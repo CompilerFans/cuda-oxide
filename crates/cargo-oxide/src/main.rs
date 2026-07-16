@@ -46,6 +46,15 @@ struct Cli {
     command: Commands,
 }
 
+/// Target GPU backend.
+#[derive(Clone, Debug, ValueEnum)]
+enum TargetBackend {
+    /// NVIDIA CUDA (default)
+    Cuda,
+    /// MetaX GPU (MXMACA)
+    Maca,
+}
+
 /// Available subcommands for `cargo oxide`.
 #[derive(Subcommand)]
 enum Commands {
@@ -62,6 +71,9 @@ enum Commands {
         /// in the environment for a non-interactive override.
         #[arg(long)]
         arch: Option<String>,
+        /// Target GPU backend (cuda or maca)
+        #[arg(long, value_enum, default_value_t = TargetBackend::Cuda)]
+        target: TargetBackend,
         /// Comma-separated list of features to enable
         #[arg(long)]
         features: Option<String>,
@@ -118,6 +130,9 @@ enum Commands {
         /// Target architecture (e.g., sm_90, sm_100, sm_120)
         #[arg(long)]
         arch: Option<String>,
+        /// Target GPU backend (cuda or maca)
+        #[arg(long, value_enum, default_value_t = TargetBackend::Cuda)]
+        target: TargetBackend,
         /// Comma-separated list of features to enable
         #[arg(long)]
         features: Option<String>,
@@ -312,6 +327,7 @@ fn main() {
             example,
             emit_nvvm_ir,
             arch,
+            target,
             features,
             bin,
             verbose,
@@ -320,6 +336,10 @@ fn main() {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "run");
             validate_nvvm_ir_arch(&ctx, &example, emit_nvvm_ir, arch.as_deref());
+            let backend_str = match target {
+                TargetBackend::Cuda => None,
+                TargetBackend::Maca => Some("maca"),
+            };
             commands::codegen_run(
                 &ctx,
                 &example,
@@ -329,6 +349,7 @@ fn main() {
                 features.as_deref(),
                 bin.as_deref(),
                 no_fmad,
+                backend_str,
             );
         }
         Commands::Sanitize {
@@ -362,6 +383,7 @@ fn main() {
             example,
             emit_nvvm_ir,
             arch,
+            target,
             features,
             verbose,
             no_fmad,
@@ -381,6 +403,10 @@ fn main() {
             if !passthrough {
                 let example = resolve_example_name(example, &ctx, "build");
                 validate_nvvm_ir_arch(&ctx, &example, emit_nvvm_ir, arch.as_deref());
+                let backend_str = match target {
+                    TargetBackend::Cuda => None,
+                    TargetBackend::Maca => Some("maca"),
+                };
                 commands::codegen_build(
                     &ctx,
                     &example,
@@ -389,6 +415,7 @@ fn main() {
                     arch.as_deref(),
                     features.as_deref(),
                     no_fmad,
+                    backend_str,
                 );
             } else {
                 if example.is_some() {

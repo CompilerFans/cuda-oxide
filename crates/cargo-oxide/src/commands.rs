@@ -166,6 +166,7 @@ pub fn codegen_run(
     features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
+    backend: Option<&str>,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -251,6 +252,7 @@ pub fn codegen_run(
     apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
     apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
+    apply_backend(&mut cmd, backend);
 
     if let Some(bin) = bin {
         println!("Building and running {} (bin: {})...", example, bin);
@@ -1221,6 +1223,7 @@ pub fn codegen_build(
     arch: Option<&str>,
     features: Option<&str>,
     no_fmad: bool,
+    backend: Option<&str>,
 ) {
     let target_arch = configured_arch(ctx, arch);
     let example_dir = if ctx.is_workspace {
@@ -1265,6 +1268,7 @@ pub fn codegen_build(
     apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
     apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
+    apply_backend(&mut cmd, backend);
 
     println!("Building {}...", example);
     println!();
@@ -1334,6 +1338,7 @@ pub fn emit_ltoir(
         Some(&sm_arch),
         features,
         no_fmad,
+        None, // LTOIR is NVVM-only, no MXMACA backend
     );
 
     // Step 2: compile that NVVM IR to LTOIR via libNVVM -gen-lto.
@@ -2945,6 +2950,13 @@ fn apply_output_mode(cmd: &mut Command, emit_nvvm_ir: bool, arch: Option<&str>) 
     }
     if emit_nvvm_ir {
         cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
+    }
+}
+
+/// Set the target GPU backend (cuda or maca).
+fn apply_backend(cmd: &mut Command, backend: Option<&str>) {
+    if let Some(backend) = backend {
+        cmd.env("CUDA_OXIDE_BACKEND", backend);
     }
 }
 
