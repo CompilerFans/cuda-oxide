@@ -1012,7 +1012,7 @@ where
 /// shape; `warp::warp_id` only handles the 1D case.
 #[inline(always)]
 fn warp_in_block_linear() -> u32 {
-    thread_in_block_linear() / 32
+    thread_in_block_linear() / crate::WAVE_SIZE
 }
 
 /// Reduce one value per thread down to a single value across a thread block.

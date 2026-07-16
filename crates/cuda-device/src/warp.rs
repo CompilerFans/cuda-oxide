@@ -248,14 +248,14 @@ pub fn active_mask() -> u32 {
 
 /// Get the warp ID within the current block.
 ///
-/// Computes: `threadIdx.x / 32`
+/// Computes: `threadIdx.x / WAVE_SIZE`
 ///
 /// This is a derived value, not a hardware register.
 /// Only valid for 1D thread blocks; for multi-dimensional blocks,
 /// compute your own warp ID from the linearized thread index.
 #[inline(always)]
 pub fn warp_id() -> u32 {
-    crate::thread::threadIdx_x() / 32
+    crate::thread::threadIdx_x() / crate::WAVE_SIZE
 }
 
 // =============================================================================

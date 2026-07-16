@@ -146,6 +146,10 @@ pub fn call_intrinsic(
 }
 
 /// Create an inline assembly operation with the convergent attribute.
+///
+/// For MXMACA backend, inline PTX is not supported. This function emits a
+/// no-op inline asm instead. Callers should provide MXMACA-specific
+/// alternatives for critical operations (fences, warp primitives, etc.).
 pub fn inline_asm_convergent(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -154,12 +158,20 @@ pub fn inline_asm_convergent(
     asm_template: &str,
     constraints: &str,
 ) -> Ptr<Operation> {
+    let opts = crate::context::lowering_options(ctx);
+    let (actual_asm, actual_constraints, actual_inputs) = if opts.backend == crate::BackendTarget::Maca {
+        // MXMACA does not support inline PTX. Emit a no-op.
+        ("nop;", "", vec![])
+    } else {
+        (asm_template, constraints, inputs)
+    };
+
     let inline_asm = llvm::InlineAsmOp::build(
         ctx,
         result_ty,
-        inputs,
-        asm_template,
-        constraints,
+        actual_inputs,
+        actual_asm,
+        actual_constraints,
         AsmKind::Convergent,
     );
     rewriter.insert_operation(ctx, inline_asm.get_operation());
@@ -172,6 +184,9 @@ pub fn inline_asm_convergent(
 /// (e.g., `cp.async` copies). Unlike `inline_asm_convergent`, the emitted asm
 /// is marked `sideeffect` only, allowing LLVM to move or duplicate it across
 /// divergent control flow when legal.
+///
+/// For MXMACA backend, inline PTX is not supported. This function emits a
+/// no-op inline asm instead.
 pub fn inline_asm_sideeffect(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -180,12 +195,19 @@ pub fn inline_asm_sideeffect(
     asm_template: &str,
     constraints: &str,
 ) -> Ptr<Operation> {
+    let opts = crate::context::lowering_options(ctx);
+    let (actual_asm, actual_constraints, actual_inputs) = if opts.backend == crate::BackendTarget::Maca {
+        ("nop;", "", vec![])
+    } else {
+        (asm_template, constraints, inputs)
+    };
+
     let inline_asm = llvm::InlineAsmOp::build(
         ctx,
         result_ty,
-        inputs,
-        asm_template,
-        constraints,
+        actual_inputs,
+        actual_asm,
+        actual_constraints,
         AsmKind::SideEffect,
     );
     rewriter.insert_operation(ctx, inline_asm.get_operation());

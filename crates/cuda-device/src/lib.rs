@@ -6,6 +6,16 @@
 #![feature(f16)]
 #![no_std]
 
+/// Wave size (threads per wave/warp).
+///
+/// - NVIDIA CUDA: 32 threads per warp
+/// - MetaX MXMACA: 64 threads per wave
+///
+/// This constant is used by `warp::warp_id()` and cooperative groups to
+/// compute wave-level indices. The compiler backend selects the correct
+/// hardware intrinsics based on the target platform.
+pub const WAVE_SIZE: u32 = 32;
+
 pub use cuda_macros::{
     cluster_launch, constant, convergent, cooperative_launch, cuda_module, device, gpu_printf,
     kernel, launch_bounds, launch_contract, ptx_asm, pure, readonly,
