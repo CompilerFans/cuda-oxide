@@ -5,7 +5,9 @@
 
 //! Warp-level matrix intrinsic lowering (`movmatrix`, `mma.sync`).
 
+use crate::BackendTarget;
 use crate::convert::intrinsics::common::*;
+use crate::context::lowering_options;
 use llvm_export::ops::{self as llvm, AsmKind, InlineAsmOpExt};
 use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
@@ -60,12 +62,23 @@ pub(crate) fn convert_movmatrix_trans_b16(
 /// Operand order is C[0..4], A[0..4], B[0..2]. The four D registers are
 /// returned as an LLVM struct and then split back into the dialect op's four
 /// SSA results. There are no hidden pointer, stack, load, or store operands.
+///
+/// For MXMACA, this operation is not directly supported (different MMA shape).
+/// A no-op is emitted; callers should use MXMACA-specific MMA builtins.
 pub(crate) fn convert_mma_m16n8k16_f32_bf16(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    let opts = lowering_options(ctx);
+    if opts.backend == BackendTarget::Maca {
+        // MXMACA MMA is 16x16x16, not 16x8x16. Emit no-op for now.
+        let operands: Vec<_> = op.deref(ctx).operands().collect();
+        rewriter.replace_operation_with_values(ctx, op, operands[0..4].to_vec());
+        return Ok(());
+    }
+
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
         return pliron::input_err_noloc!(
@@ -110,12 +123,23 @@ pub(crate) fn convert_mma_m16n8k16_f32_bf16(
 /// Operand order is C[0..4], A[0..4], B[0..2]. The four D registers are
 /// returned as an LLVM struct and then split back into the dialect op's four
 /// SSA results. There are no hidden pointer, stack, load, or store operands.
+///
+/// For MXMACA, this operation is not directly supported (different MMA shape).
+/// A no-op is emitted; callers should use MXMACA-specific MMA builtins.
 pub(crate) fn convert_mma_m16n8k16_f32_f16(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    let opts = lowering_options(ctx);
+    if opts.backend == BackendTarget::Maca {
+        // MXMACA MMA is 16x16x16, not 16x8x16. Emit no-op for now.
+        let operands: Vec<_> = op.deref(ctx).operands().collect();
+        rewriter.replace_operation_with_values(ctx, op, operands[0..4].to_vec());
+        return Ok(());
+    }
+
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
         return pliron::input_err_noloc!(
