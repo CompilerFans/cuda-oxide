@@ -24,6 +24,7 @@ members = [
     # MXMACA bindings
     "crates/maca-bindings",
     "crates/maca-core",
+    "crates/maca-host",
     # Examples
     "examples/maca-vecadd",
     # Internal naming contract (workspace-private; publish = false)

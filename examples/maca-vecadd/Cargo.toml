@@ -2,6 +2,9 @@
 name = "maca-vecadd"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 maca-core = { path = "../../crates/maca-core" }
+maca-host = { path = "../../crates/maca-host" }
+maca-bindings = { path = "../../crates/maca-bindings" }
