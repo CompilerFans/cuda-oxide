@@ -131,6 +131,39 @@ pub(crate) fn convert_barrier0(
 }
 
 // ============================================================================
+// MXMACA lane_id via mbcnt.lo + mbcnt.hi
+// ============================================================================
+
+/// Convert `lane_id` for MXMACA: `mbcnt.lo(-1, 0)` + `mbcnt.hi(-1, lo)`.
+///
+/// MXMACA uses two intrinsics to compute the 64-bit wave lane ID:
+/// 1. `mbcnt.lo(-1, 0)` — count of active lanes in lower 32 bits
+/// 2. `mbcnt.hi(-1, lo)` — count of active lanes in upper 32 bits
+/// Combined they give the lane ID within a 64-thread wave.
+pub(crate) fn convert_maca_lane_id(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let neg1 = create_i32_const(ctx, rewriter, -1);
+    let zero = create_i32_const(ctx, rewriter, 0);
+
+    // mbcnt.lo(-1, 0)
+    let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![i32_ty.into(), i32_ty.into()], false);
+    let mbcnt_lo = call_intrinsic(ctx, rewriter, op, "llvm_mxc_mbcnt_lo", func_ty, vec![neg1, zero])?;
+    let lo_val = mbcnt_lo.deref(ctx).get_result(0);
+
+    // mbcnt.hi(-1, lo)
+    let func_ty2 = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![i32_ty.into(), i32_ty.into()], false);
+    let mbcnt_hi = call_intrinsic(ctx, rewriter, op, "llvm_mxc_mbcnt_hi", func_ty2, vec![neg1, lo_val])?;
+
+    rewriter.replace_operation(ctx, op, mbcnt_hi);
+    Ok(())
+}
+
+// ============================================================================
 // MXMACA blockDim/gridDim via dispatch.ptr
 // ============================================================================
 

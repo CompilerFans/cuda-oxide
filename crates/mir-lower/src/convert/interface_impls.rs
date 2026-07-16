@@ -1232,13 +1232,17 @@ impl MirToLlvmConversion for ReadPtxSregLaneIdOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_laneid",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_lane_id(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_laneid",
+            )
+        }
     }
 }
 
