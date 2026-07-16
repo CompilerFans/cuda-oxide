@@ -75,6 +75,18 @@ pub fn create_i64_const(
     const_op.get_operation().deref(ctx).get_result(0)
 }
 
+/// Create an f32 constant with the given value.
+pub fn create_f32_const(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    value: f32,
+) -> Value {
+    let attr = pliron::builtin::attributes::FPSingleAttr::from(value);
+    let const_op = llvm::ConstantOp::new(ctx, attr.into());
+    rewriter.insert_operation(ctx, const_op.get_operation());
+    const_op.get_operation().deref(ctx).get_result(0)
+}
+
 /// Cast a pointer value to address space 3 (shared memory) if needed.
 pub fn cast_to_shared_addrspace(
     ctx: &mut Context,

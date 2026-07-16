@@ -249,6 +249,11 @@ pub(crate) fn convert_vote(
     _operands_info: &OperandsInfo,
     intrinsic_name: &str,
 ) -> Result<()> {
+    let opts = lowering_options(ctx);
+    if opts.backend == BackendTarget::Maca && intrinsic_name.contains("ballot") {
+        return convert_maca_ballot(ctx, rewriter, op);
+    }
+
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
 
@@ -273,6 +278,53 @@ pub(crate) fn convert_vote(
         intrinsic_name,
         func_ty,
         vec![mask, predicate],
+    )?;
+    rewriter.replace_operation(ctx, op, call_op);
+    Ok(())
+}
+
+/// Convert ballot for MXMACA using `fcmp.i64.f32`.
+///
+/// MXMACA ballot uses fcmp.i64.f32(predicate_as_float, 0.0, 2) which returns
+/// a 64-bit mask. The predicate is converted from i1 to f32 first.
+fn convert_maca_ballot(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+) -> Result<()> {
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let f32_ty = FP32Type::get(ctx);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 2 {
+        return pliron::input_err_noloc!("Warp ballot requires 2 operands [mask, predicate]");
+    }
+    let (_mask, predicate) = (operands[0], operands[1]);
+
+    // Convert i1 predicate to f32 (0.0 or 1.0)
+    let zero_f32 = create_f32_const(ctx, rewriter, 0.0);
+    let one_f32 = create_f32_const(ctx, rewriter, 1.0);
+
+    // Select: if predicate then 1.0 else 0.0
+    let select_op = llvm::SelectOp::new(ctx, predicate, one_f32, zero_f32);
+    rewriter.insert_operation(ctx, select_op.get_operation());
+    let pred_f32 = select_op.get_operation().deref(ctx).get_result(0);
+
+    // Call fcmp.i64.f32(pred_f32, 0.0, 2) — returns i64 mask
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        i64_ty.into(),
+        vec![f32_ty.into(), f32_ty.into(), IntegerType::get(ctx, 32, Signedness::Signless).into()],
+        false,
+    );
+    let cmp_mode = create_i32_const(ctx, rewriter, 2); // OGT
+    let call_op = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        "llvm_mxc_fcmp_i64_f32",
+        func_ty,
+        vec![pred_f32, zero_f32, cmp_mode],
     )?;
     rewriter.replace_operation(ctx, op, call_op);
     Ok(())
