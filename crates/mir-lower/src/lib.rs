@@ -154,6 +154,16 @@ use type_conversion_interface::MirConvertibleType;
 // DialectConversion driver
 // ============================================================================
 
+/// Target backend for intrinsic lowering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendTarget {
+    /// NVIDIA CUDA (NVVM/PTX) — the default.
+    #[default]
+    Cuda,
+    /// MetaX GPU (MXMACA).
+    Maca,
+}
+
 /// Options controlling the `dialect-mir` to LLVM dialect lowering pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoweringOptions {
@@ -162,12 +172,15 @@ pub struct LoweringOptions {
     ///
     /// This does not affect explicit fused operations such as `f32::mul_add`.
     pub allow_fma_contraction: bool,
+    /// Target backend for intrinsic lowering.
+    pub backend: BackendTarget,
 }
 
 impl Default for LoweringOptions {
     fn default() -> Self {
         Self {
             allow_fma_contraction: true,
+            backend: BackendTarget::Cuda,
         }
     }
 }

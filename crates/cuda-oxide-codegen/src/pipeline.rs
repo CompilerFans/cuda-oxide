@@ -11,11 +11,12 @@
 
 use crate::error::PipelineError;
 use crate::export::{
-    DeviceExternDecl, export_llvm_ir, module_uses_libdevice, render_llvm_ir, resolve_nvvm_target,
+    DeviceExternDecl, export_llvm_ir_with_backend, module_uses_libdevice,
+    render_llvm_ir, render_llvm_ir_with_backend, resolve_nvvm_target,
     unresolved_external_symbols, validate_nvvm_debug_support,
 };
 use crate::llvm_tools::LlvmToolchain;
-use crate::lower::{add_device_extern_declarations, lower_to_llvm};
+use crate::lower::{add_device_extern_declarations, lower_to_llvm_with_backend};
 use crate::options::BackendOptions;
 use crate::prep::{MirPreparation, prepare_mir_module};
 use crate::ptx::{GeneratedPtx, generate_ptx, generate_ptx_with_toolchain};
@@ -133,6 +134,8 @@ pub enum ModuleArtifactKind {
     Ptx,
     /// NVVM-compatible LLVM IR for a later libNVVM/nvJitLink step.
     NvvmIr,
+    /// LLVM IR targeting MXMACA (consumed by `mxcc`).
+    MacaLlvmIr,
 }
 
 /// Successful shared-pipeline result.
@@ -208,7 +211,7 @@ pub fn compile_translated_module(
             .trace
             .emit("\n=== Lowering dialect-mir → LLVM dialect ===");
     }
-    lower_to_llvm(ctx, module, !request.backend.no_fma)?;
+    lower_to_llvm_with_backend(ctx, module, !request.backend.no_fma, request.backend.backend)?;
 
     let needs_libdevice = module_uses_libdevice(ctx, module);
     let emit_nvvm_ir = should_emit_nvvm_ir(request.output_policy, needs_libdevice);
@@ -302,7 +305,7 @@ pub fn compile_translated_module(
             .emit(format!("\n=== Exporting to LLVM IR ({mode} mode) ==="));
     }
     remove_stale_files(request.files.stale_before_export)?;
-    export_llvm_ir(
+    export_llvm_ir_with_backend(
         ctx,
         module,
         request.device_externs,
@@ -310,12 +313,28 @@ pub fn compile_translated_module(
         emit_nvvm_ir,
         nvvm_dialect,
         request.debug_kind,
+        request.backend.backend,
     )?;
     if request.trace.verbose {
         request.trace.emit(format!(
             "LLVM IR written to {}",
             request.files.llvm_ir.display()
         ));
+    }
+
+    // For MXMACA backend, skip PTX generation — the LLVM IR is the artifact.
+    // The consumer (cargo-oxide) will invoke mxcc to compile it.
+    if request.backend.backend == crate::options::TargetBackend::Maca {
+        if request.trace.verbose {
+            request.trace.emit(
+                "\n=== MXMACA backend: LLVM IR is the final artifact (mxcc compiles it) ===",
+            );
+        }
+        return Ok(ModulePipelineOutput {
+            artifact_kind: ModuleArtifactKind::MacaLlvmIr,
+            target: "mxc-metax-macahca".to_string(),
+            diagnostics: Vec::new(),
+        });
     }
 
     if emit_nvvm_ir {

@@ -156,13 +156,27 @@ pub fn export_llvm_ir(
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
 ) -> Result<String, PipelineError> {
-    let llvm_ir = render_llvm_ir(
-        ctx,
-        module_op_ptr,
-        device_externs,
-        emit_nvvm_ir,
-        nvvm_dialect,
-        debug_kind,
+    export_llvm_ir_with_backend(
+        ctx, module_op_ptr, device_externs, path, emit_nvvm_ir, nvvm_dialect, debug_kind,
+        crate::options::TargetBackend::Cuda,
+    )
+}
+
+/// Exports an LLVM dialect module to textual LLVM IR with explicit backend target.
+// mir-importer pipeline plumbing; not part of the frontend contract.
+#[doc(hidden)]
+pub fn export_llvm_ir_with_backend(
+    ctx: &Context,
+    module_op_ptr: Ptr<Operation>,
+    device_externs: &[DeviceExternDecl],
+    path: &Path,
+    emit_nvvm_ir: bool,
+    nvvm_dialect: Option<NvvmIrDialect>,
+    debug_kind: DebugKind,
+    backend: crate::options::TargetBackend,
+) -> Result<String, PipelineError> {
+    let llvm_ir = render_llvm_ir_with_backend(
+        ctx, module_op_ptr, device_externs, emit_nvvm_ir, nvvm_dialect, debug_kind, backend,
     )?;
 
     std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
@@ -185,26 +199,55 @@ pub fn render_llvm_ir(
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
 ) -> Result<String, PipelineError> {
+    render_llvm_ir_with_backend(
+        ctx, module_op_ptr, device_externs, emit_nvvm_ir, nvvm_dialect, debug_kind,
+        crate::options::TargetBackend::Cuda,
+    )
+}
+
+/// Render LLVM text with explicit backend target selection.
+// mir-importer pipeline plumbing; not part of the frontend contract.
+#[doc(hidden)]
+pub fn render_llvm_ir_with_backend(
+    ctx: &Context,
+    module_op_ptr: Ptr<Operation>,
+    device_externs: &[DeviceExternDecl],
+    emit_nvvm_ir: bool,
+    nvvm_dialect: Option<NvvmIrDialect>,
+    debug_kind: DebugKind,
+    backend: crate::options::TargetBackend,
+) -> Result<String, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
-    let llvm_ir = if emit_nvvm_ir {
-        let dialect = nvvm_dialect.ok_or_else(|| {
-            PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
-        })?;
-        let config = PipelineExportConfig {
-            inner: llvm_export::export::NvvmExportConfig::new(dialect),
-            debug_kind,
-        };
-        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
-    } else {
-        let config = PipelineExportConfig {
-            inner: llvm_export::export::PtxExportConfig,
-            debug_kind,
-        };
-        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
+    let llvm_ir = match backend {
+        crate::options::TargetBackend::Maca => {
+            let config = PipelineExportConfig {
+                inner: llvm_export::export::MacaExportConfig,
+                debug_kind,
+            };
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
+        crate::options::TargetBackend::Cuda if emit_nvvm_ir => {
+            let dialect = nvvm_dialect.ok_or_else(|| {
+                PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
+            })?;
+            let config = PipelineExportConfig {
+                inner: llvm_export::export::NvvmExportConfig::new(dialect),
+                debug_kind,
+            };
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
+        crate::options::TargetBackend::Cuda => {
+            let config = PipelineExportConfig {
+                inner: llvm_export::export::PtxExportConfig,
+                debug_kind,
+            };
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
     };
 
     Ok(llvm_ir)
@@ -218,6 +261,10 @@ struct PipelineExportConfig<C> {
 impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
     fn datalayout(&self) -> &str {
         self.inner.datalayout()
+    }
+
+    fn target_triple(&self) -> &str {
+        self.inner.target_triple()
     }
 
     fn emit_llvm_used(&self) -> bool {

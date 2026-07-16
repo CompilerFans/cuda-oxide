@@ -61,13 +61,16 @@ impl DebugKind {
     }
 }
 
-/// Configuration trait for export backends (PTX, LTOIR, etc.).
+/// Configuration trait for export backends (PTX, LTOIR, MXMACA, etc.).
 ///
 /// This trait allows different backends to customize IR generation without
 /// exposing backend-specific details in the public API.
 pub trait ExportBackendConfig {
     /// Data layout string for the target.
     fn datalayout(&self) -> &str;
+
+    /// Target triple for the LLVM module (e.g., "nvptx64-nvidia-cuda", "mxc-metax-macahca").
+    fn target_triple(&self) -> &str;
 
     /// Whether to emit `@llvm.used` for kernel functions.
     /// This prevents the optimizer from removing "unused" kernels.
@@ -107,6 +110,10 @@ pub struct PtxExportConfig;
 impl ExportBackendConfig for PtxExportConfig {
     fn datalayout(&self) -> &str {
         NVPTX_DATALAYOUT_PTX
+    }
+
+    fn target_triple(&self) -> &str {
+        "nvptx64-nvidia-cuda"
     }
 
     fn emit_llvm_used(&self) -> bool {
@@ -167,6 +174,10 @@ impl ExportBackendConfig for NvvmExportConfig {
         }
     }
 
+    fn target_triple(&self) -> &str {
+        "nvptx64-nvidia-cuda"
+    }
+
     fn emit_llvm_used(&self) -> bool {
         true
     }
@@ -192,5 +203,59 @@ impl ExportBackendConfig for NvvmExportConfig {
 
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
         Some(self.dialect)
+    }
+}
+
+// ============================================================================
+// MXMACA (MetaX) backend configuration
+// ============================================================================
+
+/// MXMACA data layout for MetaX GPU targets (xcore1000).
+///
+/// Obtained from `mxcc -S -emit-llvm` output on a simple .maca file.
+pub(super) const MACA_DATALAYOUT: &str = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-\
+    p5:32:32-p6:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-\
+    v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7";
+
+/// MXMACA target triple.
+pub(super) const MACA_TARGET_TRIPLE: &str = "mxc-metax-macahca";
+
+/// Export configuration for MXMACA (MetaX GPU) backend.
+///
+/// Uses MXMACA-specific settings:
+/// - MXMACA data layout (xcore1000)
+/// - `mxc-metax-macahca` target triple
+/// - No NVVM metadata (not NVIDIA)
+/// - No PTX kernel keyword (uses `metaxgpu_kernel` calling convention)
+#[derive(Clone, Debug, Default)]
+pub struct MacaExportConfig;
+
+impl ExportBackendConfig for MacaExportConfig {
+    fn datalayout(&self) -> &str {
+        MACA_DATALAYOUT
+    }
+
+    fn target_triple(&self) -> &str {
+        MACA_TARGET_TRIPLE
+    }
+
+    fn emit_llvm_used(&self) -> bool {
+        false
+    }
+
+    fn emit_nvvmir_version(&self) -> bool {
+        false
+    }
+
+    fn nvvmir_version(&self) -> [i32; 4] {
+        [0, 0, 0, 0]
+    }
+
+    fn emit_all_kernel_annotations(&self) -> bool {
+        false
+    }
+
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        false // MXMACA uses metaxgpu_kernel calling convention, not ptx_kernel
     }
 }

@@ -1032,13 +1032,17 @@ impl MirToLlvmConversion for ReadPtxSregNtidXOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_x",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_blockdim_x(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_ntid_x",
+            )
+        }
     }
 }
 
@@ -1050,13 +1054,17 @@ impl MirToLlvmConversion for ReadPtxSregNtidYOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_y",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_blockdim_y(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_ntid_y",
+            )
+        }
     }
 }
 
@@ -1122,13 +1130,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidXOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_x",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_griddim_x(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_nctaid_x",
+            )
+        }
     }
 }
 
@@ -1140,13 +1152,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidYOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_y",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_griddim_y(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_nctaid_y",
+            )
+        }
     }
 }
 
@@ -1158,13 +1174,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidZOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_nctaid_z",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_griddim_z(
+                ctx, rewriter, self.get_operation(), operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx, rewriter, self.get_operation(), operands_info,
+                "llvm_nvvm_read_ptx_sreg_nctaid_z",
+            )
+        }
     }
 }
 

@@ -538,6 +538,7 @@ impl Compiler {
             verbose: false,
             llc_override: None,
             opt_override: None,
+            backend: crate::options::TargetBackend::Cuda,
         };
         let request = ModulePipelineRequest::for_standalone_ptx(
             &backend_options,

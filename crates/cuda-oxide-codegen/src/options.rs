@@ -5,6 +5,16 @@
 
 use std::path::PathBuf;
 
+/// Target GPU backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TargetBackend {
+    /// NVIDIA CUDA (NVVM/PTX) — the default.
+    #[default]
+    Cuda,
+    /// MetaX GPU (MXMACA).
+    Maca,
+}
+
 /// Explicit backend knobs; replaces every `CUDA_OXIDE_*` env read inside the
 /// backend. `run_pipeline` (mir-importer) builds one from the environment at
 /// its own boundary. The experimental API builds one from typed compile
@@ -26,6 +36,8 @@ pub struct BackendOptions {
     pub llc_override: Option<PathBuf>,
     /// Explicit `opt` binary (was `CUDA_OXIDE_OPT`).
     pub opt_override: Option<PathBuf>,
+    /// Target GPU backend (CUDA or MXMACA).
+    pub backend: TargetBackend,
 }
 
 impl BackendOptions {
@@ -33,6 +45,10 @@ impl BackendOptions {
     /// this crate outside this crate's own tests; called by rustc-pipeline
     /// hosts, never by the backend itself.
     pub fn from_env() -> Self {
+        let backend = match std::env::var("CUDA_OXIDE_BACKEND").as_deref() {
+            Ok("maca") | Ok("MXMACA") | Ok("metax") => TargetBackend::Maca,
+            _ => TargetBackend::Cuda,
+        };
         Self {
             target_arch: std::env::var("CUDA_OXIDE_TARGET").ok(),
             device_arch_hint: std::env::var("CUDA_OXIDE_DEVICE_ARCH").ok(),
@@ -41,6 +57,7 @@ impl BackendOptions {
             verbose: std::env::var("CUDA_OXIDE_VERBOSE").is_ok(),
             llc_override: std::env::var("CUDA_OXIDE_LLC").ok().map(PathBuf::from),
             opt_override: std::env::var("CUDA_OXIDE_OPT").ok().map(PathBuf::from),
+            backend,
         }
     }
 }
