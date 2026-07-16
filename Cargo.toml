@@ -21,6 +21,11 @@ members = [
     "crates/cuda-async",
     "crates/libnvvm-sys",
     "crates/nvjitlink-sys",
+    # MXMACA bindings
+    "crates/maca-bindings",
+    "crates/maca-core",
+    # Examples
+    "examples/maca-vecadd",
     # Internal naming contract (workspace-private; publish = false)
     "crates/reserved-oxide-symbols",
     # Differential codegen fuzzer support
