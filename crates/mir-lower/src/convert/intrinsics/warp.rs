@@ -31,7 +31,11 @@
 //! | `MatchAllSyncI32` | `llvm.nvvm.match.all.sync.i32p`   | Full mask iff all agree      |
 //! | `MatchAllSyncI64` | `llvm.nvvm.match.all.sync.i64p`   | 64-bit variant               |
 
+use crate::BackendTarget;
 use crate::convert::intrinsics::common::*;
+use crate::context::lowering_options;
+use llvm_export::op_interfaces::BinArithOp;
+use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -56,6 +60,11 @@ pub(crate) fn convert_shuffle_i32(
     intrinsic_name: &str,
     clamp: i32,
 ) -> Result<()> {
+    let opts = lowering_options(ctx);
+    if opts.backend == BackendTarget::Maca {
+        return convert_maca_shuffle_i32(ctx, rewriter, op);
+    }
+
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
@@ -82,6 +91,50 @@ pub(crate) fn convert_shuffle_i32(
         intrinsic_name,
         func_ty,
         vec![mask, val, lane_or_delta, clamp_val],
+    )?;
+    rewriter.replace_operation(ctx, op, call_op);
+    Ok(())
+}
+
+/// Convert i32 shuffle for MXMACA using `bsm.bpermute(offset, value)`.
+///
+/// MXMACA shuffle is through BSM (shared memory), not register shuffle.
+/// The offset is `lane * 4` (byte offset for i32).
+fn convert_maca_shuffle_i32(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 3 {
+        return pliron::input_err_noloc!(
+            "Warp shuffle i32 requires 3 operands [mask, value, lane_or_delta]"
+        );
+    }
+    let (_mask, val, lane) = (operands[0], operands[1], operands[2]);
+
+    // Calculate byte offset: lane * 4
+    let four = create_i32_const(ctx, rewriter, 4);
+    let mul_op = llvm::MulOp::new(ctx, lane, four);
+    rewriter.insert_operation(ctx, mul_op.get_operation());
+    let offset = mul_op.get_operation().deref(ctx).get_result(0);
+
+    // Call bsm.bpermute(offset, value)
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        i32_ty.into(),
+        vec![i32_ty.into(), i32_ty.into()],
+        false,
+    );
+    let call_op = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        "llvm_mxc_bsm_bpermute",
+        func_ty,
+        vec![offset, val],
     )?;
     rewriter.replace_operation(ctx, op, call_op);
     Ok(())
