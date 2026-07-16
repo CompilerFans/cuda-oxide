@@ -18,6 +18,7 @@
 use crate::BackendTarget;
 use crate::convert::intrinsics::common::*;
 use crate::context::lowering_options;
+use llvm_export::attributes::LlvmAtomicOrdering;
 use llvm_export::op_interfaces::BinArithOp;
 use llvm_export::ops as llvm;
 use llvm_export::ops::{AsmKind, InlineAsmOpExt};
@@ -254,16 +255,31 @@ fn convert_membar(
     op: Ptr<Operation>,
     asm_template: &str,
 ) -> Result<()> {
-    let void_ty = llvm_types::VoidType::get(ctx);
-    inline_asm_convergent(
-        ctx,
-        rewriter,
-        void_ty.into(),
-        vec![],
-        asm_template,
-        "~{memory}",
-    );
-    rewriter.erase_operation(ctx, op);
+    let opts = lowering_options(ctx);
+    if opts.backend == BackendTarget::Maca {
+        // MXMACA uses standard LLVM fence instructions with syncscopes
+        let scope = match asm_template {
+            "membar.cta;" => Some("block".to_string()),
+            "membar.gl;" => Some("device".to_string()),
+            "membar.sys;" => None, // system scope = no syncscope
+            _ => None,
+        };
+        let ordering = LlvmAtomicOrdering::SeqCst;
+        let fence_op = llvm::FenceOp::new(ctx, ordering, scope);
+        rewriter.insert_operation(ctx, fence_op.get_operation());
+        rewriter.erase_operation(ctx, op);
+    } else {
+        let void_ty = llvm_types::VoidType::get(ctx);
+        inline_asm_convergent(
+            ctx,
+            rewriter,
+            void_ty.into(),
+            vec![],
+            asm_template,
+            "~{memory}",
+        );
+        rewriter.erase_operation(ctx, op);
+    }
     Ok(())
 }
 
