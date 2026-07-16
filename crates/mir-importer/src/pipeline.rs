@@ -348,6 +348,18 @@ pub fn run_pipeline(
             target: generated.target,
             allow_fma_contraction: config.allow_fma_contraction,
         }),
+        ModuleArtifactKind::MacaLlvmIr => {
+            // MXMACA backend outputs LLVM IR consumed by mxcc.
+            // The .ll file is the artifact; no PTX is generated.
+            Ok(CompilationResult {
+                artifact_path: ll_path.clone(),
+                artifact_kind: CompilationArtifactKind::Ptx, // Reuse Ptx kind for now
+                ll_path,
+                ptx_path,
+                target: generated.target,
+                allow_fma_contraction: config.allow_fma_contraction,
+            })
+        }
     }
 }
 
