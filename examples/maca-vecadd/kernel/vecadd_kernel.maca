@@ -1,0 +1,6 @@
+__global__ void vecadd(float *out, const float *a, const float *b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
