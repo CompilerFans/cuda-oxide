@@ -18,8 +18,10 @@
 use crate::BackendTarget;
 use crate::context::lowering_options;
 use crate::convert::intrinsics::common::*;
-use llvm_export::attributes::LlvmAtomicOrdering;
-use llvm_export::op_interfaces::BinArithOp;
+use llvm_export::attributes::{ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering};
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
 use llvm_export::ops as llvm;
 use llvm_export::ops::{AsmKind, InlineAsmOpExt};
 use llvm_export::types as llvm_types;
@@ -189,10 +191,11 @@ pub(crate) fn convert_maca_lane_id(
 // ============================================================================
 
 /// MXMACA dispatch structure offsets (from LLVM IR analysis).
-const MACA_DISPATCH_BLOCKDIM_OFFSET: u32 = 4; // blockDim.x (i16) | blockDim.y (i16) packed as i32
-const MACA_DISPATCH_GRIDDIM_X_OFFSET: u32 = 12; // gridDim.x (i32)
-const MACA_DISPATCH_GRIDDIM_Y_OFFSET: u32 = 16; // gridDim.y (i32)
-const MACA_DISPATCH_GRIDDIM_Z_OFFSET: u32 = 20; // gridDim.z (i32)
+const MACA_DISPATCH_BLOCKDIM_XY_OFFSET: u32 = 4; // blockDim.x (i16) | blockDim.y (i16)
+const MACA_DISPATCH_BLOCKDIM_Z_OFFSET: u32 = 8; // blockDim.z (low i16)
+const MACA_DISPATCH_GLOBAL_SIZE_X_OFFSET: u32 = 12; // global_size.x (i32)
+const MACA_DISPATCH_GLOBAL_SIZE_Y_OFFSET: u32 = 16; // global_size.y (i32)
+const MACA_DISPATCH_GLOBAL_SIZE_Z_OFFSET: u32 = 20; // global_size.z (i32)
 
 /// Call `@llvm.mxc.dispatch.ptr()` and return the dispatch pointer value.
 fn get_maca_dispatch_ptr(
@@ -236,76 +239,153 @@ fn read_dispatch_i32(
     Ok(load_op.get_operation().deref(ctx).get_result(0))
 }
 
-/// Convert `ntid.x` (blockDim.x) for MXMACA: read i32 from dispatch+4, AND with 0xFFFF.
+fn read_maca_blockdim(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    current_op: Ptr<Operation>,
+    offset: u32,
+    shift: i32,
+) -> Result<pliron::value::Value> {
+    let packed = read_dispatch_i32(ctx, rewriter, current_op, offset)?;
+    let value = if shift == 0 {
+        packed
+    } else {
+        let shift = create_i32_const(ctx, rewriter, shift);
+        let lshr_op = llvm::LShrOp::new(ctx, packed, shift);
+        rewriter.insert_operation(ctx, lshr_op.get_operation());
+        lshr_op.get_operation().deref(ctx).get_result(0)
+    };
+    let mask = create_i32_const(ctx, rewriter, 0xFFFF);
+    let and_op = llvm::AndOp::new(ctx, value, mask);
+    rewriter.insert_operation(ctx, and_op.get_operation());
+    Ok(and_op.get_operation().deref(ctx).get_result(0))
+}
+
+fn convert_maca_blockdim(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    offset: u32,
+    shift: i32,
+) -> Result<()> {
+    let value = read_maca_blockdim(ctx, rewriter, op, offset, shift)?;
+    rewriter.replace_operation(ctx, op, value.defining_op().unwrap());
+    Ok(())
+}
+
+/// Convert `ntid.x` (blockDim.x) for MXMACA.
 pub(crate) fn convert_maca_blockdim_x(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let packed = read_dispatch_i32(ctx, rewriter, op, MACA_DISPATCH_BLOCKDIM_OFFSET)?;
-    // blockDim.x is the lower 16 bits
-    let mask = create_i32_const(ctx, rewriter, 0xFFFF);
-    let and_op = llvm::AndOp::new(ctx, packed, mask);
-    rewriter.insert_operation(ctx, and_op.get_operation());
-    rewriter.replace_operation(ctx, op, and_op.get_operation());
-    Ok(())
+    convert_maca_blockdim(ctx, rewriter, op, MACA_DISPATCH_BLOCKDIM_XY_OFFSET, 0)
 }
 
-/// Convert `ntid.y` (blockDim.y) for MXMACA: read i32 from dispatch+4, LSHR by 16.
+/// Convert `ntid.y` (blockDim.y) for MXMACA.
 pub(crate) fn convert_maca_blockdim_y(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let packed = read_dispatch_i32(ctx, rewriter, op, MACA_DISPATCH_BLOCKDIM_OFFSET)?;
-    // blockDim.y is the upper 16 bits
-    let shift = create_i32_const(ctx, rewriter, 16);
-    let lshr_op = llvm::LShrOp::new(ctx, packed, shift);
-    rewriter.insert_operation(ctx, lshr_op.get_operation());
-    let lshr_result = lshr_op.get_operation().deref(ctx).get_result(0);
-    let mask = create_i32_const(ctx, rewriter, 0xFFFF);
-    let and_op = llvm::AndOp::new(ctx, lshr_result, mask);
-    rewriter.insert_operation(ctx, and_op.get_operation());
-    rewriter.replace_operation(ctx, op, and_op.get_operation());
+    convert_maca_blockdim(ctx, rewriter, op, MACA_DISPATCH_BLOCKDIM_XY_OFFSET, 16)
+}
+
+/// Convert `ntid.z` (blockDim.z) for MXMACA.
+pub(crate) fn convert_maca_blockdim_z(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    convert_maca_blockdim(ctx, rewriter, op, MACA_DISPATCH_BLOCKDIM_Z_OFFSET, 0)
+}
+
+fn convert_maca_griddim(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    global_size_offset: u32,
+    blockdim_offset: u32,
+    blockdim_shift: i32,
+) -> Result<()> {
+    let global_size = read_dispatch_i32(ctx, rewriter, op, global_size_offset)?;
+    let blockdim = read_maca_blockdim(ctx, rewriter, op, blockdim_offset, blockdim_shift)?;
+
+    // The dispatch packet stores global work-item counts. CUDA gridDim is the
+    // number of blocks, so use overflow-safe ceil(global_size / blockdim).
+    let quotient_op = llvm::UDivOp::new(ctx, global_size, blockdim);
+    rewriter.insert_operation(ctx, quotient_op.get_operation());
+    let quotient = quotient_op.get_operation().deref(ctx).get_result(0);
+    let overflow_flags = IntegerOverflowFlagsAttr::default();
+    let product_op =
+        llvm::MulOp::new_with_overflow_flag(ctx, quotient, blockdim, overflow_flags.clone());
+    rewriter.insert_operation(ctx, product_op.get_operation());
+    let product = product_op.get_operation().deref(ctx).get_result(0);
+    let remainder_op = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::UGT, global_size, product);
+    rewriter.insert_operation(ctx, remainder_op.get_operation());
+    let has_remainder = remainder_op.get_operation().deref(ctx).get_result(0);
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let extend_op = llvm::ZExtOp::new_with_nneg(ctx, has_remainder, i32_ty.into(), false);
+    rewriter.insert_operation(ctx, extend_op.get_operation());
+    let remainder = extend_op.get_operation().deref(ctx).get_result(0);
+    let result_op = llvm::AddOp::new_with_overflow_flag(ctx, quotient, remainder, overflow_flags);
+    rewriter.insert_operation(ctx, result_op.get_operation());
+    rewriter.replace_operation(ctx, op, result_op.get_operation());
     Ok(())
 }
 
-/// Convert `nctaid.x` (gridDim.x) for MXMACA: read i32 from dispatch+12.
+/// Convert `nctaid.x` (gridDim.x) for MXMACA.
 pub(crate) fn convert_maca_griddim_x(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let val = read_dispatch_i32(ctx, rewriter, op, MACA_DISPATCH_GRIDDIM_X_OFFSET)?;
-    rewriter.replace_operation(ctx, op, val.defining_op().unwrap());
-    Ok(())
+    convert_maca_griddim(
+        ctx,
+        rewriter,
+        op,
+        MACA_DISPATCH_GLOBAL_SIZE_X_OFFSET,
+        MACA_DISPATCH_BLOCKDIM_XY_OFFSET,
+        0,
+    )
 }
 
-/// Convert `nctaid.y` (gridDim.y) for MXMACA: read i32 from dispatch+16.
+/// Convert `nctaid.y` (gridDim.y) for MXMACA.
 pub(crate) fn convert_maca_griddim_y(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let val = read_dispatch_i32(ctx, rewriter, op, MACA_DISPATCH_GRIDDIM_Y_OFFSET)?;
-    rewriter.replace_operation(ctx, op, val.defining_op().unwrap());
-    Ok(())
+    convert_maca_griddim(
+        ctx,
+        rewriter,
+        op,
+        MACA_DISPATCH_GLOBAL_SIZE_Y_OFFSET,
+        MACA_DISPATCH_BLOCKDIM_XY_OFFSET,
+        16,
+    )
 }
 
-/// Convert `nctaid.z` (gridDim.z) for MXMACA: read i32 from dispatch+20.
+/// Convert `nctaid.z` (gridDim.z) for MXMACA.
 pub(crate) fn convert_maca_griddim_z(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let val = read_dispatch_i32(ctx, rewriter, op, MACA_DISPATCH_GRIDDIM_Z_OFFSET)?;
-    rewriter.replace_operation(ctx, op, val.defining_op().unwrap());
-    Ok(())
+    convert_maca_griddim(
+        ctx,
+        rewriter,
+        op,
+        MACA_DISPATCH_GLOBAL_SIZE_Z_OFFSET,
+        MACA_DISPATCH_BLOCKDIM_Z_OFFSET,
+        0,
+    )
 }
 
 fn convert_membar(

@@ -1112,13 +1112,23 @@ impl MirToLlvmConversion for ReadPtxSregNtidZOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
-            ctx,
-            rewriter,
-            self.get_operation(),
-            operands_info,
-            "llvm_nvvm_read_ptx_sreg_ntid_z",
-        )
+        let opts = crate::context::lowering_options(ctx);
+        if opts.backend == crate::BackendTarget::Maca {
+            super::intrinsics::basic::convert_maca_blockdim_z(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            )
+        } else {
+            super::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_ntid_z",
+            )
+        }
     }
 }
 

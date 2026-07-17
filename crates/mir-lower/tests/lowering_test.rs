@@ -141,7 +141,7 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 }
 
 #[test]
-fn maca_blockdim_uses_byte_offset_in_dispatch_record() -> Result<(), anyhow::Error> {
+fn maca_launch_dimensions_use_dispatch_packet_semantics() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
@@ -170,15 +170,16 @@ fn maca_blockdim_uses_byte_offset_in_dispatch_record() -> Result<(), anyhow::Err
         32,
         pliron::builtin::types::Signedness::Signless,
     );
-    let ntid_op = Operation::new(
-        &mut ctx,
-        nvvm::ReadPtxSregNtidXOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
-        vec![],
-        vec![],
-        0,
-    );
-    ntid_op.insert_at_back(block, &ctx);
+    for op_info in [
+        nvvm::ReadPtxSregNctaidXOp::get_concrete_op_info(),
+        nvvm::ReadPtxSregNctaidYOp::get_concrete_op_info(),
+        nvvm::ReadPtxSregNctaidZOp::get_concrete_op_info(),
+        nvvm::ReadPtxSregNtidZOp::get_concrete_op_info(),
+    ] {
+        let dimension_op =
+            Operation::new(&mut ctx, op_info, vec![i32_ty.into()], vec![], vec![], 0);
+        dimension_op.insert_at_back(block, &ctx);
+    }
     let ret_op = Operation::new(
         &mut ctx,
         mir::MirReturnOp::get_concrete_op_info(),
@@ -209,13 +210,44 @@ fn maca_blockdim_uses_byte_offset_in_dispatch_record() -> Result<(), anyhow::Err
         &llvm_export::export::MacaExportConfig,
     )
     .map_err(anyhow::Error::msg)?;
-    let gep = ir
-        .lines()
-        .find(|line| line.contains("getelementptr inbounds"))
-        .expect("blockDim lowering emits a dispatch GEP");
+    for offset in [4, 8, 12, 16, 20] {
+        assert!(
+            ir.lines().any(|line| {
+                line.contains("getelementptr inbounds i8, ptr addrspace(4)")
+                    && line.contains(&format!("i32 {offset}"))
+            }),
+            "missing byte offset {offset} in dispatch lowering:\n{ir}"
+        );
+    }
+    assert_eq!(
+        ir.matches("udiv i32").count(),
+        3,
+        "each gridDim axis must divide global size by blockDim:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("icmp ugt i32").count(),
+        3,
+        "each gridDim axis must implement overflow-safe ceiling division:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("zext i1").count(),
+        3,
+        "each ceiling division must add its remainder predicate:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("add i32").count(),
+        3,
+        "each gridDim axis must produce quotient plus remainder:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("lshr i32").count(),
+        1,
+        "only blockDim.y uses the high half of the packed XY field:\n{ir}"
+    );
     assert!(
-        gep.contains("getelementptr inbounds i8, ptr addrspace(4)") && gep.contains("i32 4"),
-        "dispatch offset must be four bytes, not four pointer elements:\n{gep}\n\n{ir}"
+        !ir.contains("llvm_nvvm_read_ptx_sreg_ntid_z")
+            && !ir.contains("llvm.nvvm.read.ptx.sreg.ntid.z"),
+        "MACA blockDim.z must not retain an NVVM intrinsic:\n{ir}"
     );
 
     Ok(())
