@@ -17,6 +17,10 @@
   ELF `.devbin`，再以独立的 `MacaDeviceBinary` payload（wire kind `0x210`）嵌入宿主程序。
 - kernel 已正确导出为 `define metaxgpu_kernel`；`blockDim` 的 dispatch 访问使用
   `getelementptr i8 + 4`，不再按指针宽度错误放大偏移。
+- `gridDim` 已按 dispatch packet 的真实语义修正：`+12/+16/+20` 是全局 work-item 数，
+  现在会除以各轴 `blockDim` 得到 block 数；`blockDim.z` 的 `dispatch+8` lowering 也已补齐。
+- 新增 `vecadd_bench`：C500、N=67,108,864 时固定 grid scalar kernel 实测 1443.9 GB/s
+  （0.5577 ms，标称带宽的 78.8%），相对原始逐元素 kernel 的 921.5 GB/s 提升 1.57 倍。
 - cu-bridge 的 `wcu*` 函数、类型和常量兼容层已接入 `cuda-bindings`；`cuda-core`、
   `cuda-host`（宏实际使用的 loader）均能直接加载 MACA device binary。
 - Rust/libm 数学调用会从 CUDA `__nv_*` 重写为 MACA `mc_math_func_*`。`libm_math`
@@ -62,7 +66,7 @@ cuda-oxide 是一个 Rust GPU 编译器，将 `#[kernel]` 标注的 Rust 函数�
 |---|---|
 | GPU | MetaX C500 × 4 |
 | GPU 内存 | 65536 MiB |
-| 实测带宽 | 1385 GB/s |
+| 实测带宽 | 1444 GB/s（Oxide FP32 VecAdd 有效带宽） |
 
 ### 2.2 软件
 
@@ -140,8 +144,8 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 |---|---|---|
 | threadIdx → `llvm.mxc.thread.id.x/y/z` | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | blockIdx → `llvm.mxc.block.id.x/y/z` | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
-| blockDim → dispatch.ptr+4 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
-| gridDim → dispatch.ptr+12/16/20 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
+| blockDim → dispatch.ptr+4/+8 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
+| gridDim → ceil((dispatch.ptr+12/16/20) / blockDim) | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | barrier → `llvm_mxc_barrier` | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | fence → LLVM fence 指令 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | lane_id → mbcnt.lo+mbcnt.hi | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |

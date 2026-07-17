@@ -62,6 +62,7 @@ pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = crate::mcDrvError_enum_MC_ERROR_N
 pub const CUDA_ERROR_UNKNOWN: CUresult = crate::mcDrvError_enum_MC_ERROR_UNKNOWN;
 
 // Stream and event flags.
+pub use crate::mcDrvEventFlagsEnum_MC_EVENT_DEFAULT as CUevent_flags_enum_CU_EVENT_DEFAULT;
 pub use crate::mcDrvEventFlagsEnum_MC_EVENT_DISABLE_TIMING as CUevent_flags_enum_CU_EVENT_DISABLE_TIMING;
 pub use crate::mcDrvEventWaitFlagsEnum_MC_EVENT_WAIT_DEFAULT as CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT;
 pub use crate::mcDrvStreamFlags_enum_MC_STREAM_NON_BLOCKING as CUstream_flags_enum_CU_STREAM_NON_BLOCKING;
