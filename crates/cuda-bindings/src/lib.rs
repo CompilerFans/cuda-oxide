@@ -37,38 +37,121 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::env;
 
-// Type aliases to map cu-bridge types to CUDA types for compatibility
-pub type CUresult = mcDrvError_enum;
-pub type CUevent = mcDrvEvent_t;
-pub type CUdevice = mcDrvDevice_t;
-pub type CUcontext = mcDrvContext_t;
-pub type CUmodule = mcDrvModule_t;
-pub type CUfunction = mcDrvFunction_t;
-pub type CUstream = mcDrvStream_t;
-pub type CUdeviceptr = mcDrvDeviceptr_t;
+#[cfg(cuda_oxide_cu_bridge)]
+mod cu_bridge_compat;
+#[cfg(cuda_oxide_cu_bridge)]
+pub use cu_bridge_compat::*;
 
-// Error code aliases
-pub const CUDA_SUCCESS: mcDrvError_enum = mcDrvError_enum_MC_SUCCESS;
-pub const CUDA_ERROR_INVALID_VALUE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_VALUE;
-pub const CUDA_ERROR_OUT_OF_MEMORY: mcDrvError_enum = mcDrvError_enum_MC_ERROR_OUT_OF_MEMORY;
-pub const CUDA_ERROR_NOT_INITIALIZED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_INITIALIZED;
-pub const CUDA_ERROR_DEINITIALIZED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_DEINITIALIZED;
-pub const CUDA_ERROR_NO_DEVICE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NO_DEVICE;
-pub const CUDA_ERROR_INVALID_DEVICE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_DEVICE;
-pub const CUDA_ERROR_INVALID_IMAGE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_IMAGE;
-pub const CUDA_ERROR_INVALID_CONTEXT: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_CONTEXT;
-pub const CUDA_ERROR_INVALID_HANDLE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_HANDLE;
-pub const CUDA_ERROR_NOT_FOUND: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_FOUND;
-pub const CUDA_ERROR_NOT_READY: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_READY;
-pub const CUDA_ERROR_ILLEGAL_ADDRESS: mcDrvError_enum = mcDrvError_enum_MC_ERROR_ILLEGAL_ADDRESS;
-pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: mcDrvError_enum = mcDrvError_enum_MC_ERROR_LAUNCH_OUT_OF_RESOURCES;
-pub const CUDA_ERROR_LAUNCH_TIMEOUT: mcDrvError_enum = mcDrvError_enum_MC_ERROR_LAUNCH_TIMEOUT;
-pub const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PEER_ACCESS_ALREADY_ENABLED;
-pub const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PEER_ACCESS_NOT_ENABLED;
-pub const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PRIMARY_CONTEXT_ACTIVE;
-pub const CUDA_ERROR_CONTEXT_IS_DESTROYED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_CONTEXT_IS_DESTROYED;
-pub const CUDA_ERROR_NOT_SUPPORTED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_SUPPORTED;
-pub const CUDA_ERROR_UNKNOWN: mcDrvError_enum = mcDrvError_enum_MC_ERROR_UNKNOWN;
+/// Driver implementation selected when this crate was compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaDriverBackend {
+    /// NVIDIA's native CUDA Driver API.
+    NativeCuda,
+    /// MXMACA's CUDA-compatible cu-bridge Driver API.
+    MacaCuBridge,
+}
+
+/// Driver implementation selected from the CUDA headers used by `build.rs`.
+#[cfg(cuda_oxide_cu_bridge)]
+pub const CUDA_DRIVER_BACKEND: CudaDriverBackend = CudaDriverBackend::MacaCuBridge;
+
+/// Driver implementation selected from the CUDA headers used by `build.rs`.
+#[cfg(not(cuda_oxide_cu_bridge))]
+pub const CUDA_DRIVER_BACKEND: CudaDriverBackend = CudaDriverBackend::NativeCuda;
+
+/// Returns whether `error` is CUDA's invalid-cluster-size status.
+///
+/// MXMACA 3.7 has no equivalent cu-bridge status, so that branch returns
+/// `false` instead of assigning a guessed error value.
+pub fn is_invalid_cluster_size(error: CUresult) -> bool {
+    #[cfg(cuda_oxide_cu_bridge)]
+    {
+        let _ = error;
+        false
+    }
+    #[cfg(not(cuda_oxide_cu_bridge))]
+    {
+        error == cudaError_enum_CUDA_ERROR_INVALID_CLUSTER_SIZE
+    }
+}
+
+/// Returns whether `error` denotes PTX unsupported by the CUDA driver.
+///
+/// MACA consumes LLVM IR rather than PTX and has no semantically equivalent
+/// status, so this predicate is always false in cu-bridge builds.
+pub fn is_unsupported_ptx_version(error: CUresult) -> bool {
+    #[cfg(cuda_oxide_cu_bridge)]
+    {
+        let _ = error;
+        false
+    }
+    #[cfg(not(cuda_oxide_cu_bridge))]
+    {
+        error == cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+    }
+}
+
+/// Returns CUDA's unsupported-PTX status when the selected backend defines it.
+#[doc(hidden)]
+pub fn unsupported_ptx_version_error() -> Option<CUresult> {
+    #[cfg(cuda_oxide_cu_bridge)]
+    {
+        None
+    }
+    #[cfg(not(cuda_oxide_cu_bridge))]
+    {
+        Some(cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION)
+    }
+}
+
+/// Queries a function's compile-time required cluster dimensions.
+///
+/// # Safety
+///
+/// `width`, `height`, and `depth` must each be valid for an `i32` write, and
+/// `function` must be a live function in the current context.
+pub unsafe fn cu_function_required_cluster_dimensions(
+    width: *mut std::ffi::c_int,
+    height: *mut std::ffi::c_int,
+    depth: *mut std::ffi::c_int,
+    function: CUfunction,
+) -> CUresult {
+    #[cfg(cuda_oxide_cu_bridge)]
+    {
+        let _ = (width, height, depth, function);
+        cudaError_enum_CUDA_ERROR_NOT_SUPPORTED
+    }
+    #[cfg(not(cuda_oxide_cu_bridge))]
+    {
+        let result = unsafe {
+            cuFuncGetAttribute(
+                width,
+                CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
+                function,
+            )
+        };
+        if result != cudaError_enum_CUDA_SUCCESS {
+            return result;
+        }
+        let result = unsafe {
+            cuFuncGetAttribute(
+                height,
+                CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT,
+                function,
+            )
+        };
+        if result != cudaError_enum_CUDA_SUCCESS {
+            return result;
+        }
+        unsafe {
+            cuFuncGetAttribute(
+                depth,
+                CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
+                function,
+            )
+        }
+    }
+}
 
 /// Reports the elapsed time between two recorded events, dispatching to the
 /// event elapsed-time driver entry point declared by this build's toolkit
@@ -81,10 +164,21 @@ pub const CUDA_ERROR_UNKNOWN: mcDrvError_enum = mcDrvError_enum_MC_ERROR_UNKNOWN
 /// in the current context.
 pub unsafe fn cu_event_elapsed_time(
     elapsed_ms: *mut f32,
-    start: mcDrvEvent_t,
-    end: mcDrvEvent_t,
-) -> mcDrvError_enum {
-    unsafe { wcuEventElapsedTime(elapsed_ms, start, end) }
+    start: CUevent,
+    end: CUevent,
+) -> CUresult {
+    #[cfg(cuda_oxide_cu_bridge)]
+    {
+        unsafe { wcuEventElapsedTime(elapsed_ms, start, end) }
+    }
+    #[cfg(all(not(cuda_oxide_cu_bridge), cuda_has_cuEventElapsedTime_v2))]
+    {
+        unsafe { cuEventElapsedTime_v2(elapsed_ms, start, end) }
+    }
+    #[cfg(all(not(cuda_oxide_cu_bridge), not(cuda_has_cuEventElapsedTime_v2)))]
+    {
+        unsafe { cuEventElapsedTime(elapsed_ms, start, end) }
+    }
 }
 
 /// Root directory of the CUDA toolkit used for this build, for host code that must agree with

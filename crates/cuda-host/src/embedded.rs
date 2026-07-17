@@ -11,6 +11,7 @@ pub use cuda_core::embedded::{
     artifact_bundles_from_binary_path, artifact_bundles_from_current_exe,
     embedded_modules_from_current_exe,
 };
+use cuda_core::embedded::{CUDA_DRIVER_BACKEND, CudaDriverBackend, directly_loadable_payload};
 use cuda_core::{CudaContext, CudaModule, DriverError};
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,8 +46,9 @@ pub enum EmbeddedModuleError {
 
 /// Load a named embedded artifact bundle from the current executable.
 ///
-/// Cubin and PTX payloads are loaded directly with the CUDA driver. NVVM IR and
-/// LTOIR payloads are linked to an in-memory cubin for their original target.
+/// Cubin, PTX, and MXMACA device-binary payloads are loaded directly with the
+/// configured driver. NVVM IR and LTOIR payloads are linked to an in-memory cubin
+/// for their original target.
 /// A payload built for a standard pre-Blackwell target, such as `sm_86`, may
 /// instead be converted to PTX and JIT-compiled by the driver on Blackwell.
 pub fn load_embedded_module(
@@ -72,11 +74,15 @@ pub fn load_embedded_module(
 /// All kernel symbols are therefore available regardless of which crate bundle
 /// they were compiled into.
 ///
-/// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin) are skipped; use
-/// `load_embedded_module` for those.
+/// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin, or MXMACA device
+/// binaries) are skipped; use `load_embedded_module` for those.
 pub fn load_all_ptx_bundles_merged(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+    if CUDA_DRIVER_BACKEND != CudaDriverBackend::NativeCuda {
+        return Err(EmbeddedModuleError::NoModules);
+    }
+
     let bundles = artifact_bundles_from_current_exe()?;
 
     let mut merged = String::new();
@@ -137,12 +143,14 @@ fn load_bundle(
     ctx: &Arc<CudaContext>,
     bundle: &OwnedArtifactBundle,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
-    if let Some(cubin) = bundle.payload(ArtifactPayloadKind::Cubin) {
-        return Ok(ctx.load_module_from_image(cubin)?);
+    if let Some(image) = directly_loadable_payload(bundle) {
+        return Ok(ctx.load_module_from_image(image)?);
     }
 
-    if let Some(ptx) = bundle.payload(ArtifactPayloadKind::Ptx) {
-        return Ok(ctx.load_module_from_image(ptx)?);
+    if CUDA_DRIVER_BACKEND == CudaDriverBackend::MacaCuBridge {
+        return Err(EmbeddedModuleError::UnsupportedPayload {
+            name: bundle.name.clone(),
+        });
     }
 
     if let Some(nvvm_ir) = bundle.payload(ArtifactPayloadKind::NvvmIr) {
@@ -220,6 +228,7 @@ fn concrete_bundle_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxide_artifacts::OwnedArtifactPayload;
 
     fn bundle_with_target(target: &str) -> OwnedArtifactBundle {
         OwnedArtifactBundle {
@@ -284,5 +293,34 @@ mod tests {
     #[test]
     fn target_arch_rejects_malformed_bundle_target() {
         assert!(concrete_bundle_target("sm_90x").is_err());
+    }
+
+    #[test]
+    fn mixed_bundle_uses_the_configured_driver_payload() {
+        let mut bundle = bundle_with_target("test-target");
+        bundle.payloads.extend([
+            OwnedArtifactPayload {
+                kind: ArtifactPayloadKind::Ptx,
+                name: "demo.ptx".to_string(),
+                bytes: b"ptx".to_vec(),
+            },
+            OwnedArtifactPayload {
+                kind: ArtifactPayloadKind::Cubin,
+                name: "demo.cubin".to_string(),
+                bytes: b"cubin".to_vec(),
+            },
+            OwnedArtifactPayload {
+                kind: ArtifactPayloadKind::MacaDeviceBinary,
+                name: "demo.devbin".to_string(),
+                bytes: b"\x7fELFmaca".to_vec(),
+            },
+        ]);
+
+        let expected = match CUDA_DRIVER_BACKEND {
+            CudaDriverBackend::NativeCuda => &b"cubin"[..],
+            CudaDriverBackend::MacaCuBridge => &b"\x7fELFmaca"[..],
+        };
+
+        assert_eq!(directly_loadable_payload(&bundle), Some(expected));
     }
 }

@@ -39,16 +39,32 @@ fn run() -> Result<(), Box<dyn Error>> {
     for var in TOOLKIT_ENV_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
+    println!("cargo:rerun-if-env-changed=MACA_PATH");
     println!("cargo::rustc-check-cfg=cfg(cuda_has_cuEventElapsedTime_v2)");
+    println!("cargo::rustc-check-cfg=cfg(cuda_oxide_cu_bridge)");
 
     let toolkit = cuda_toolkit_dir();
     let include_dir = find_cuda_include_dir(&toolkit)?;
+    let using_cu_bridge = is_cu_bridge(&include_dir);
+    if using_cu_bridge {
+        println!("cargo:rustc-cfg=cuda_oxide_cu_bridge");
+    }
     probe_event_elapsed_time_v2(&include_dir.join("cuda.h"));
 
-    for path in collect_lib_paths(&toolkit) {
+    for path in collect_lib_paths(&toolkit, using_cu_bridge) {
         println!("cargo:rustc-link-search=native={}", path.display());
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
+    if using_cu_bridge {
+        let runtime_lib_dir = cu_bridge_runtime_lib_dir(&toolkit).ok_or_else(|| {
+            "cuda-bindings: could not find cu-bridge libruntime_cu.so; set MACA_PATH to the MXMACA SDK root"
+        })?;
+        println!(
+            "cargo:rustc-link-search=native={}",
+            runtime_lib_dir.display()
+        );
+        println!("cargo:rustc-link-lib=dylib=runtime_cu");
+    }
 
     bindgen::builder()
         .header("wrapper.h")
@@ -124,6 +140,41 @@ fn find_cuda_include_dir(toolkit: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Returns whether the discovered headers belong to MXMACA cu-bridge.
+///
+/// cu-bridge ships its Driver API declarations under `bridge/runtime`; a
+/// native CUDA toolkit does not have that directory. Detecting the header
+/// layout keeps the public Rust API source-compatible without relying on the
+/// installation path containing a particular directory name.
+fn is_cu_bridge(include_dir: &Path) -> bool {
+    let driver_wrapper = include_dir.join("bridge/runtime/cuda_driver_wrapper.h");
+    println!("cargo:rerun-if-changed={}", driver_wrapper.display());
+    driver_wrapper.is_file()
+}
+
+/// Finds the MXMACA library directory containing cu-bridge's `wcu*` symbols.
+///
+/// Prefer an explicit `MACA_PATH`. As a fallback, resolve cu-bridge's
+/// `libcuda.so` symlink, which points into the SDK library directory.
+fn cu_bridge_runtime_lib_dir(toolkit: &str) -> Option<PathBuf> {
+    if let Ok(maca_path) = env::var("MACA_PATH") {
+        let lib_dir = PathBuf::from(maca_path).join("lib");
+        if lib_dir.join("libruntime_cu.so").is_file() {
+            return Some(lib_dir);
+        }
+    }
+
+    let cuda_library = Path::new(toolkit).join("lib/libcuda.so");
+    let lib_dir = std::fs::canonicalize(cuda_library)
+        .ok()?
+        .parent()?
+        .to_path_buf();
+    lib_dir
+        .join("libruntime_cu.so")
+        .is_file()
+        .then_some(lib_dir)
+}
+
 /// Probes the discovered `cuda.h` for `cuEventElapsedTime_v2` and emits the
 /// `cuda_has_cuEventElapsedTime_v2` cfg when present.
 ///
@@ -160,9 +211,17 @@ fn probe_event_elapsed_time_v2(cuda_h: &Path) {
 /// install), also adds that target's `lib` and `lib/stubs`. Only the single `targets/`
 /// directory matching cargo's build `TARGET` is considered, never all of `targets/*`.
 /// Order is preserved; duplicates are not filtered.
-fn collect_lib_paths(toolkit: &str) -> Vec<PathBuf> {
+fn collect_lib_paths(toolkit: &str, using_cu_bridge: bool) -> Vec<PathBuf> {
     let base = PathBuf::from(toolkit);
     let mut paths = vec![];
+
+    if using_cu_bridge {
+        // cu-bridge installs libcuda.so directly under `<root>/lib`.
+        let lib = base.join("lib");
+        if lib.is_dir() {
+            paths.push(lib);
+        }
+    }
 
     let lib64 = base.join("lib64");
     if lib64.is_dir() {

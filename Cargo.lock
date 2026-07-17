@@ -387,6 +387,7 @@ dependencies = [
  "half",
  "libnvvm-sys",
  "nvjitlink-sys",
+ "oxide-artifacts",
  "sha2",
  "thiserror",
 ]

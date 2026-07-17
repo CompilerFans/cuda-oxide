@@ -487,17 +487,34 @@ impl CudaFunction {
     /// zero or all positive. A partial tuple is treated as an invalid driver
     /// response rather than silently normalizing it.
     pub fn required_cluster_dimensions(&self) -> Result<Option<(u32, u32, u32)>, DriverError> {
-        let required = (
-            self.attribute(
-                cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
-            )?,
-            self.attribute(
-                cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT,
-            )?,
-            self.attribute(
-                cuda_bindings::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
-            )?,
-        );
+        self.context().bind_to_thread()?;
+        let mut width = MaybeUninit::uninit();
+        let mut height = MaybeUninit::uninit();
+        let mut depth = MaybeUninit::uninit();
+        unsafe {
+            cuda_bindings::cu_function_required_cluster_dimensions(
+                width.as_mut_ptr(),
+                height.as_mut_ptr(),
+                depth.as_mut_ptr(),
+                self.cu_function,
+            )
+            .result()?;
+        }
+        let required = unsafe {
+            (
+                u32::try_from(width.assume_init()),
+                u32::try_from(height.assume_init()),
+                u32::try_from(depth.assume_init()),
+            )
+        };
+        let required = match required {
+            (Ok(width), Ok(height), Ok(depth)) => (width, height, depth),
+            _ => {
+                return Err(DriverError(
+                    cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                ));
+            }
+        };
         match required {
             (0, 0, 0) => Ok(None),
             (x, y, z) if x != 0 && y != 0 && z != 0 => Ok(Some(required)),

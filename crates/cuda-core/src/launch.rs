@@ -908,9 +908,7 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
                 cluster,
             ) {
                 Ok(active_clusters) => active_clusters,
-                Err(error)
-                    if error.0 == cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_CLUSTER_SIZE =>
-                {
+                Err(error) if cuda_bindings::is_invalid_cluster_size(error.0) => {
                     return Err(LaunchContractError::ClusterShapeUnsupported {
                         kernel: C::SPEC.kernel_name,
                         cluster,

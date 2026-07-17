@@ -6,6 +6,7 @@
 //! Loading CUDA modules from embedded device artifact bundles.
 
 use crate::{CudaContext, CudaModule, DriverError};
+pub use cuda_bindings::{CUDA_DRIVER_BACKEND, CudaDriverBackend};
 use oxide_artifacts::ArtifactError;
 pub use oxide_artifacts::{
     ArtifactCompileOptions, ArtifactPayloadKind, COMPILE_OPTIONS_TARGET_MARKER, OwnedArtifactBundle,
@@ -80,13 +81,23 @@ pub fn load_embedded_module(
     ctx: &Arc<CudaContext>,
     name: &str,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
-    let module = embedded_modules_from_current_exe()?
+    let module = named_embedded_module(artifact_bundles_from_current_exe()?, name)?;
+    module.load(ctx)
+}
+
+fn named_embedded_module(
+    bundles: impl IntoIterator<Item = OwnedArtifactBundle>,
+    name: &str,
+) -> Result<EmbeddedModule, EmbeddedModuleError> {
+    let bundle = bundles
         .into_iter()
-        .find(|module| module.name() == name)
+        .find(|bundle| bundle.name == name)
         .ok_or_else(|| EmbeddedModuleError::ModuleNotFound {
             name: name.to_string(),
         })?;
-    module.load(ctx)
+    EmbeddedModule::new(bundle).ok_or_else(|| EmbeddedModuleError::UnsupportedPayload {
+        name: name.to_string(),
+    })
 }
 
 pub fn load_first_embedded_module(
@@ -100,9 +111,26 @@ pub fn load_first_embedded_module(
 }
 
 fn loadable_payload(bundle: &OwnedArtifactBundle) -> Option<&[u8]> {
-    bundle
-        .payload(ArtifactPayloadKind::Cubin)
-        .or_else(|| bundle.payload(ArtifactPayloadKind::Ptx))
+    loadable_payload_for_backend(bundle, CUDA_DRIVER_BACKEND)
+}
+
+/// Selects the direct module image supported by the driver used to build
+/// `cuda-core`.
+#[doc(hidden)]
+pub fn directly_loadable_payload(bundle: &OwnedArtifactBundle) -> Option<&[u8]> {
+    loadable_payload(bundle)
+}
+
+fn loadable_payload_for_backend(
+    bundle: &OwnedArtifactBundle,
+    backend: CudaDriverBackend,
+) -> Option<&[u8]> {
+    match backend {
+        CudaDriverBackend::NativeCuda => bundle
+            .payload(ArtifactPayloadKind::Cubin)
+            .or_else(|| bundle.payload(ArtifactPayloadKind::Ptx)),
+        CudaDriverBackend::MacaCuBridge => bundle.payload(ArtifactPayloadKind::MacaDeviceBinary),
+    }
 }
 
 #[derive(Debug)]
@@ -116,6 +144,9 @@ pub enum EmbeddedModuleError {
     },
     Artifacts(ArtifactError),
     ModuleNotFound {
+        name: String,
+    },
+    UnsupportedPayload {
         name: String,
     },
     NoModules,
@@ -133,6 +164,9 @@ impl fmt::Display for EmbeddedModuleError {
             Self::ModuleNotFound { name } => {
                 write!(f, "embedded CUDA module '{name}' was not found")
             }
+            Self::UnsupportedPayload { name } => {
+                write!(f, "embedded CUDA module '{name}' has no supported payload")
+            }
             Self::NoModules => f.write_str("no embedded CUDA modules were found"),
             Self::Driver(error) => write!(f, "failed to load embedded CUDA module: {error}"),
         }
@@ -145,7 +179,7 @@ impl std::error::Error for EmbeddedModuleError {
             Self::CurrentExe { source } | Self::Io { source, .. } => Some(source),
             Self::Artifacts(error) => Some(error),
             Self::Driver(error) => Some(error),
-            Self::ModuleNotFound { .. } | Self::NoModules => None,
+            Self::ModuleNotFound { .. } | Self::UnsupportedPayload { .. } | Self::NoModules => None,
         }
     }
 }
@@ -172,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_module_accepts_ptx_payload() {
+    fn embedded_module_accepts_ptx_only_with_native_cuda() {
         let bundle = OwnedArtifactBundle {
             name: "demo".to_string(),
             target: "sm_90".to_string(),
@@ -185,13 +219,15 @@ mod tests {
             entries: Vec::new(),
         };
 
-        let module = EmbeddedModule::new(bundle).unwrap();
-        assert_eq!(module.name(), "demo");
-        assert_eq!(module.payload(ArtifactPayloadKind::Ptx), Some(&b"ptx"[..]));
+        let module = EmbeddedModule::new(bundle);
+        assert_eq!(
+            module.is_some(),
+            CUDA_DRIVER_BACKEND == CudaDriverBackend::NativeCuda
+        );
     }
 
     #[test]
-    fn embedded_module_accepts_cubin_payload() {
+    fn embedded_module_accepts_cubin_only_with_native_cuda() {
         let bundle = OwnedArtifactBundle {
             name: "demo".to_string(),
             target: "sm_90".to_string(),
@@ -204,12 +240,88 @@ mod tests {
             entries: Vec::new(),
         };
 
-        let module = EmbeddedModule::new(bundle).unwrap();
-        assert_eq!(module.name(), "demo");
+        let module = EmbeddedModule::new(bundle);
         assert_eq!(
-            module.payload(ArtifactPayloadKind::Cubin),
+            module.is_some(),
+            CUDA_DRIVER_BACKEND == CudaDriverBackend::NativeCuda
+        );
+    }
+
+    #[test]
+    fn embedded_module_accepts_maca_binary_only_with_cu_bridge() {
+        let bundle = OwnedArtifactBundle {
+            name: "demo".to_string(),
+            target: "xcore1000".to_string(),
+            compile_options: ArtifactCompileOptions::new(),
+            payloads: vec![OwnedArtifactPayload {
+                kind: ArtifactPayloadKind::MacaDeviceBinary,
+                name: "demo.devbin".to_string(),
+                bytes: b"\x7fELFmaca".to_vec(),
+            }],
+            entries: Vec::new(),
+        };
+
+        let module = EmbeddedModule::new(bundle);
+        assert_eq!(
+            module.is_some(),
+            CUDA_DRIVER_BACKEND == CudaDriverBackend::MacaCuBridge
+        );
+    }
+
+    #[test]
+    fn mixed_bundle_selection_follows_driver_backend() {
+        let bundle = OwnedArtifactBundle {
+            name: "mixed".to_string(),
+            target: "test-target".to_string(),
+            compile_options: ArtifactCompileOptions::new(),
+            payloads: vec![
+                OwnedArtifactPayload {
+                    kind: ArtifactPayloadKind::Ptx,
+                    name: "mixed.ptx".to_string(),
+                    bytes: b"ptx".to_vec(),
+                },
+                OwnedArtifactPayload {
+                    kind: ArtifactPayloadKind::Cubin,
+                    name: "mixed.cubin".to_string(),
+                    bytes: b"cubin".to_vec(),
+                },
+                OwnedArtifactPayload {
+                    kind: ArtifactPayloadKind::MacaDeviceBinary,
+                    name: "mixed.devbin".to_string(),
+                    bytes: b"\x7fELFmaca".to_vec(),
+                },
+            ],
+            entries: Vec::new(),
+        };
+
+        assert_eq!(
+            loadable_payload_for_backend(&bundle, CudaDriverBackend::NativeCuda),
             Some(&b"cubin"[..])
         );
+        assert_eq!(
+            loadable_payload_for_backend(&bundle, CudaDriverBackend::MacaCuBridge),
+            Some(&b"\x7fELFmaca"[..])
+        );
+    }
+
+    #[test]
+    fn named_module_distinguishes_missing_from_unsupported_payload() {
+        let unsupported = OwnedArtifactBundle {
+            name: "present".to_string(),
+            target: "test-target".to_string(),
+            compile_options: ArtifactCompileOptions::new(),
+            payloads: Vec::new(),
+            entries: Vec::new(),
+        };
+
+        assert!(matches!(
+            named_embedded_module([unsupported], "present"),
+            Err(EmbeddedModuleError::UnsupportedPayload { name }) if name == "present"
+        ));
+        assert!(matches!(
+            named_embedded_module(Vec::new(), "missing"),
+            Err(EmbeddedModuleError::ModuleNotFound { name }) if name == "missing"
+        ));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

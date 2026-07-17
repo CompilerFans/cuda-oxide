@@ -34,7 +34,7 @@ impl DriverError {
     /// installed driver. PTX requires direct driver support even when other
     /// parts of the toolkit can use CUDA minor-version compatibility.
     pub fn is_unsupported_ptx_version(&self) -> bool {
-        self.0 == cuda_bindings::cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+        cuda_bindings::is_unsupported_ptx_version(self.0)
     }
 
     /// Shared formatting helper for both `Display` and [`Debug`].
@@ -146,11 +146,11 @@ mod tests {
 
     #[test]
     fn identifies_unsupported_ptx_version() {
-        let unsupported =
-            DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_UNSUPPORTED_PTX_VERSION);
         let unrelated = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
 
-        assert!(unsupported.is_unsupported_ptx_version());
+        if let Some(error) = cuda_bindings::unsupported_ptx_version_error() {
+            assert!(DriverError(error).is_unsupported_ptx_version());
+        }
         assert!(!unrelated.is_unsupported_ptx_version());
     }
 }
