@@ -3617,6 +3617,55 @@ fn maca_mma_f16_fails_instead_of_returning_accumulator() -> Result<(), anyhow::E
 }
 
 #[test]
+fn maca_native_m16n16k16_f16_lowers_to_mxc_intrinsic() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let argument_types = (0..4)
+        .map(|_| f32_ty.into())
+        .chain((0..4).map(|_| i32_ty.into()))
+        .collect();
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
+    let operands = (0..8)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect();
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::MmaM16N16K16F32F16Op::get_concrete_op_info(),
+        vec![f32_ty.into(); 4],
+        operands,
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let module = Operation::get_op::<ModuleOp>(module_ptr, &ctx).expect("module op");
+    let ir = llvm_export::export::export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &llvm_export::export::MacaExportConfig,
+    )
+    .map_err(anyhow::Error::msg)?;
+    assert!(ir.contains("@llvm.mxc.mma.f32.16x16x16f16(<4 x half>"));
+    assert!(ir.contains("<4 x float>"));
+    assert!(!ir.contains("llvm.nvvm"));
+    assert!(!ir.contains("asm "));
+    Ok(())
+}
+
+#[test]
 fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{IntegerType, Signedness};
 

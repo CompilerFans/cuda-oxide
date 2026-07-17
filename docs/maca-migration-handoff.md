@@ -37,7 +37,8 @@
   现在会在编译期明确报错，lowering 后置校验也禁止残留 inline PTX/NVVM intrinsic。
 - **Wave64 核心已闭环**：`WAVE_SIZE=64`、mask/ballot/active/lanemask 为 u64；idx/up/down/xor
   shuffle、all/any/ballot、match any/all、redux、sync_mask、block reduce/scan 已在 C500 真机通过。
-- **仍未完成**：16x16x16 原生 MMA。
+- **原生 MMA 已启动**：C500 Wave64 `m16n16k16.f32.f16` 已通过 16x16 真机数值 smoke；
+  BF16/INT8 变体仍待补齐。
 
 ---
 
@@ -158,6 +159,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | match any/all → 按位 icmp vote mask 交集 | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500，i32/i64 value |
 | redux add/min/max/and/or/xor → 6 级稀疏 mask bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500，full/sparse mask |
 | sync_mask → warp fence + barrier | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
+| m16n16k16 f32/f16 MMA → `llvm.mxc.mma.f32.16x16x16f16` | `mir-lower/src/convert/intrinsics/wmma.rs` | ✅ C500 16x16 数值 smoke |
 | CUDA WMMA | `mir-lower/src/convert/intrinsics/wmma.rs` | ✅ MACA 编译期明确拒绝 |
 
 #### Wave=64 适配
@@ -215,7 +217,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 | 任务 | 说明 | 阻塞因素 |
 |---|---|---|
-| MMA builtin 映射 | `__builtin_mxc_mma_16x16x16f16/bf16/i8` | 需要确认 builtin/LLVM lowering 与布局 |
+| MMA builtin 映射 | `__builtin_mxc_mma_16x16x16bf16/i8` | FP16 已完成；BF16/INT8 待实现与真机验证 |
 
 已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin`
 产物闭环、Inline PTX/MMA fail-closed、Wave64 shuffle/vote/match/redux 与 C500 primitives smoke。
@@ -316,6 +318,9 @@ cargo oxide run vecadd --target maca
 
 # 运行 Wave64 shuffle/vote/match/redux/lanemask、atomics、block reduce/scan 真机 smoke
 cargo oxide run maca_primitives_smoke --target maca
+
+# 运行 C500 Wave64 原生 m16n16k16 FP16 MMA 真机 smoke
+cargo oxide run maca_mma_smoke --target maca
 ```
 
 ### 6.2 测试命令
@@ -417,12 +422,13 @@ cargo oxide doctor
 | `feat: add cu-bridge type aliases to cuda-bindings` | 类型别名 |
 | `feat: implement direct kernel launch via C launcher` | 直接 kernel launch |
 | `feat(maca): support Wave64 match and redux collectives` | C500 match any/all 与全部整数 redux，含稀疏 mask |
+| `feat(maca): add native Wave64 FP16 MMA` | C500 m16n16k16 f32/f16 intrinsic 与 16x16 数值 smoke |
 
 ---
 
 ## 9. 下一步建议
 
-1. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
+1. **MMA builtin 映射** — 继续实现并验证 `__builtin_mxc_mma_16x16x16bf16/i8`
 2. **GEMM 示例** — 在 Wave64/MMA 正确性稳定后进入端到端矩阵乘
 3. **性能基线** — 与 MXMACA C++/库实现同口径比较
 

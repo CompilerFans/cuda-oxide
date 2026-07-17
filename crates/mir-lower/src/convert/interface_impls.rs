@@ -60,8 +60,8 @@ use dialect_nvvm::ops::{
     MbarrierInitSharedOp, MbarrierInvalSharedOp, MbarrierTestWaitSharedOp,
     MbarrierTryWaitParityClusterOp, MbarrierTryWaitParitySharedOp, MbarrierTryWaitSharedOp,
     MinBf16x2Op, MmaM8N8K4F64Op, MmaM16N8K8F32Tf32Op, MmaM16N8K16F32Bf16Op, MmaM16N8K16F32F16Op,
-    MmaM16N8K32S32S8Op, MovmatrixTransB16Op, MulBf16x2Op, NanosleepOp, NegBf16x2Op,
-    NvvmAtomAddBf16x2Op, NvvmAtomAddF16x2Op, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
+    MmaM16N8K32S32S8Op, MmaM16N16K16F32F16Op, MovmatrixTransB16Op, MulBf16x2Op, NanosleepOp,
+    NegBf16x2Op, NvvmAtomAddBf16x2Op, NvvmAtomAddF16x2Op, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
     NvvmAtomicRmwOp, NvvmAtomicStoreOp, PmEventOp, ReadPtxSregClock64Op, ReadPtxSregClockOp,
     ReadPtxSregClusterCtaidXOp, ReadPtxSregClusterCtaidYOp, ReadPtxSregClusterCtaidZOp,
     ReadPtxSregClusterIdxOp, ReadPtxSregClusterNctaidXOp, ReadPtxSregClusterNctaidYOp,
@@ -2785,6 +2785,23 @@ impl MirToLlvmConversion for MmaM16N8K16F32F16Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::wmma::convert_mma_m16n8k16_f32_f16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MmaM16N16K16F32F16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wmma::convert_mma_m16n16k16_f32_f16(
             ctx,
             rewriter,
             self.get_operation(),

@@ -248,6 +248,25 @@ impl MmaM16N8K16F32F16Op {
     }
 }
 
+/// C500-native Wave64 MMA: m16n16k16 with f32 accumulator and f16 inputs.
+///
+/// Operands are C[0..4] f32, A[0..2] packed i32, then B[0..2] packed i32.
+/// Results are four f32 accumulator registers.
+#[pliron_op(
+    name = "nvvm.mma_m16n16k16_f32_f16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<8>, NResultsInterface<4>],
+)]
+pub struct MmaM16N16K16F32F16Op;
+
+impl MmaM16N16K16F32F16Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MmaM16N16K16F32F16Op { op }
+    }
+}
+
 /// Register-only warp MMA: m16n8k8 with f32 accumulator and tf32 inputs.
 ///
 /// # Operands
@@ -487,6 +506,7 @@ pub(super) fn register(ctx: &mut Context) {
     MovmatrixTransB16Op::register(ctx);
     MmaM16N8K16F32Bf16Op::register(ctx);
     MmaM16N8K16F32F16Op::register(ctx);
+    MmaM16N16K16F32F16Op::register(ctx);
     MmaM16N8K8F32Tf32Op::register(ctx);
     MmaM16N8K32S32S8Op::register(ctx);
     MmaM8N8K4F64Op::register(ctx);

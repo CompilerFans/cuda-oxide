@@ -26,6 +26,28 @@
 //! memory accesses. Movmatrix and MMA are register-only and have no memory
 //! effect.
 
+/// Multiply one C500 Wave64-distributed FP16 tile and add an f32 accumulator.
+///
+/// Together, all 64 lanes compute `D = A x B + C` for a 16x16x16 native
+/// MXMACA MMA. Each lane supplies two packed FP16 registers for A and B and
+/// four f32 accumulator registers. Each packed `u32` contains two IEEE f16
+/// values, low half first.
+///
+/// This is intentionally separate from CUDA's `m16n8` operations: the wave
+/// width, tile shape, and per-lane fragment ABI are different.
+///
+/// # Safety
+///
+/// - All 64 lanes in the C500 wave must execute the call together.
+/// - `a`, `b`, and `c` must use the MXMACA 16x16x16 fragment layout.
+/// - Calling this API for a non-MACA target is unsupported.
+#[inline(never)]
+#[must_use]
+pub unsafe fn mma_m16n16k16_f32_f16(c: [f32; 4], a: [u32; 2], b: [u32; 2]) -> [f32; 4] {
+    let _ = (c, a, b);
+    unreachable!("mma_m16n16k16_f32_f16 called outside MACA kernel context")
+}
+
 /// Transpose an 8×8 matrix of b16 elements in-register across the warp.
 ///
 /// Each lane provides one `u32` that packs two b16 elements of the source
