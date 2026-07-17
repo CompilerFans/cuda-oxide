@@ -3747,6 +3747,81 @@ fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error
 }
 
 #[test]
+fn maca_wave64_match_and_redux_lower_to_native_ir() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![i64_ty.into(), i32_ty.into(), i64_ty.into()]);
+    let mask = entry.deref(&ctx).get_argument(0);
+    let value = entry.deref(&ctx).get_argument(1);
+    let wide_value = entry.deref(&ctx).get_argument(2);
+
+    for (op_info, operand) in [
+        (nvvm::MatchAnySyncI32Op::get_concrete_op_info(), value),
+        (nvvm::MatchAllSyncI64Op::get_concrete_op_info(), wide_value),
+    ] {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i64_ty.into()],
+            vec![mask, operand],
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    for op_info in [
+        nvvm::ReduxSyncAddOp::get_concrete_op_info(),
+        nvvm::ReduxSyncUminOp::get_concrete_op_info(),
+        nvvm::ReduxSyncMinOp::get_concrete_op_info(),
+        nvvm::ReduxSyncUmaxOp::get_concrete_op_info(),
+        nvvm::ReduxSyncMaxOp::get_concrete_op_info(),
+        nvvm::ReduxSyncAndOp::get_concrete_op_info(),
+        nvvm::ReduxSyncOrOp::get_concrete_op_info(),
+        nvvm::ReduxSyncXorOp::get_concrete_op_info(),
+    ] {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i32_ty.into()],
+            vec![mask, value],
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let module = Operation::get_op::<ModuleOp>(module_ptr, &ctx).expect("module op");
+    let ir = llvm_export::export::export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &llvm_export::export::MacaExportConfig,
+    )
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(ir.matches("@llvm.mxc.bsm.bpermute").count(), 49);
+    assert!(ir.contains("@llvm.mxc.icmp.i64.i32"));
+    assert!(ir.contains("@llvm.cttz.i64"));
+    assert!(ir.contains("select i1"));
+    assert!(!ir.contains("llvm.nvvm"));
+    assert!(!ir.contains("asm "));
+    Ok(())
+}
+
+#[test]
 fn test_mma_m16n8k8_f32_tf32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = make_test_ctx();
     let f32_ty = pliron::builtin::types::FP32Type::get(&ctx);

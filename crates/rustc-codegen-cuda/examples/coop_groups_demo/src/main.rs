@@ -37,7 +37,7 @@ use cuda_host::{cuda_launch, cuda_module};
 
 /// Each thread writes the warp's `active_mask()` (full warp → 0xFFFFFFFF).
 #[kernel]
-pub fn test_active_mask(mut out: DisjointSlice<u32>) {
+pub fn test_active_mask(mut out: DisjointSlice<u64>) {
     let gid = thread::index_1d();
     let mask = warp::active_mask();
     if let Some(slot) = out.get_mut(gid) {
@@ -49,11 +49,11 @@ pub fn test_active_mask(mut out: DisjointSlice<u32>) {
 /// `value`. With `value = lane / 4` the warp is partitioned into 8 buckets
 /// of 4 contiguous lanes each, so every thread should see `0xF << (group*4)`.
 #[kernel]
-pub fn test_match_any(mut out: DisjointSlice<u32>) {
+pub fn test_match_any(mut out: DisjointSlice<u64>) {
     let gid = thread::index_1d();
     let lane = warp::lane_id();
     let value: u32 = lane / 4;
-    let mask = warp::match_any_sync(u32::MAX, value);
+    let mask = warp::match_any_sync(u64::MAX, value);
     if let Some(slot) = out.get_mut(gid) {
         *slot = mask;
     }
@@ -61,9 +61,9 @@ pub fn test_match_any(mut out: DisjointSlice<u32>) {
 
 /// All lanes use the same value, so `match_all_sync` returns the full mask.
 #[kernel]
-pub fn test_match_all(mut out: DisjointSlice<u32>) {
+pub fn test_match_all(mut out: DisjointSlice<u64>) {
     let gid = thread::index_1d();
-    let mask = warp::match_all_sync(u32::MAX, 42u32);
+    let mask = warp::match_all_sync(u64::MAX, 42u32);
     if let Some(slot) = out.get_mut(gid) {
         *slot = mask;
     }
@@ -173,7 +173,7 @@ mod grid_sync_kernels {
 /// `warp::ballot(predicate)`. With `predicate = lane_id() & 1`, every
 /// lane should report `0xAAAAAAAA`.
 #[kernel]
-pub fn test_typed_warp32_ballot(mut out: DisjointSlice<u32>) {
+pub fn test_typed_warp32_ballot(mut out: DisjointSlice<u64>) {
     let gid = thread::index_1d();
     let warp_tile = this_thread_block().tiled_partition::<32>();
     let mask = warp_tile.ballot((warp::lane_id() & 1) != 0);
@@ -186,7 +186,7 @@ pub fn test_typed_warp32_ballot(mut out: DisjointSlice<u32>) {
 /// `k` is set iff the lane at tile-rank `k` had `predicate == true`.
 /// With `predicate = lane_id() & 1` every tile should see `0xAAAA`.
 #[kernel]
-pub fn test_typed_warp16_ballot(mut out: DisjointSlice<u32>) {
+pub fn test_typed_warp16_ballot(mut out: DisjointSlice<u64>) {
     let gid = thread::index_1d();
     let tile = this_thread_block().tiled_partition::<16>();
     let mask = tile.ballot((warp::lane_id() & 1) != 0);
@@ -618,7 +618,7 @@ fn main() {
 
     // --- active_mask ---
     println!("--- active_mask() ---");
-    let mut out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out = DeviceBuffer::<u64>::zeroed(&stream, N).unwrap();
     // SAFETY: `slice_mut(out)` is the (ptr, len) pair for `test_active_mask`'s single
     // slice parameter (see the #[kernel] fn above); `out` is a live DeviceBuffer.
     unsafe {
@@ -632,7 +632,7 @@ fn main() {
     }
     .expect("test_active_mask launch failed");
     let host = out.to_host_vec(&stream).unwrap();
-    let ok = host.iter().all(|&m| m == u32::MAX);
+    let ok = host.iter().all(|&m| m == u32::MAX as u64);
     println!(
         "  every lane saw 0xFFFFFFFF: {}",
         if ok { "yes" } else { "NO" }
@@ -640,7 +640,7 @@ fn main() {
 
     // --- match_any_sync ---
     println!("\n--- match_any_sync(value = lane / 4) ---");
-    let mut out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out = DeviceBuffer::<u64>::zeroed(&stream, N).unwrap();
     // SAFETY: `slice_mut(out)` is the (ptr, len) pair for `test_match_any`'s single
     // slice parameter (see the #[kernel] fn above); `out` is a live DeviceBuffer.
     unsafe {
@@ -656,7 +656,7 @@ fn main() {
     let host = out.to_host_vec(&stream).unwrap();
     let ok = host.iter().enumerate().all(|(i, &m)| {
         let group = (i % 32) / 4;
-        m == 0xF << (group * 4)
+        m == 0xFu64 << (group * 4)
     });
     println!(
         "  every lane saw its 4-bucket mask: {}",
@@ -665,7 +665,7 @@ fn main() {
 
     // --- match_all_sync ---
     println!("\n--- match_all_sync(constant) ---");
-    let mut out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out = DeviceBuffer::<u64>::zeroed(&stream, N).unwrap();
     // SAFETY: `slice_mut(out)` is the (ptr, len) pair for `test_match_all`'s single
     // slice parameter (see the #[kernel] fn above); `out` is a live DeviceBuffer.
     unsafe {
@@ -679,7 +679,7 @@ fn main() {
     }
     .expect("test_match_all launch failed");
     let host = out.to_host_vec(&stream).unwrap();
-    let ok = host.iter().all(|&m| m == u32::MAX);
+    let ok = host.iter().all(|&m| m == u32::MAX as u64);
     println!(
         "  every lane saw 0xFFFFFFFF: {}",
         if ok { "yes" } else { "NO" }
@@ -720,7 +720,7 @@ fn main() {
 
     // --- WarpTile<32>::ballot ---
     println!("\n--- WarpTile<32>::ballot(lane_id & 1) ---");
-    let mut out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out = DeviceBuffer::<u64>::zeroed(&stream, N).unwrap();
     // SAFETY: `slice_mut(out)` is the (ptr, len) pair for `test_typed_warp32_ballot`'s single
     // slice parameter (see the #[kernel] fn above); `out` is a live DeviceBuffer.
     unsafe {
@@ -746,7 +746,7 @@ fn main() {
 
     // --- WarpTile<16>::ballot ---
     println!("\n--- WarpTile<16>::ballot(lane_id & 1) ---");
-    let mut out = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out = DeviceBuffer::<u64>::zeroed(&stream, N).unwrap();
     // SAFETY: `slice_mut(out)` is the (ptr, len) pair for `test_typed_warp16_ballot`'s single
     // slice parameter (see the #[kernel] fn above); `out` is a live DeviceBuffer.
     unsafe {

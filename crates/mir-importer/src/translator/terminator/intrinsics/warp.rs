@@ -490,7 +490,7 @@ pub fn emit_warp_shuffle_i64(
 /// Emit a warp match operation (`match.any.sync` or `match.all.sync`).
 ///
 /// Both ops have the same shape from MIR's perspective: 2 operands
-/// `[mask, value]` and 1 result (a u32 bitmask). The op identifier picks the
+/// `[mask, value]` and 1 result (a Wave64 u64 bitmask). The op identifier picks the
 /// 32-bit vs 64-bit and any vs all variant.
 ///
 /// # Parameters
@@ -526,7 +526,7 @@ pub fn emit_warp_match(
 
     let _ = value_is_i64;
 
-    let result_ty = IntegerType::get(ctx, 32, Signedness::Unsigned).to_handle();
+    let result_ty = IntegerType::get(ctx, 64, Signedness::Unsigned).to_handle();
 
     let (mask, mut last_op) = rvalue::translate_operand(
         ctx,

@@ -36,8 +36,8 @@
 - **已消除静默错误路径**：MACA 的通用 inline PTX、用户 inline PTX 和 CUDA WMMA
   现在会在编译期明确报错，lowering 后置校验也禁止残留 inline PTX/NVVM intrinsic。
 - **Wave64 核心已闭环**：`WAVE_SIZE=64`、mask/ballot/active/lanemask 为 u64；idx/up/down/xor
-  shuffle、all/any/ballot、sync_mask、block reduce/scan 已在 C500 真机通过。
-- **仍未完成**：match/redux 和 16x16x16 原生 MMA。
+  shuffle、all/any/ballot、match any/all、redux、sync_mask、block reduce/scan 已在 C500 真机通过。
+- **仍未完成**：16x16x16 原生 MMA。
 
 ---
 
@@ -155,6 +155,8 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | lane_id → mbcnt.lo+mbcnt.hi | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | i32/f32/u64/f64 shuffle → 源 lane 计算 + bsm.bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
 | ballot/all/any → icmp.i64.i32 + u64 mask | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
+| match any/all → 按位 icmp vote mask 交集 | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500，i32/i64 value |
+| redux add/min/max/and/or/xor → 6 级稀疏 mask bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500，full/sparse mask |
 | sync_mask → warp fence + barrier | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
 | CUDA WMMA | `mir-lower/src/convert/intrinsics/wmma.rs` | ✅ MACA 编译期明确拒绝 |
 
@@ -216,7 +218,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | MMA builtin 映射 | `__builtin_mxc_mma_16x16x16f16/bf16/i8` | 需要确认 builtin/LLVM lowering 与布局 |
 
 已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin`
-产物闭环、Inline PTX/MMA fail-closed、Wave64 核心与 C500 primitives smoke。
+产物闭环、Inline PTX/MMA fail-closed、Wave64 shuffle/vote/match/redux 与 C500 primitives smoke。
 
 ### 4.2 中优先级
 
@@ -312,7 +314,7 @@ cargo run -p maca-vecadd
 # 运行原始统一编译 vecadd（完整 rustc backend → mxcc → bundle → cu-bridge 路径）
 cargo oxide run vecadd --target maca
 
-# 运行 Wave64 shuffle/vote/lanemask、atomics、block reduce/scan 真机 smoke
+# 运行 Wave64 shuffle/vote/match/redux/lanemask、atomics、block reduce/scan 真机 smoke
 cargo oxide run maca_primitives_smoke --target maca
 ```
 
@@ -414,15 +416,15 @@ cargo oxide doctor
 | `refactor: simplify maca-vecadd to standalone executable` | 独立可执行文件 |
 | `feat: add cu-bridge type aliases to cuda-bindings` | 类型别名 |
 | `feat: implement direct kernel launch via C launcher` | 直接 kernel launch |
+| `feat(maca): support Wave64 match and redux collectives` | C500 match any/all 与全部整数 redux，含稀疏 mask |
 
 ---
 
 ## 9. 下一步建议
 
-1. **match/redux 原生 lowering** — 当前由 MACA 后置校验明确拒绝
-2. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
-3. **GEMM 示例** — 在 Wave64/MMA 正确性稳定后进入端到端矩阵乘
-4. **性能基线** — 与 MXMACA C++/库实现同口径比较
+1. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
+2. **GEMM 示例** — 在 Wave64/MMA 正确性稳定后进入端到端矩阵乘
+3. **性能基线** — 与 MXMACA C++/库实现同口径比较
 
 ---
 

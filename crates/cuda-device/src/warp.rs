@@ -44,6 +44,8 @@
 //! }
 //! ```
 
+use crate::WaveMask;
+
 // =============================================================================
 // Lane Identification
 // =============================================================================
@@ -690,14 +692,14 @@ pub fn popc(predicate: bool) -> u32 {
 ///
 /// ```rust,ignore
 /// // Find the lowest lane in my warp that has my key (bulk-insert leader).
-/// let same_key_lanes = warp::match_any_sync(u32::MAX, key);
+/// let same_key_lanes = warp::match_any_sync(u64::MAX, key);
 /// let leader_lane = same_key_lanes.trailing_zeros();
 /// if warp::lane_id() == leader_lane {
 ///     // I'm the leader for this key — do the atomic insert.
 /// }
 /// ```
 #[inline(never)]
-pub fn match_any_sync(mask: u32, value: u32) -> u32 {
+pub fn match_any_sync(mask: WaveMask, value: u32) -> WaveMask {
     let _ = (mask, value);
     unreachable!("match_any_sync called outside CUDA kernel context")
 }
@@ -706,7 +708,7 @@ pub fn match_any_sync(mask: u32, value: u32) -> u32 {
 ///
 /// PTX `match.any.sync.b64`. Lowered to `@llvm.nvvm.match.any.sync.i64`.
 #[inline(never)]
-pub fn match_any_i64_sync(mask: u32, value: u64) -> u32 {
+pub fn match_any_i64_sync(mask: WaveMask, value: u64) -> WaveMask {
     let _ = (mask, value);
     unreachable!("match_any_i64_sync called outside CUDA kernel context")
 }
@@ -722,12 +724,12 @@ pub fn match_any_i64_sync(mask: u32, value: u64) -> u32 {
 /// # Example
 ///
 /// ```rust,ignore
-/// if warp::match_all_sync(u32::MAX, my_value) != 0 {
+/// if warp::match_all_sync(u64::MAX, my_value) != 0 {
 ///     // Every lane in the warp had the same value.
 /// }
 /// ```
 #[inline(never)]
-pub fn match_all_sync(mask: u32, value: u32) -> u32 {
+pub fn match_all_sync(mask: WaveMask, value: u32) -> WaveMask {
     let _ = (mask, value);
     unreachable!("match_all_sync called outside CUDA kernel context")
 }
@@ -736,7 +738,7 @@ pub fn match_all_sync(mask: u32, value: u32) -> u32 {
 ///
 /// PTX `match.all.sync.b64`. Lowered to `@llvm.nvvm.match.all.sync.i64p`.
 #[inline(never)]
-pub fn match_all_i64_sync(mask: u32, value: u64) -> u32 {
+pub fn match_all_i64_sync(mask: WaveMask, value: u64) -> WaveMask {
     let _ = (mask, value);
     unreachable!("match_all_i64_sync called outside CUDA kernel context")
 }
@@ -762,7 +764,7 @@ pub fn match_all_i64_sync(mask: u32, value: u64) -> u32 {
 /// `convergent` attribute on the lowered intrinsic, which only stops LLVM
 /// from moving the instruction across control flow.)
 #[inline(never)]
-pub fn redux_sync_add(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_add(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_add called outside CUDA kernel context")
 }
@@ -784,7 +786,7 @@ pub fn redux_sync_add(mask: u32, value: u32) -> u32 {
 /// Lowered to `@llvm.nvvm.redux.sync.umin` → PTX `redux.sync.min.u32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_min_u32(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_min_u32(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_min_u32 called outside CUDA kernel context")
 }
@@ -794,7 +796,7 @@ pub fn redux_sync_min_u32(mask: u32, value: u32) -> u32 {
 /// Lowered to `@llvm.nvvm.redux.sync.min` → PTX `redux.sync.min.s32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_min_i32(mask: u32, value: i32) -> i32 {
+pub fn redux_sync_min_i32(mask: WaveMask, value: i32) -> i32 {
     let _ = (mask, value);
     unreachable!("redux_sync_min_i32 called outside CUDA kernel context")
 }
@@ -804,7 +806,7 @@ pub fn redux_sync_min_i32(mask: u32, value: i32) -> i32 {
 /// Lowered to `@llvm.nvvm.redux.sync.umax` → PTX `redux.sync.max.u32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_max_u32(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_max_u32(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_max_u32 called outside CUDA kernel context")
 }
@@ -814,7 +816,7 @@ pub fn redux_sync_max_u32(mask: u32, value: u32) -> u32 {
 /// Lowered to `@llvm.nvvm.redux.sync.max` → PTX `redux.sync.max.s32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_max_i32(mask: u32, value: i32) -> i32 {
+pub fn redux_sync_max_i32(mask: WaveMask, value: i32) -> i32 {
     let _ = (mask, value);
     unreachable!("redux_sync_max_i32 called outside CUDA kernel context")
 }
@@ -824,7 +826,7 @@ pub fn redux_sync_max_i32(mask: u32, value: i32) -> i32 {
 /// Lowered to `@llvm.nvvm.redux.sync.and` → PTX `redux.sync.and.b32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_and(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_and(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_and called outside CUDA kernel context")
 }
@@ -834,7 +836,7 @@ pub fn redux_sync_and(mask: u32, value: u32) -> u32 {
 /// Lowered to `@llvm.nvvm.redux.sync.or` → PTX `redux.sync.or.b32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_or(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_or(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_or called outside CUDA kernel context")
 }
@@ -844,7 +846,7 @@ pub fn redux_sync_or(mask: u32, value: u32) -> u32 {
 /// Lowered to `@llvm.nvvm.redux.sync.xor` → PTX `redux.sync.xor.b32`.
 /// Convergent; participating lanes must be converged at the call.
 #[inline(never)]
-pub fn redux_sync_xor(mask: u32, value: u32) -> u32 {
+pub fn redux_sync_xor(mask: WaveMask, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_xor called outside CUDA kernel context")
 }

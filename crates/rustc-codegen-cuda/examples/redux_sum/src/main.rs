@@ -15,7 +15,7 @@
 use cuda_device::{DisjointSlice, kernel, thread, warp};
 use cuda_host::cuda_module;
 
-const FULL_MASK: u32 = 0xffff_ffff;
+const FULL_MASK: u64 = u64::MAX;
 
 // =============================================================================
 // KERNELS

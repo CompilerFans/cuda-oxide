@@ -76,7 +76,7 @@
 //! let m_h2 = tile.ballot(tag == h2);  // mask is 0xFFFF or 0xFFFF0000
 //! ```
 
-use crate::{cluster, grid, shared::SharedArray, thread, warp};
+use crate::{WaveMask, cluster, grid, shared::SharedArray, thread, warp};
 
 // =============================================================================
 // Traits
@@ -168,22 +168,22 @@ pub trait WarpCollective: ThreadGroup {
     /// positions; the implementation already AND-s the raw hardware
     /// result with the group's participation mask, so the returned
     /// bits are guaranteed to be a subset of `mask()`.
-    fn match_any(&self, value: u32) -> u32;
+    fn match_any(&self, value: u32) -> WaveMask;
 
     /// 64-bit value variant of [`match_any`](Self::match_any).
     ///
     /// PTX `match.any.sync.b64` (sm_70+).
-    fn match_any_i64(&self, value: u64) -> u32;
+    fn match_any_i64(&self, value: u64) -> WaveMask;
 
     /// Group's participation mask if every lane in the group has the same
     /// `value`, else 0.
     ///
     /// PTX `match.all.sync.b32` (sm_70+). Recover the all-match predicate
     /// as `result != 0`.
-    fn match_all(&self, value: u32) -> u32;
+    fn match_all(&self, value: u32) -> WaveMask;
 
     /// 64-bit value variant of [`match_all`](Self::match_all).
-    fn match_all_i64(&self, value: u64) -> u32;
+    fn match_all_i64(&self, value: u64) -> WaveMask;
 }
 
 // =============================================================================
@@ -514,23 +514,23 @@ impl<const N: u32> WarpCollective for WarpTile<N> {
     }
 
     #[inline(always)]
-    fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask() as u32, value) & self.mask() as u32
+    fn match_any(&self, value: u32) -> WaveMask {
+        warp::match_any_sync(self.mask(), value) & self.mask()
     }
 
     #[inline(always)]
-    fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask() as u32, value) & self.mask() as u32
+    fn match_any_i64(&self, value: u64) -> WaveMask {
+        warp::match_any_i64_sync(self.mask(), value) & self.mask()
     }
 
     #[inline(always)]
-    fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask() as u32, value)
+    fn match_all(&self, value: u32) -> WaveMask {
+        warp::match_all_sync(self.mask(), value)
     }
 
     #[inline(always)]
-    fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask() as u32, value)
+    fn match_all_i64(&self, value: u64) -> WaveMask {
+        warp::match_all_i64_sync(self.mask(), value)
     }
 }
 
@@ -674,23 +674,23 @@ impl WarpCollective for CoalescedThreads {
     }
 
     #[inline(always)]
-    fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask as u32, value) & self.mask as u32
+    fn match_any(&self, value: u32) -> WaveMask {
+        warp::match_any_sync(self.mask, value) & self.mask
     }
 
     #[inline(always)]
-    fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask as u32, value) & self.mask as u32
+    fn match_any_i64(&self, value: u64) -> WaveMask {
+        warp::match_any_i64_sync(self.mask, value) & self.mask
     }
 
     #[inline(always)]
-    fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask as u32, value)
+    fn match_all(&self, value: u32) -> WaveMask {
+        warp::match_all_sync(self.mask, value)
     }
 
     #[inline(always)]
-    fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask as u32, value)
+    fn match_all_i64(&self, value: u64) -> WaveMask {
+        warp::match_all_i64_sync(self.mask, value)
     }
 }
 

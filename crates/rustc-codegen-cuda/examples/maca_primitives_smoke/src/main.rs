@@ -26,6 +26,10 @@ mod kernels {
         mut active: DisjointSlice<u64>,
         mut lane_masks: DisjointSlice<u64>,
         mut wide_shuffle: DisjointSlice<u64>,
+        mut match32: DisjointSlice<u64>,
+        mut match64: DisjointSlice<u64>,
+        mut match_all: DisjointSlice<u64>,
+        mut redux: DisjointSlice<u32>,
     ) {
         let lane = warp::lane_id();
         let value = lane + 1;
@@ -49,6 +53,21 @@ mod kernels {
         let wide_value = ((lane as u64) << 40) | (lane as u64 + 0x1234);
         let wide_broadcast = warp::shuffle_u64(wide_value, 7);
         let double_xor = warp::shuffle_xor_f64(lane as f64 + 0.5, 32);
+        let match32_value = warp::match_any_sync(u64::MAX, lane & 3);
+        let match64_value = warp::match_any_i64_sync(u64::MAX, (lane & 7) as u64);
+        let match_all_value =
+            warp::match_all_sync(u64::MAX, 17) ^ warp::match_all_i64_sync(u64::MAX, lane as u64);
+        let redux_values = [
+            warp::redux_sync_add(u64::MAX, value),
+            warp::redux_sync_min_u32(u64::MAX, 100 - lane),
+            warp::redux_sync_min_i32(u64::MAX, lane as i32 - 40) as u32,
+            warp::redux_sync_max_u32(u64::MAX, lane),
+            warp::redux_sync_max_i32(u64::MAX, lane as i32 - 40) as u32,
+            warp::redux_sync_and(u64::MAX, !(1u32 << (lane & 31))),
+            warp::redux_sync_or(u64::MAX, 1u32 << (lane & 31)),
+            warp::redux_sync_xor(u64::MAX, lane),
+            warp::redux_sync_add(0x5555_5555_5555_5555, value),
+        ];
 
         if let Some(out) = broadcast.get_mut(thread::index_1d()) {
             *out = broadcast_value;
@@ -70,6 +89,22 @@ mod kernels {
         }
         if let Some(out) = wide_shuffle.get_mut(thread::index_1d()) {
             *out = wide_broadcast ^ double_xor.to_bits();
+        }
+        if let Some(out) = match32.get_mut(thread::index_1d()) {
+            *out = match32_value;
+        }
+        if let Some(out) = match64.get_mut(thread::index_1d()) {
+            *out = match64_value;
+        }
+        if let Some(out) = match_all.get_mut(thread::index_1d()) {
+            *out = match_all_value;
+        }
+        for i in 0..redux_values.len() {
+            unsafe {
+                *redux
+                    .as_mut_ptr()
+                    .add(thread::index_1d().get() * redux_values.len() + i) = redux_values[i];
+            }
         }
     }
 
@@ -115,6 +150,10 @@ fn main() {
     let mut active = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
     let mut lane_masks = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
     let mut wide_shuffle = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
+    let mut match32 = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
+    let mut match64 = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
+    let mut match_all = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
+    let mut redux = DeviceBuffer::<u32>::zeroed(&stream, WAVE * 9).unwrap();
     let wave_launch = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (WAVE as u32, 1, 1),
@@ -131,6 +170,10 @@ fn main() {
             &mut active,
             &mut lane_masks,
             &mut wide_shuffle,
+            &mut match32,
+            &mut match64,
+            &mut match_all,
+            &mut redux,
         )
     }
     .expect("wave64_primitives launch failed");
@@ -142,6 +185,10 @@ fn main() {
     let active = active.to_host_vec(&stream).unwrap();
     let lane_masks = lane_masks.to_host_vec(&stream).unwrap();
     let wide_shuffle = wide_shuffle.to_host_vec(&stream).unwrap();
+    let match32 = match32.to_host_vec(&stream).unwrap();
+    let match64 = match64.to_host_vec(&stream).unwrap();
+    let match_all = match_all.to_host_vec(&stream).unwrap();
+    let redux = redux.to_host_vec(&stream).unwrap();
     for lane in 0..WAVE {
         assert_eq!(broadcast[lane], 8, "broadcast lane {lane}");
         assert_eq!(xor32[lane], (lane as u32) ^ 32, "xor lane {lane}");
@@ -163,6 +210,33 @@ fn main() {
             wide_shuffle[lane],
             wide_from_lane7 ^ double_from_xor_lane,
             "u64/f64 shuffle lane {lane}"
+        );
+        assert_eq!(
+            match32[lane],
+            0x1111_1111_1111_1111u64 << (lane & 3),
+            "match-any i32 lane {lane}"
+        );
+        assert_eq!(
+            match64[lane],
+            0x0101_0101_0101_0101u64 << (lane & 7),
+            "match-any i64 lane {lane}"
+        );
+        assert_eq!(match_all[lane], u64::MAX, "match-all lane {lane}");
+        let expected = [
+            2080,
+            37,
+            (-40i32) as u32,
+            63,
+            23,
+            0,
+            u32::MAX,
+            0,
+            if lane & 1 == 0 { 1024 } else { lane as u32 + 1 },
+        ];
+        assert_eq!(
+            &redux[lane * 9..lane * 9 + 9],
+            &expected,
+            "redux lane {lane}"
         );
     }
     assert_eq!(reduction[0], 2080, "Wave64 reduction");
@@ -201,7 +275,7 @@ fn main() {
     }
 
     println!(
-        "PASS: Wave64 primitives, {} atomic increments, and {}-thread block reduce/scan",
+        "PASS: Wave64 shuffle/vote/match/redux, {} atomic increments, and {}-thread block reduce/scan",
         ATOMIC_THREADS, BLOCK_THREADS
     );
 }
