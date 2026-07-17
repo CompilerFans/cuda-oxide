@@ -117,7 +117,7 @@ pub(crate) fn convert_arrive_expect_tx(
         vec![bar_ptr, bytes],
         asm_template,
         "=l,l,r,~{memory}",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -146,7 +146,7 @@ pub(crate) fn convert_arrive_expect_tx_cluster(
         vec![bar_ptr, bytes],
         asm_template,
         "=l,l,r,~{memory}",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -174,7 +174,7 @@ pub(crate) fn convert_arrive_cluster(
         vec![addr],
         asm_template,
         "l,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -204,7 +204,7 @@ pub(crate) fn convert_test_wait(
         vec![bar_ptr, token],
         asm_template,
         "=r,l,l,~{memory}",
-    );
+    )?;
     let i32_result = asm_op.deref(ctx).get_result(0);
     let trunc_op = trunc_to_i1(ctx, rewriter, i32_result);
     // trunc_to_i1 returns a Value; we need the operation that defined it
@@ -241,7 +241,7 @@ pub(crate) fn convert_try_wait(
         vec![bar_ptr, token],
         asm_template,
         "=r,l,l,~{memory}",
-    );
+    )?;
     let i32_result = asm_op.deref(ctx).get_result(0);
     let trunc_val = trunc_to_i1(ctx, rewriter, i32_result);
     let trunc_def_op = match trunc_val.defining_entity() {
@@ -276,7 +276,7 @@ pub(crate) fn convert_try_wait_parity(
         vec![bar_ptr, parity],
         asm_template,
         "=r,l,r,~{memory}",
-    );
+    )?;
     let i32_result = asm_op.deref(ctx).get_result(0);
     let trunc_val = trunc_to_i1(ctx, rewriter, i32_result);
     let trunc_def_op = match trunc_val.defining_entity() {
@@ -311,7 +311,7 @@ pub(crate) fn convert_try_wait_parity_cluster(
         vec![bar_ptr, parity],
         asm_template,
         "=r,l,r,~{memory}",
-    );
+    )?;
     let i32_result = asm_op.deref(ctx).get_result(0);
     let trunc_val = trunc_to_i1(ctx, rewriter, i32_result);
     let trunc_def_op = match trunc_val.defining_entity() {
@@ -365,7 +365,7 @@ pub(crate) fn convert_fence_proxy_async(
         vec![],
         "fence.proxy.async.shared::cta;",
         "~{memory}",
-    );
+    )?;
     // NOTE: The caller (interface_impls.rs) is responsible for erasing the original op
     // since this function does not receive it.
     Ok(())
@@ -385,7 +385,7 @@ pub(crate) fn convert_fence_mbarrier_init_release_cluster(
         vec![],
         "fence.mbarrier_init.release.cluster;",
         "~{memory}",
-    );
+    )?;
     Ok(())
 }
 
@@ -403,7 +403,7 @@ pub(crate) fn convert_fence_proxy_async_generic_release_shared_cta_cluster(
         vec![],
         "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;",
         "~{memory}",
-    );
+    )?;
     Ok(())
 }
 
@@ -421,7 +421,7 @@ pub(crate) fn convert_fence_proxy_async_generic_acquire_shared_cluster_cluster(
         vec![],
         "fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;",
         "~{memory}",
-    );
+    )?;
     Ok(())
 }
 
@@ -448,7 +448,7 @@ pub(crate) fn convert_nanosleep(
         vec![ns],
         asm_template,
         "r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }

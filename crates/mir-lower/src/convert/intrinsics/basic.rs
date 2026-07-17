@@ -416,7 +416,7 @@ fn convert_membar(
             vec![],
             asm_template,
             "~{memory}",
-        );
+        )?;
         rewriter.erase_operation(ctx, op);
     }
     Ok(())

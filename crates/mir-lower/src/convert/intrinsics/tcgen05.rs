@@ -142,7 +142,7 @@ pub(crate) fn convert_relinquish_alloc_permit(
         vec![],
         "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -171,7 +171,7 @@ pub(crate) fn convert_fence_before_thread_sync(
         vec![],
         "tcgen05.fence::before_thread_sync;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -196,7 +196,7 @@ pub(crate) fn convert_fence_after_thread_sync(
         vec![],
         "tcgen05.fence::after_thread_sync;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -227,7 +227,7 @@ pub(crate) fn convert_commit(
         vec![mbar],
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [$0];",
         "r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -255,7 +255,7 @@ pub(crate) fn convert_commit_shared_cluster(
         vec![mbar],
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [$0];",
         "r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -397,7 +397,7 @@ pub(crate) fn convert_cp_smem_to_tmem(
         vec![tmem_addr, smem_desc],
         "tcgen05.cp.cta_group::1.128x256b [$0], $1;",
         "r,l,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
 
     Ok(())
@@ -564,7 +564,7 @@ pub(crate) fn convert_load_wait(
         vec![],
         "tcgen05.wait::ld.sync.aligned;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -587,7 +587,7 @@ pub(crate) fn convert_store_wait(
         vec![],
         "tcgen05.wait::st.sync.aligned;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -675,7 +675,7 @@ pub(crate) fn convert_relinquish_alloc_permit_cg2(
         vec![],
         "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -747,7 +747,7 @@ pub(crate) fn convert_commit_cg2(
         vec![mbar],
         "tcgen05.commit.cta_group::2.mbarrier::arrive::one.b64 [$0];",
         "r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -773,7 +773,7 @@ pub(crate) fn convert_commit_shared_cluster_cg2(
         vec![mbar],
         "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64 [$0];",
         "r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -806,7 +806,7 @@ pub(crate) fn convert_commit_multicast_cg2(
         vec![mbar, cta_mask],
         "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [$0], $1;",
         "r,h,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -834,7 +834,7 @@ pub(crate) fn convert_cp_smem_to_tmem_cg2(
         vec![tmem_addr, smem_desc],
         "tcgen05.cp.cta_group::2.128x256b [$0], $1;",
         "r,l,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
 
     Ok(())

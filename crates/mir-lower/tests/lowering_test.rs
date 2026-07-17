@@ -3537,6 +3537,86 @@ fn test_mma_m16n8k16_f32_f16_lowers_to_inline_asm() -> Result<(), anyhow::Error>
 }
 
 #[test]
+fn maca_user_inline_ptx_fails_closed() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![i32_ty.into()]);
+    let input = entry.deref(&ctx).get_argument(0);
+    let inline_ptx = nvvm::InlinePtxOp::build(
+        &mut ctx,
+        vec![i32_ty.into()],
+        vec![input],
+        "add.u32 $0, $1, $1;",
+        "=r,r",
+        false,
+        true,
+    );
+    inline_ptx.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    let error = mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .expect_err("MACA must reject user-authored inline PTX");
+    assert!(
+        error
+            .to_string()
+            .contains("user-authored inline PTX is unsupported")
+    );
+    Ok(())
+}
+
+#[test]
+fn maca_mma_f16_fails_instead_of_returning_accumulator() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let argument_types = (0..4)
+        .map(|_| f32_ty.into())
+        .chain((0..6).map(|_| i32_ty.into()))
+        .collect();
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
+    let operands = (0..10)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect();
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::MmaM16N8K16F32F16Op::get_concrete_op_info(),
+        vec![f32_ty.into(); 4],
+        operands,
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    let error = mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .expect_err("MACA must reject CUDA m16n8k16 MMA");
+    assert!(
+        error
+            .to_string()
+            .contains("C500 requires a native 16x16x16 lowering")
+    );
+    Ok(())
+}
+
+#[test]
 fn test_mma_m16n8k8_f32_tf32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = make_test_ctx();
     let f32_ty = pliron::builtin::types::FP32Type::get(&ctx);

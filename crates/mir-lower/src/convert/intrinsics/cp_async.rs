@@ -63,7 +63,7 @@ fn convert_cp_async_impl(
             }}"
         ),
         "l,l,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -110,7 +110,7 @@ fn convert_cp_async_zfill_impl(
             }}"
         ),
         "l,l,r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }

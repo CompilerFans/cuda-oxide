@@ -6,8 +6,8 @@
 //! Warp-level matrix intrinsic lowering (`movmatrix`, `mma.sync`).
 
 use crate::BackendTarget;
-use crate::convert::intrinsics::common::*;
 use crate::context::lowering_options;
+use crate::convert::intrinsics::common::*;
 use llvm_export::ops::{self as llvm, AsmKind, InlineAsmOpExt};
 use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
@@ -18,6 +18,16 @@ use pliron::irbuild::rewriter::Rewriter;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
+
+fn reject_cuda_warp_matrix_on_maca(ctx: &Context, operation: &str) -> Result<()> {
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        return pliron::input_err_noloc!(
+            "CUDA warp-matrix operation `{}` is unsupported for MACA target; C500 requires a native 16x16x16 lowering",
+            operation
+        );
+    }
+    Ok(())
+}
 
 /// Convert `nvvm.movmatrix_trans_b16` to inline PTX.
 ///
@@ -30,6 +40,7 @@ pub(crate) fn convert_movmatrix_trans_b16(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    reject_cuda_warp_matrix_on_maca(ctx, "movmatrix.sync.aligned.m8n8.trans.b16")?;
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 1 {
         return pliron::input_err_noloc!(
@@ -63,21 +74,14 @@ pub(crate) fn convert_movmatrix_trans_b16(
 /// returned as an LLVM struct and then split back into the dialect op's four
 /// SSA results. There are no hidden pointer, stack, load, or store operands.
 ///
-/// For MXMACA, this operation is not directly supported (different MMA shape).
-/// A no-op is emitted; callers should use MXMACA-specific MMA builtins.
+/// MXMACA rejects this CUDA-specific shape until native 16x16x16 lowering is available.
 pub(crate) fn convert_mma_m16n8k16_f32_bf16(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let opts = lowering_options(ctx);
-    if opts.backend == BackendTarget::Maca {
-        // MXMACA MMA is 16x16x16, not 16x8x16. Emit no-op for now.
-        let operands: Vec<_> = op.deref(ctx).operands().collect();
-        rewriter.replace_operation_with_values(ctx, op, operands[0..4].to_vec());
-        return Ok(());
-    }
+    reject_cuda_warp_matrix_on_maca(ctx, "mma.sync.m16n8k16.f32.bf16")?;
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
@@ -104,7 +108,7 @@ pub(crate) fn convert_mma_m16n8k16_f32_bf16(
         operands,
         template,
         constraints,
-    );
+    )?;
 
     let aggregate = inline_asm.deref(ctx).get_result(0);
     let mut results = Vec::with_capacity(4);
@@ -124,21 +128,14 @@ pub(crate) fn convert_mma_m16n8k16_f32_bf16(
 /// returned as an LLVM struct and then split back into the dialect op's four
 /// SSA results. There are no hidden pointer, stack, load, or store operands.
 ///
-/// For MXMACA, this operation is not directly supported (different MMA shape).
-/// A no-op is emitted; callers should use MXMACA-specific MMA builtins.
+/// MXMACA rejects this CUDA-specific shape until native 16x16x16 lowering is available.
 pub(crate) fn convert_mma_m16n8k16_f32_f16(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
-    let opts = lowering_options(ctx);
-    if opts.backend == BackendTarget::Maca {
-        // MXMACA MMA is 16x16x16, not 16x8x16. Emit no-op for now.
-        let operands: Vec<_> = op.deref(ctx).operands().collect();
-        rewriter.replace_operation_with_values(ctx, op, operands[0..4].to_vec());
-        return Ok(());
-    }
+    reject_cuda_warp_matrix_on_maca(ctx, "mma.sync.m16n8k16.f32.f16")?;
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
@@ -165,7 +162,7 @@ pub(crate) fn convert_mma_m16n8k16_f32_f16(
         operands,
         template,
         constraints,
-    );
+    )?;
 
     let aggregate = inline_asm.deref(ctx).get_result(0);
     let mut results = Vec::with_capacity(4);
@@ -190,6 +187,7 @@ pub(crate) fn convert_mma_m16n8k8_f32_tf32(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    reject_cuda_warp_matrix_on_maca(ctx, "mma.sync.m16n8k8.f32.tf32")?;
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
         return pliron::input_err_noloc!(
@@ -215,7 +213,7 @@ pub(crate) fn convert_mma_m16n8k8_f32_tf32(
         operands,
         template,
         constraints,
-    );
+    )?;
 
     let aggregate = inline_asm.deref(ctx).get_result(0);
     let mut results = Vec::with_capacity(4);
@@ -240,6 +238,7 @@ pub(crate) fn convert_mma_m16n8k32_s32_s8(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    reject_cuda_warp_matrix_on_maca(ctx, "mma.sync.m16n8k32.s32.s8")?;
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 10 {
         return pliron::input_err_noloc!(
@@ -265,7 +264,7 @@ pub(crate) fn convert_mma_m16n8k32_s32_s8(
         operands,
         template,
         constraints,
-    );
+    )?;
 
     let aggregate = inline_asm.deref(ctx).get_result(0);
     let mut results = Vec::with_capacity(4);
@@ -289,6 +288,7 @@ pub(crate) fn convert_mma_m8n8k4_f64(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    reject_cuda_warp_matrix_on_maca(ctx, "mma.sync.m8n8k4.f64")?;
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 4 {
         return pliron::input_err_noloc!(
@@ -307,7 +307,7 @@ pub(crate) fn convert_mma_m8n8k4_f64(
         "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 \
          {$0, $1}, {$4}, {$5}, {$2, $3};",
         "=d,=d,d,d,d,d",
-    );
+    )?;
 
     let aggregate = inline_asm.deref(ctx).get_result(0);
     let mut results = Vec::with_capacity(2);

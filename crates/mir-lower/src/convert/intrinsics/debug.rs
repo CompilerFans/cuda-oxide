@@ -102,7 +102,7 @@ pub(crate) fn convert_trap(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let void_ty = llvm_types::VoidType::get(ctx);
-    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], "trap;", "");
+    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], "trap;", "")?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -114,7 +114,7 @@ pub(crate) fn convert_breakpoint(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let void_ty = llvm_types::VoidType::get(ctx);
-    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], "brkpt;", "");
+    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], "brkpt;", "")?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -133,7 +133,7 @@ pub(crate) fn convert_pm_event(
     let void_ty = llvm_types::VoidType::get(ctx);
 
     let asm_str = format!("pmevent {};", event_id);
-    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], &asm_str, "");
+    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], &asm_str, "")?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }

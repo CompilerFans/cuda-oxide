@@ -48,7 +48,7 @@ pub(crate) fn convert_m8n8_x4(
             "}"
         ),
         "l,r,r,r,r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -79,7 +79,7 @@ pub(crate) fn convert_m8n8_x4_trans(
             "}"
         ),
         "l,r,r,r,r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -110,7 +110,7 @@ pub(crate) fn convert_m8n8_x2(
             "}"
         ),
         "l,r,r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(crate) fn convert_m8n8_x2_trans(
             "}"
         ),
         "l,r,r,~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }

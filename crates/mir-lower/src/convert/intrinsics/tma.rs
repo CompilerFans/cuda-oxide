@@ -43,7 +43,7 @@ pub(crate) fn convert_commit_group(
         vec![],
         "cp.async.bulk.commit_group;",
         "~{memory}",
-    );
+    )?;
     Ok(())
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn convert_wait_group(
     } else {
         "cp.async.bulk.wait_group $0;"
     };
-    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![n], asm, "n,~{memory}");
+    inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![n], asm, "n,~{memory}")?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }

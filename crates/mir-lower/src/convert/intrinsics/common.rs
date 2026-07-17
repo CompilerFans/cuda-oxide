@@ -159,9 +159,9 @@ pub fn call_intrinsic(
 
 /// Create an inline assembly operation with the convergent attribute.
 ///
-/// For MXMACA backend, inline PTX is not supported. This function emits a
-/// no-op inline asm instead. Callers should provide MXMACA-specific
-/// alternatives for critical operations (fences, warp primitives, etc.).
+/// MXMACA cannot execute PTX inline assembly. MACA callers must use a native
+/// intrinsic lowering instead; falling back to a no-op would silently change
+/// program semantics.
 pub fn inline_asm_convergent(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -169,25 +169,25 @@ pub fn inline_asm_convergent(
     inputs: Vec<Value>,
     asm_template: &str,
     constraints: &str,
-) -> Ptr<Operation> {
+) -> Result<Ptr<Operation>> {
     let opts = crate::context::lowering_options(ctx);
-    let (actual_asm, actual_constraints, actual_inputs) = if opts.backend == crate::BackendTarget::Maca {
-        // MXMACA does not support inline PTX. Emit a no-op.
-        ("nop;", "", vec![])
-    } else {
-        (asm_template, constraints, inputs)
-    };
+    if opts.backend == crate::BackendTarget::Maca {
+        return pliron::input_err_noloc!(
+            "inline PTX is unsupported for MACA target: `{}`",
+            asm_template
+        );
+    }
 
     let inline_asm = llvm::InlineAsmOp::build(
         ctx,
         result_ty,
-        actual_inputs,
-        actual_asm,
-        actual_constraints,
+        inputs,
+        asm_template,
+        constraints,
         AsmKind::Convergent,
     );
     rewriter.insert_operation(ctx, inline_asm.get_operation());
-    inline_asm.get_operation()
+    Ok(inline_asm.get_operation())
 }
 
 /// Create an inline assembly operation with the sideeffect attribute (non-convergent).
@@ -197,8 +197,8 @@ pub fn inline_asm_convergent(
 /// is marked `sideeffect` only, allowing LLVM to move or duplicate it across
 /// divergent control flow when legal.
 ///
-/// For MXMACA backend, inline PTX is not supported. This function emits a
-/// no-op inline asm instead.
+/// MXMACA cannot execute PTX inline assembly. MACA callers must use a native
+/// intrinsic lowering instead.
 pub fn inline_asm_sideeffect(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -206,24 +206,25 @@ pub fn inline_asm_sideeffect(
     inputs: Vec<Value>,
     asm_template: &str,
     constraints: &str,
-) -> Ptr<Operation> {
+) -> Result<Ptr<Operation>> {
     let opts = crate::context::lowering_options(ctx);
-    let (actual_asm, actual_constraints, actual_inputs) = if opts.backend == crate::BackendTarget::Maca {
-        ("nop;", "", vec![])
-    } else {
-        (asm_template, constraints, inputs)
-    };
+    if opts.backend == crate::BackendTarget::Maca {
+        return pliron::input_err_noloc!(
+            "inline PTX is unsupported for MACA target: `{}`",
+            asm_template
+        );
+    }
 
     let inline_asm = llvm::InlineAsmOp::build(
         ctx,
         result_ty,
-        actual_inputs,
-        actual_asm,
-        actual_constraints,
+        inputs,
+        asm_template,
+        constraints,
         AsmKind::SideEffect,
     );
     rewriter.insert_operation(ctx, inline_asm.get_operation());
-    inline_asm.get_operation()
+    Ok(inline_asm.get_operation())
 }
 
 /// Truncate an i32 result to i1 (for predicate results).
@@ -330,7 +331,7 @@ mod tests {
                         vec![],
                         "bar.sync 0;",
                         "~{memory}",
-                    );
+                    )?;
                     None
                 }
                 HelperAction::InlineAsmSideEffect => {
@@ -344,7 +345,7 @@ mod tests {
                         vec![dst, value],
                         "st.global.u32 [$0], $1;",
                         "l,r,~{memory}",
-                    );
+                    )?;
                     None
                 }
                 HelperAction::TruncToI1 => {
@@ -413,13 +414,20 @@ mod tests {
         module_ptr: Ptr<Operation>,
         action: HelperAction,
     ) -> Option<Value> {
+        try_run_helper_action(ctx, module_ptr, action).expect("helper conversion failed")
+    }
+
+    fn try_run_helper_action(
+        ctx: &mut Context,
+        module_ptr: Ptr<Operation>,
+        action: HelperAction,
+    ) -> Result<Option<Value>> {
         let mut conversion = HelperConversion {
             action,
             returned_value: None,
         };
-        apply_dialect_conversion(ctx, &mut conversion, module_ptr)
-            .expect("helper conversion failed");
-        conversion.returned_value
+        apply_dialect_conversion(ctx, &mut conversion, module_ptr)?;
+        Ok(conversion.returned_value)
     }
 
     fn module_ops(ctx: &Context, module_ptr: Ptr<Operation>) -> Vec<Ptr<Operation>> {
@@ -703,6 +711,36 @@ mod tests {
             asm.get_attr_inline_asm_convergent(&ctx)
                 .is_some_and(|b| !bool::from((*b).clone()))
         );
+    }
+
+    #[test]
+    fn inline_asm_helpers_reject_maca_instead_of_emitting_noop() {
+        for action in [
+            HelperAction::InlineAsmConvergent,
+            HelperAction::InlineAsmSideEffect,
+        ] {
+            let mut ctx = make_ctx();
+            crate::context::set_lowering_options(
+                &mut ctx,
+                crate::LoweringOptions {
+                    allow_fma_contraction: true,
+                    backend: crate::BackendTarget::Maca,
+                },
+            );
+            let global_ptr_ty: TypeHandle = llvm_types::PointerType::get(&ctx, 1).into();
+            let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+            let (module_ptr, entry) = build_test_func(&mut ctx, vec![global_ptr_ty, i32_ty]);
+            append_trigger(&mut ctx, entry);
+
+            let error = try_run_helper_action(&mut ctx, module_ptr, action)
+                .expect_err("MACA inline PTX helper must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("inline PTX is unsupported for MACA")
+            );
+            assert!(find_body_ops::<llvm::InlineAsmOp>(&ctx, module_ptr).is_empty());
+        }
     }
 
     #[test]

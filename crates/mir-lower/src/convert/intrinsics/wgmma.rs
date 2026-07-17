@@ -38,7 +38,7 @@ pub(crate) fn convert_fence(
         vec![],
         "wgmma.fence.sync.aligned;",
         "",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -57,7 +57,7 @@ pub(crate) fn convert_commit_group(
         vec![],
         "wgmma.commit_group.sync.aligned;",
         "",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -84,7 +84,7 @@ pub(crate) fn convert_wait_group(
         vec![n],
         "wgmma.wait_group.sync.aligned $0;",
         "n",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -120,7 +120,7 @@ pub(crate) fn convert_make_smem_desc(
         vec![ptr_casted],
         asm_template,
         "=l,l",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }

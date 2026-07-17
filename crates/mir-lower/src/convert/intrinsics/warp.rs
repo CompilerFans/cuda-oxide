@@ -32,8 +32,8 @@
 //! | `MatchAllSyncI64` | `llvm.nvvm.match.all.sync.i64p`   | 64-bit variant               |
 
 use crate::BackendTarget;
-use crate::convert::intrinsics::common::*;
 use crate::context::lowering_options;
+use crate::convert::intrinsics::common::*;
 use llvm_export::op_interfaces::BinArithOp;
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
@@ -233,7 +233,7 @@ pub(crate) fn convert_shuffle_i64(
         vec![val, lane_or_delta, mask],
         &asm_template,
         "=l,l,r,r",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -314,7 +314,11 @@ fn convert_maca_ballot(
     let func_ty = llvm_types::FuncType::get(
         ctx,
         i64_ty.into(),
-        vec![f32_ty.into(), f32_ty.into(), IntegerType::get(ctx, 32, Signedness::Signless).into()],
+        vec![
+            f32_ty.into(),
+            f32_ty.into(),
+            IntegerType::get(ctx, 32, Signedness::Signless).into(),
+        ],
         false,
     );
     let cmp_mode = create_i32_const(ctx, rewriter, 2); // OGT
@@ -545,7 +549,7 @@ pub(crate) fn convert_elect_sync(
         vec![mask],
         asm_template,
         "=r,=r,r",
-    );
+    )?;
     let struct_result = asm_op.deref(ctx).get_result(0);
 
     // Field 0 → leader lane id (result 0). Field 1 → predicate as 0/1 i32,

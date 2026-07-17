@@ -33,8 +33,10 @@
 - 官方 workspace 测试集合在 cu-bridge 环境下为 734 passed、169 ignored；过滤 2 项：当前环境
   不具备的 NVIDIA `ptxas` 用例，以及已在无 toolkit 环境单独通过的 toolkit 路径优先级用例。
 - CI 风格的 `cargo test --workspace --all-targets` 为 699 passed、3 ignored，同样过滤上述 2 项。
-- **仍未完成**：`WAVE_SIZE` 仍为 32，u32 warp mask 尚未迁移到 Wave64；通用 inline PTX
-  和 MMA 在 MACA 分支仍存在 no-op 原型，不能视为语义兼容。下一阶段应先消除这些静默错误路径。
+- **已消除静默错误路径**：MACA 的通用 inline PTX、用户 inline PTX 和 CUDA WMMA
+  现在会在编译期明确报错，lowering 后置校验也禁止残留 inline PTX。
+- **仍未完成**：`WAVE_SIZE` 仍为 32，u32 warp mask 尚未迁移到 Wave64；现有 shuffle
+  丢失 mode，ballot 类型/mask 语义不完整，16x16x16 原生 MMA 尚未实现。
 
 ---
 
@@ -150,9 +152,9 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | barrier → `llvm_mxc_barrier` | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | fence → LLVM fence 指令 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | lane_id → mbcnt.lo+mbcnt.hi | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
-| shuffle → bsm.bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ |
-| ballot → fcmp.i64.f32 | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ |
-| MMA → no-op 原型（语义不正确） | `mir-lower/src/convert/intrinsics/wmma.rs` | ⚠️ 待替换 |
+| shuffle → bsm.bpermute 原型 | `mir-lower/src/convert/intrinsics/warp.rs` | ⚠️ mode/mask 语义待替换 |
+| ballot → fcmp.i64.f32 原型 | `mir-lower/src/convert/intrinsics/warp.rs` | ⚠️ i64/mask 契约待闭环 |
+| CUDA WMMA | `mir-lower/src/convert/intrinsics/wmma.rs` | ✅ MACA 编译期明确拒绝 |
 
 #### Wave=64 适配
 
@@ -161,7 +163,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | `WAVE_SIZE` 常量 | `cuda-device/src/lib.rs` | ⏳ 仍为 32 |
 | `warp_id()` 使用 WAVE_SIZE | `cuda-device/src/warp.rs` | ✅ 仅完成抽象 |
 | `warp_in_block_linear()` 使用 WAVE_SIZE | `cuda-device/src/cooperative_groups.rs` | ✅ 仅完成抽象 |
-| Inline PTX → no-op | `mir-lower/src/convert/intrinsics/common.rs` | ⚠️ 静默错误原型 |
+| Inline PTX fail-closed | `mir-lower/src/convert/intrinsics/common.rs`、`asm.rs`、`lib.rs` | ✅ 编译期明确拒绝 |
 
 ### 3.3 运行时绑定（✅ 完成）
 
@@ -209,11 +211,11 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 | 任务 | 说明 | 阻塞因素 |
 |---|---|---|
-| Inline PTX/MMA fail-closed | 禁止把未实现语义静默降为 no-op | 需要定义可诊断的 unsupported 路径 |
 | Wave64 API 与 mask | `WAVE_SIZE=64`，warp mask 从 u32 迁移并处理 API 兼容 | API breaking |
 | MMA builtin 映射 | `__builtin_mxc_mma_16x16x16f16/bf16/i8` | 需要确认 builtin/LLVM lowering 与布局 |
 
-已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin` 产物闭环。
+已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin`
+产物闭环、Inline PTX/MMA fail-closed。
 
 ### 4.2 中优先级
 
@@ -413,8 +415,8 @@ cargo oxide doctor
 
 ## 9. 下一步建议
 
-1. **消除静默 no-op** — 未支持的 inline PTX/MMA 必须明确报错，已有映射再逐项开放
-2. **Wave64 语义闭环** — 更新 `WAVE_SIZE`、mask 类型和 warp/cooperative-groups 测试
+1. **Wave64 语义闭环** — 更新 `WAVE_SIZE`、mask 类型和 warp/cooperative-groups 测试
+2. **原生 vote/shuffle lowering** — 修复 i64 mask/result、mode 和上下边界语义
 3. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
 4. **扩展示例矩阵** — reduction、atomics、shuffle/ballot，再进入 GEMM
 5. **性能基线** — 在正确性示例稳定后与 MXMACA C++/库实现同口径比较

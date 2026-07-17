@@ -116,7 +116,7 @@ fn convert_ldmatrix(
         .join(",");
 
     let inline_asm =
-        inline_asm_convergent(ctx, rewriter, result_ty, operands, &template, &constraints);
+        inline_asm_convergent(ctx, rewriter, result_ty, operands, &template, &constraints)?;
 
     if register_count == 1 {
         rewriter.replace_operation(ctx, op, inline_asm);

@@ -48,7 +48,7 @@ pub(crate) fn convert_cluster_sreg(
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let asm_template = format!("mov.u32 $0, {};", sreg_name);
 
-    let asm_op = inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], &asm_template, "=r");
+    let asm_op = inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], &asm_template, "=r")?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -62,7 +62,8 @@ pub(crate) fn convert_cluster_idx(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
-    let asm_op = inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], CLUSTER_IDX_ASM, "=r");
+    let asm_op =
+        inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], CLUSTER_IDX_ASM, "=r")?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -77,7 +78,7 @@ pub(crate) fn convert_num_clusters(
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let asm_op =
-        inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], NUM_CLUSTERS_ASM, "=r");
+        inline_asm_convergent(ctx, rewriter, i32_ty.into(), vec![], NUM_CLUSTERS_ASM, "=r")?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -97,7 +98,7 @@ pub(crate) fn convert_cluster_sync(
         vec![],
         "barrier.cluster.arrive.aligned; barrier.cluster.wait.aligned;",
         "~{memory}",
-    );
+    )?;
     rewriter.erase_operation(ctx, op);
     Ok(())
 }
@@ -127,7 +128,7 @@ pub(crate) fn convert_mapa_shared_cluster(
         vec![shared_ptr, llvm_rank],
         "mapa.shared::cluster.u64 $0, $1, $2;",
         "=l,l,r",
-    );
+    )?;
 
     let i64_result = asm_op.deref(ctx).get_result(0);
     let llvm_ptr_ty = llvm_types::PointerType::get(ctx, 3);
@@ -163,7 +164,7 @@ pub(crate) fn convert_dsmem_read_u32(
         vec![shared_ptr, llvm_rank],
         "{ .reg .u64 %mapped; mapa.shared::cluster.u64 %mapped, $1, $2; ld.shared::cluster.u32 $0, [%mapped]; }",
         "=r,l,r,~{memory}",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
 
     Ok(())

@@ -6,6 +6,7 @@
 //! User-authored inline PTX lowering.
 
 use crate::convert::types::convert_type;
+use crate::{BackendTarget, context::lowering_options};
 use dialect_nvvm::ops::InlinePtxOp;
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
@@ -26,6 +27,12 @@ pub(crate) fn convert_inline_ptx(
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
     let loc = op.deref(ctx).loc();
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        return pliron::input_err!(
+            loc,
+            "user-authored inline PTX is unsupported for MACA target"
+        );
+    }
     let inline_ptx = InlinePtxOp::new(op);
     let template = inline_ptx
         .get_attr_ptx_template(ctx)

@@ -153,7 +153,7 @@ pub(crate) fn convert_query_is_canceled(
             "}"
         ),
         "=r,l,l",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -198,7 +198,7 @@ pub(crate) fn convert_query_get_first_ctaid(
         vec![resp_lo, resp_hi],
         &asm_template,
         "=r,l,l",
-    );
+    )?;
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
