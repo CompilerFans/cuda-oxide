@@ -807,9 +807,8 @@ dependencies = [
 name = "maca-vecadd"
 version = "0.1.0"
 dependencies = [
- "maca-bindings",
+ "libloading",
  "maca-core",
- "maca-host",
 ]
 
 [[package]]
