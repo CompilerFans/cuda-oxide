@@ -55,17 +55,22 @@ Measured on a 104-AP MetaX C500 with `N = 67,108,864` on 2026-07-17:
 
 | Kernel | Launch | Median ms | Effective GB/s |
 | --- | --- | ---: | ---: |
-| `vecadd_direct` | `262144 x 256` | 0.8739 | 921.5 |
-| `vecadd_scalar_grid` | `832 x 256` | 0.5577 | **1443.9** |
-| `vecadd_scalar_grid_u4` | `832 x 256` | 0.5584 | 1442.2 |
-| `vecadd_packed128_grid` | `416 x 128` | 0.5588 | 1441.1 |
-| `vecadd_packed128_grid_u4` | `416 x 128` | 0.5605 | 1436.7 |
+| `vecadd_direct` | `262144 x 256` | 0.8447 | 953.3 |
+| `vecadd_scalar_grid` | `416 x 512` | 0.5537 | **1454.4** |
+| `vecadd_scalar_grid_u4` | `416 x 512` | 0.5548 | 1451.6 |
+| `vecadd_packed128_grid` | `416 x 128` | 0.5593 | 1439.8 |
+| `vecadd_packed128_grid_u4` | `416 x 128` | 0.5615 | 1434.2 |
 
-The fixed-grid scalar kernel is 1.57x the effective bandwidth of the official
-algorithm. It reaches 78.8% of the C500 nominal 1832 GB/s and 97.0% of a local
-mcPyTorch `torch.add(out=...)` reference measured at 1489 GB/s.
+The fixed-grid scalar kernel is 1.53x the effective bandwidth of the official
+algorithm. It reaches 79.4% of the C500 nominal 1832 GB/s and 97.6% of a local
+mcPyTorch `torch.add(out=...)` reference measured at 1489.8 GB/s. The seven
+HBM-size samples span 0.5536--0.5541 ms.
 
 The final MACA device bitcode for `vecadd_packed128_grid` contains two aligned
 `load i128` operations and one aligned `store i128`. It does not outperform the
-scalar fixed-grid path on this chip; reducing block scheduling overhead is the
-material optimization here. Results can vary with clocks and other GPU work.
+scalar fixed-grid path on this chip. The material optimizations are reducing
+block scheduling overhead and keeping the grid-stride induction variable in
+C500's native 32-bit launch-index width. The kernel retains Oxide slice
+arguments and is launched directly through the generated module API; raw
+pointers did not improve performance. Results can vary with clocks and other
+GPU work.

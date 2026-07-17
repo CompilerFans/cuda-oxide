@@ -17,7 +17,7 @@ const DEFAULT_BASE_ITERS: usize = 100;
 const DEFAULT_SAMPLES: usize = 5;
 const TARGET_BYTES_PER_SAMPLE: u64 = 32 * 1024 * 1024 * 1024;
 const C500_NOMINAL_GBPS: f64 = 1832.0;
-const MCPYTORCH_REFERENCE_GBPS: f64 = 1489.0;
+const MCPYTORCH_REFERENCE_GBPS: f64 = 1489.8;
 
 #[cuda_module]
 mod kernels {
@@ -60,27 +60,33 @@ mod kernels {
     }
 
     /// Fixed-grid scalar kernel. Each thread walks a disjoint grid-stride
-    /// sequence, avoiding hundreds of thousands of short-lived blocks.
+    /// sequence, avoiding short-lived blocks. The induction variable stays
+    /// 32-bit to match C500's native launch-index width.
     #[kernel]
     pub fn vecadd_scalar_grid(
         a: &[f32],
         b: &[f32],
         mut c: DisjointSlice<f32>,
-        n: usize,
-        stride: usize,
+        n: u32,
+        stride: u32,
     ) {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
         let c_ptr = c.as_mut_ptr();
-        let mut i = thread::index_1d().get();
+        let mut i = thread::blockIdx_x()
+            .wrapping_mul(thread::blockDim_x())
+            .wrapping_add(thread::threadIdx_x());
 
         while i < n {
+            let offset = i as usize;
             // SAFETY: i < n, host guarantees n <= every buffer length, and
             // grid-stride sequences are disjoint for distinct thread IDs.
             unsafe {
-                c_ptr.add(i).write(*a_ptr.add(i) + *b_ptr.add(i));
+                c_ptr
+                    .add(offset)
+                    .write(*a_ptr.add(offset) + *b_ptr.add(offset));
             }
-            i += stride;
+            i = i.wrapping_add(stride);
         }
     }
 
@@ -91,34 +97,48 @@ mod kernels {
         a: &[f32],
         b: &[f32],
         mut c: DisjointSlice<f32>,
-        n: usize,
-        stride: usize,
+        n: u32,
+        stride: u32,
     ) {
         let a_ptr = a.as_ptr();
         let b_ptr = b.as_ptr();
         let c_ptr = c.as_mut_ptr();
-        let step = stride * 4;
-        let mut i = thread::index_1d().get();
+        let step = stride.wrapping_mul(4);
+        let mut i = thread::blockIdx_x()
+            .wrapping_mul(thread::blockDim_x())
+            .wrapping_add(thread::threadIdx_x());
 
         while i < n {
+            let offset = i as usize;
             // SAFETY: each lane below is bounds checked; adding a multiple of
             // the global thread count preserves disjointness across threads.
             unsafe {
-                c_ptr.add(i).write(*a_ptr.add(i) + *b_ptr.add(i));
-                let i1 = i + stride;
+                c_ptr
+                    .add(offset)
+                    .write(*a_ptr.add(offset) + *b_ptr.add(offset));
+                let i1 = i.wrapping_add(stride);
                 if i1 < n {
-                    c_ptr.add(i1).write(*a_ptr.add(i1) + *b_ptr.add(i1));
+                    let offset = i1 as usize;
+                    c_ptr
+                        .add(offset)
+                        .write(*a_ptr.add(offset) + *b_ptr.add(offset));
                 }
-                let i2 = i1 + stride;
+                let i2 = i1.wrapping_add(stride);
                 if i2 < n {
-                    c_ptr.add(i2).write(*a_ptr.add(i2) + *b_ptr.add(i2));
+                    let offset = i2 as usize;
+                    c_ptr
+                        .add(offset)
+                        .write(*a_ptr.add(offset) + *b_ptr.add(offset));
                 }
-                let i3 = i2 + stride;
+                let i3 = i2.wrapping_add(stride);
                 if i3 < n {
-                    c_ptr.add(i3).write(*a_ptr.add(i3) + *b_ptr.add(i3));
+                    let offset = i3 as usize;
+                    c_ptr
+                        .add(offset)
+                        .write(*a_ptr.add(offset) + *b_ptr.add(offset));
                 }
             }
-            i += step;
+            i = i.wrapping_add(step);
         }
     }
 
@@ -277,9 +297,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("byte model   : 12 bytes/element (2 reads + 1 write)\n");
 
     let configs = tuning_configs(aps);
+    let u32_configs = u32_tuning_configs(aps);
+    let max_u32_stride = u32_configs
+        .iter()
+        .map(|config| config.blocks * config.threads)
+        .max()
+        .expect("non-empty u32 tuning configs");
+    let max_u32_step = max_u32_stride
+        .checked_mul(4)
+        .ok_or("C500 launch geometry exceeds the u32 index range")?;
+    let max_safe_elements = u32::MAX - max_u32_step + 1;
+    if max_elements > max_safe_elements as usize {
+        return Err(format!(
+            "VECADD_MAX_ELEMENTS must be <= {max_safe_elements} for the u32 grid-stride kernels"
+        )
+        .into());
+    }
     verify_launch_dimensions(&module, &stream)?;
     println!("launch dims  : PASS (grid 7x3x2, block 32x4x2)");
-    verify_all(&module, &stream, configs[0])?;
+    verify_all(&module, &stream, u32_configs[0])?;
     println!("correctness  : PASS (1,000,003 logical elements)\n");
 
     println!("Allocating scalar buffers...");
@@ -315,7 +351,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &scalar_b,
         &mut scalar_c,
         max_elements,
-        &configs,
+        &u32_configs,
         warmup,
         base_iters,
         samples,
@@ -328,13 +364,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         &scalar_b,
         &mut scalar_c,
         max_elements,
-        &configs,
+        &u32_configs,
         warmup,
         base_iters,
         samples,
         true,
     )?;
-
     println!("\nTuning explicit packed-128 kernels at N={max_elements}");
     let packed_grid = tune_packed_grid(
         &module,
@@ -387,14 +422,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let scalar = benchmark(&stream, n, warmup, base_iters, samples, || unsafe {
-            let stride = scalar_grid.blocks as usize * scalar_grid.threads as usize;
+            let stride = scalar_grid.blocks * scalar_grid.threads;
             module.vecadd_scalar_grid(
                 &stream,
                 scalar_grid.launch(),
                 &scalar_a,
                 &scalar_b,
                 &mut scalar_c,
-                n,
+                n as u32,
                 stride,
             )
         })?;
@@ -404,14 +439,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         let scalar4 = benchmark(&stream, n, warmup, base_iters, samples, || unsafe {
-            let stride = scalar_u4.blocks as usize * scalar_u4.threads as usize;
+            let stride = scalar_u4.blocks * scalar_u4.threads;
             module.vecadd_scalar_grid_u4(
                 &stream,
                 scalar_u4.launch(),
                 &scalar_a,
                 &scalar_b,
                 &mut scalar_c,
-                n,
+                n as u32,
                 stride,
             )
         })?;
@@ -511,12 +546,27 @@ fn tune_scalar_grid(
     let label = if unroll4 { "scalar-u4" } else { "scalar" };
     let mut best = None::<(GridConfig, f64)>;
     for &config in configs {
-        let stride = config.blocks as usize * config.threads as usize;
         let timing = benchmark(stream, n, warmup, base_iters, samples, || unsafe {
             if unroll4 {
-                module.vecadd_scalar_grid_u4(stream, config.launch(), a, b, c, n, stride)
+                module.vecadd_scalar_grid_u4(
+                    stream,
+                    config.launch(),
+                    a,
+                    b,
+                    c,
+                    n as u32,
+                    config.blocks * config.threads,
+                )
             } else {
-                module.vecadd_scalar_grid(stream, config.launch(), a, b, c, n, stride)
+                module.vecadd_scalar_grid(
+                    stream,
+                    config.launch(),
+                    a,
+                    b,
+                    c,
+                    n as u32,
+                    config.blocks * config.threads,
+                )
             }
         })?;
         let gbps = bandwidth_gbps(n, timing.median_ms);
@@ -637,12 +687,32 @@ fn verify_all(
 
     let stride = config.blocks as usize * config.threads as usize;
     c = DeviceBuffer::<f32>::zeroed(stream, N)?;
-    unsafe { module.vecadd_scalar_grid(stream, config.launch(), &a, &b, &mut c, N, stride)? };
+    unsafe {
+        module.vecadd_scalar_grid(
+            stream,
+            config.launch(),
+            &a,
+            &b,
+            &mut c,
+            N as u32,
+            config.blocks * config.threads,
+        )?;
+    };
     check_scalar(&c.to_host_vec(stream)?)
         .map_err(|error| format!("vecadd_scalar_grid: {error}"))?;
 
     c = DeviceBuffer::<f32>::zeroed(stream, N)?;
-    unsafe { module.vecadd_scalar_grid_u4(stream, config.launch(), &a, &b, &mut c, N, stride)? };
+    unsafe {
+        module.vecadd_scalar_grid_u4(
+            stream,
+            config.launch(),
+            &a,
+            &b,
+            &mut c,
+            N as u32,
+            config.blocks * config.threads,
+        )?;
+    };
     check_scalar(&c.to_host_vec(stream)?)
         .map_err(|error| format!("vecadd_scalar_grid_u4: {error}"))?;
 
@@ -713,6 +783,16 @@ fn tuning_configs(aps: u32) -> Vec<GridConfig> {
         }
     }
     configs
+}
+
+fn u32_tuning_configs(aps: u32) -> Vec<GridConfig> {
+    [(4, 512), (32, 64), (16, 128), (8, 256)]
+        .into_iter()
+        .map(|(blocks_per_ap, threads)| GridConfig {
+            blocks: aps * blocks_per_ap,
+            threads,
+        })
+        .collect()
 }
 
 fn benchmark_sizes(max_elements: usize) -> Vec<usize> {

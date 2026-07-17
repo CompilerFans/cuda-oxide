@@ -19,8 +19,9 @@
   `getelementptr i8 + 4`，不再按指针宽度错误放大偏移。
 - `gridDim` 已按 dispatch packet 的真实语义修正：`+12/+16/+20` 是全局 work-item 数，
   现在会除以各轴 `blockDim` 得到 block 数；`blockDim.z` 的 `dispatch+8` lowering 也已补齐。
-- 新增 `vecadd_bench`：C500、N=67,108,864 时固定 grid scalar kernel 实测 1443.9 GB/s
-  （0.5577 ms，标称带宽的 78.8%），相对原始逐元素 kernel 的 921.5 GB/s 提升 1.57 倍。
+- 新增并优化 `vecadd_bench`：C500、N=67,108,864 时固定 grid、u32 索引的 scalar kernel
+  实测 1454.4 GB/s（0.5537 ms，标称带宽的 79.4%），相对同次原始逐元素 kernel 的
+  953.3 GB/s 提升 1.53 倍；达到同口径 mcPyTorch 1489.8 GB/s 实测上限的 97.6%。
 - cu-bridge 的 `wcu*` 函数、类型和常量兼容层已接入 `cuda-bindings`；`cuda-core`、
   `cuda-host`（宏实际使用的 loader）均能直接加载 MACA device binary。
 - Rust/libm 数学调用会从 CUDA `__nv_*` 重写为 MACA `mc_math_func_*`。`libm_math`
@@ -66,7 +67,7 @@ cuda-oxide 是一个 Rust GPU 编译器，将 `#[kernel]` 标注的 Rust 函数�
 |---|---|
 | GPU | MetaX C500 × 4 |
 | GPU 内存 | 65536 MiB |
-| 实测带宽 | 1444 GB/s（Oxide FP32 VecAdd 有效带宽） |
+| 实测带宽 | 1454.4 GB/s（Oxide FP32 VecAdd 有效带宽） |
 
 ### 2.2 软件
 
