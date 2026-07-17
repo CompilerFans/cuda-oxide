@@ -15,6 +15,8 @@ use std::process::Command;
 
 use crate::backend;
 
+const TARGET_BACKEND_ENV: &str = "CUDA_OXIDE_TARGET_BACKEND";
+
 /// Project-local cuda-oxide defaults loaded from `.cargo/cuda-oxide.toml`.
 #[derive(Debug, Clone, Default)]
 pub struct OxideConfig {
@@ -166,7 +168,7 @@ pub fn codegen_run(
     features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
-    backend: Option<&str>,
+    target_backend: Option<&str>,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -175,6 +177,7 @@ pub fn codegen_run(
     };
 
     let interop = load_interop_config(&example_dir);
+    let target_backend = configured_target_backend_or_exit(ctx, target_backend);
 
     let output_format = format_label(emit_nvvm_ir);
     let target_arch = configured_arch(ctx, arch);
@@ -194,6 +197,7 @@ pub fn codegen_run(
     let detected_device_arch = detect_run_target_arch(target_arch, emit_nvvm_ir);
 
     if let Some(interop) = interop.filter(|config| !config.device_crates.is_empty()) {
+        reject_unsupported_interop_target_backend(&target_backend);
         codegen_run_interop(
             ctx,
             example,
@@ -252,7 +256,7 @@ pub fn codegen_run(
     apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
     apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
-    apply_backend(&mut cmd, backend);
+    apply_target_backend(&mut cmd, &target_backend);
 
     if let Some(bin) = bin {
         println!("Building and running {} (bin: {})...", example, bin);
@@ -294,10 +298,13 @@ pub fn codegen_sanitize(
     };
 
     let interop = load_interop_config(&example_dir);
+    let target_backend = configured_target_backend_or_exit(ctx, None);
+    reject_unsupported_sanitize_target_backend(&target_backend);
     let target_arch = configured_arch(ctx, arch);
     let detected_device_arch = detect_run_target_arch(target_arch, false);
 
     if let Some(interop) = interop.filter(|config| !config.device_crates.is_empty()) {
+        reject_unsupported_interop_target_backend(&target_backend);
         println!("=========================================");
         println!("RUSTC-CODEGEN-CUDA SANITIZE INTEROP: {}", example);
         println!("=========================================");
@@ -482,6 +489,41 @@ fn reject_interop_nvvm_ir(emit_nvvm_ir: bool) {
     }
 }
 
+fn reject_unsupported_interop_target_backend(target_backend: &str) {
+    if let Err(message) = validate_interop_target_backend(target_backend) {
+        eprintln!("Error: {message}");
+        std::process::exit(2);
+    }
+}
+
+fn validate_interop_target_backend(target_backend: &str) -> Result<(), String> {
+    if target_backend == "maca" {
+        return Err(
+            "metadata interop does not support the MACA target backend yet; use `--target cuda`"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn reject_unsupported_sanitize_target_backend(target_backend: &str) {
+    if let Err(message) = validate_sanitize_target_backend(target_backend) {
+        eprintln!("Error: {message}");
+        std::process::exit(2);
+    }
+}
+
+fn validate_sanitize_target_backend(target_backend: &str) -> Result<(), String> {
+    if target_backend == "maca" {
+        return Err(
+            "NVIDIA Compute Sanitizer does not support the MACA target backend; set \
+             CUDA_OXIDE_TARGET_BACKEND=cuda to sanitize a CUDA build"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn build_interop_device_crates(
     ctx: &Context,
     example_dir: &Path,
@@ -550,6 +592,9 @@ fn build_interop_device_crate(
         .current_dir(device_dir);
 
     apply_interop_device_codegen_options(&mut cmd, ctx, verbose, options);
+    // Metadata interop currently publishes PTX. Pin the supported backend so
+    // an explicit `--target cuda` overrides an inherited MACA selection.
+    apply_target_backend(&mut cmd, "cuda");
     let fingerprinted_cfgs = options
         .sanitizer_line_tables
         .then(|| {
@@ -1223,9 +1268,10 @@ pub fn codegen_build(
     arch: Option<&str>,
     features: Option<&str>,
     no_fmad: bool,
-    backend: Option<&str>,
+    target_backend: Option<&str>,
 ) {
     let target_arch = configured_arch(ctx, arch);
+    let target_backend = configured_target_backend_or_exit(ctx, target_backend);
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
@@ -1235,6 +1281,7 @@ pub fn codegen_build(
     if let Some(interop) =
         load_interop_config(&example_dir).filter(|config| !config.device_crates.is_empty())
     {
+        reject_unsupported_interop_target_backend(&target_backend);
         codegen_build_interop(
             ctx,
             example,
@@ -1268,7 +1315,7 @@ pub fn codegen_build(
     apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
     apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
-    apply_backend(&mut cmd, backend);
+    apply_target_backend(&mut cmd, &target_backend);
 
     println!("Building {}...", example);
     println!();
@@ -1338,7 +1385,7 @@ pub fn emit_ltoir(
         Some(&sm_arch),
         features,
         no_fmad,
-        None, // LTOIR is NVVM-only, no MXMACA backend
+        Some("cuda"), // LTOIR is NVVM-only; override inherited/project MACA selection
     );
 
     // Step 2: compile that NVVM IR to LTOIR via libNVVM -gen-lto.
@@ -1560,6 +1607,7 @@ pub struct CargoPassthroughOptions<'a> {
     pub device_codegen_crate: Option<&'a str>,
     pub device_cfgs: &'a [String],
     pub no_fmad: bool,
+    pub target_backend: Option<&'a str>,
 }
 
 fn normalize_device_codegen_crates(raw: &str) -> Result<String, String> {
@@ -1607,6 +1655,37 @@ fn configured_device_codegen_crates(
     )
 }
 
+fn resolve_target_backend(
+    explicit: Option<&str>,
+    inherited: Option<&str>,
+    configured: Option<&str>,
+) -> Result<String, String> {
+    let value = explicit.or(inherited).or(configured).unwrap_or("cuda");
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cuda" => Ok("cuda".to_string()),
+        "maca" => Ok("maca".to_string()),
+        _ => Err(format!(
+            "invalid {TARGET_BACKEND_ENV} value `{value}`; expected `cuda` or `maca`"
+        )),
+    }
+}
+
+fn configured_target_backend(ctx: &Context, explicit: Option<&str>) -> Result<String, String> {
+    let inherited = std::env::var(TARGET_BACKEND_ENV).ok();
+    resolve_target_backend(
+        explicit,
+        inherited.as_deref(),
+        project_config_env(ctx, TARGET_BACKEND_ENV),
+    )
+}
+
+fn configured_target_backend_or_exit(ctx: &Context, explicit: Option<&str>) -> String {
+    configured_target_backend(ctx, explicit).unwrap_or_else(|message| {
+        eprintln!("Error: {message}");
+        std::process::exit(2);
+    })
+}
+
 fn resolve_device_codegen_crates(
     explicit: Option<&str>,
     inherited: Option<&str>,
@@ -1628,6 +1707,7 @@ fn passthrough_codegen_fingerprint(
     opts: &CargoPassthroughOptions<'_>,
     owner_filter: Option<&str>,
     target_arch: Option<&str>,
+    target_backend: &str,
 ) -> String {
     let inherited_env: BTreeMap<String, Option<String>> = std::env::vars_os()
         .filter_map(|(key, value)| {
@@ -1636,7 +1716,14 @@ fn passthrough_codegen_fingerprint(
                 .map(|key| (key, value.into_string().ok()))
         })
         .collect();
-    passthrough_codegen_fingerprint_with_env(ctx, opts, owner_filter, target_arch, &inherited_env)
+    passthrough_codegen_fingerprint_with_env(
+        ctx,
+        opts,
+        owner_filter,
+        target_arch,
+        target_backend,
+        &inherited_env,
+    )
 }
 
 fn passthrough_codegen_fingerprint_with_env(
@@ -1644,6 +1731,7 @@ fn passthrough_codegen_fingerprint_with_env(
     opts: &CargoPassthroughOptions<'_>,
     owner_filter: Option<&str>,
     target_arch: Option<&str>,
+    target_backend: &str,
     inherited_env: &BTreeMap<String, Option<String>>,
 ) -> String {
     let mut effective_env = BTreeMap::new();
@@ -1652,11 +1740,15 @@ fn passthrough_codegen_fingerprint_with_env(
         backend_artifact_identity(&ctx.backend_so),
     );
 
-    // Project-configured CUDA_OXIDE_* variables are defaults. Mirror the same
+    let affects_codegen = |key: &str| {
+        key.starts_with("CUDA_OXIDE_") || (target_backend == "maca" && key == "MACA_PATH")
+    };
+
+    // Project-configured codegen variables are defaults. Mirror the same
     // parent override rule as `apply_config_env` so changes that can affect
     // codegen also change Cargo's rustflags fingerprint.
     for (key, configured_value) in &ctx.config.env {
-        if !key.starts_with("CUDA_OXIDE_") {
+        if !affects_codegen(key) {
             continue;
         }
         match inherited_env.get(key) {
@@ -1673,10 +1765,10 @@ fn passthrough_codegen_fingerprint_with_env(
         }
     }
     // Capture backend settings inherited outside project config, including
-    // current and future CUDA_OXIDE_* switches.
+    // current and future CUDA_OXIDE_* switches plus the MACA SDK root.
     for (key, value) in inherited_env
         .iter()
-        .filter(|(key, value)| key.starts_with("CUDA_OXIDE_") && value.is_some())
+        .filter(|(key, value)| affects_codegen(key) && value.is_some())
     {
         effective_env.insert(
             key.clone(),
@@ -1698,6 +1790,23 @@ fn passthrough_codegen_fingerprint_with_env(
     }
     if let Some(target_arch) = target_arch {
         effective_env.insert("CUDA_OXIDE_TARGET".to_string(), target_arch.to_string());
+    }
+    effective_env.insert(TARGET_BACKEND_ENV.to_string(), target_backend.to_string());
+    if target_backend == "maca" {
+        let mxcc = effective_env
+            .get("CUDA_OXIDE_MXCC")
+            .map(PathBuf::from)
+            .or_else(|| {
+                effective_env
+                    .get("MACA_PATH")
+                    .map(|path| PathBuf::from(path).join("mxgpu_llvm/bin/mxcc"))
+            });
+        if let Some(mxcc) = mxcc {
+            effective_env.insert(
+                "__CUDA_OXIDE_MXCC_ARTIFACT".to_string(),
+                backend_artifact_identity(&mxcc),
+            );
+        }
     }
     if let Some(owner_filter) = owner_filter {
         effective_env.insert(
@@ -1744,8 +1853,10 @@ fn sanitize_codegen_fingerprint_cfg(
         device_codegen_crate: None,
         device_cfgs: &[],
         no_fmad,
+        target_backend: None,
     };
-    let base = passthrough_codegen_fingerprint(ctx, &opts, None, target_arch);
+    let target_backend = configured_target_backend_or_exit(ctx, None);
+    let base = passthrough_codegen_fingerprint(ctx, &opts, None, target_arch, &target_backend);
     let mut hash = 0xcbf29ce484222325_u64;
     for bytes in [
         "sanitize-line-tables-v1".as_bytes(),
@@ -1782,14 +1893,20 @@ fn cargo_passthrough_command(
     cargo_args: &[String],
 ) -> Result<Command, String> {
     let target_arch = configured_arch(ctx, opts.arch);
+    let target_backend = configured_target_backend(ctx, opts.target_backend)?;
     let owner_filter = configured_device_codegen_crates(ctx, opts.device_codegen_crate)?;
     let mut fingerprinted_device_cfgs = opts.device_cfgs.to_vec();
     // Cargo does not fingerprint arbitrary child environment variables. An
     // otherwise-unused cfg makes every effective codegen setting part of the
     // rustc command line, so changing target/output/FMA/filter settings reruns
     // the backend instead of silently reusing stale PTX or NVVM IR.
-    let fingerprint =
-        passthrough_codegen_fingerprint(ctx, opts, owner_filter.as_deref(), target_arch);
+    let fingerprint = passthrough_codegen_fingerprint(
+        ctx,
+        opts,
+        owner_filter.as_deref(),
+        target_arch,
+        &target_backend,
+    );
     fingerprinted_device_cfgs.push(format!("cuda_oxide_internal_codegen_env=\"{fingerprint}\""));
     let mut cmd = Command::new("cargo");
     cmd.arg(cargo_subcommand);
@@ -1810,6 +1927,7 @@ fn cargo_passthrough_command(
         cmd.env("CUDA_OXIDE_DEVICE_CODEGEN_CRATE", owner_filter);
     }
     apply_output_mode(&mut cmd, opts.emit_nvvm_ir, target_arch);
+    apply_target_backend(&mut cmd, &target_backend);
     Ok(cmd)
 }
 
@@ -2953,11 +3071,9 @@ fn apply_output_mode(cmd: &mut Command, emit_nvvm_ir: bool, arch: Option<&str>) 
     }
 }
 
-/// Set the target GPU backend (cuda or maca).
-fn apply_backend(cmd: &mut Command, backend: Option<&str>) {
-    if let Some(backend) = backend {
-        cmd.env("CUDA_OXIDE_BACKEND", backend);
-    }
+/// Pin the target GPU backend without changing the codegen shared-object path.
+fn apply_target_backend(cmd: &mut Command, target_backend: &str) {
+    cmd.env(TARGET_BACKEND_ENV, target_backend);
 }
 
 fn configured_arch<'a>(ctx: &'a Context, cli_arch: Option<&'a str>) -> Option<&'a str> {
@@ -3269,8 +3385,9 @@ fn artifact_stem(example: &str) -> String {
     example.replace('-', "_")
 }
 
-/// Remove stale generated artifacts (`.ptx`, `.ll`, `.ltoir`, `.cubin`) from a
-/// previous run so we can verify the build produces fresh output.
+/// Remove stale generated artifacts (`.ptx`, `.ll`, `.ltoir`, `.cubin`,
+/// `.devbin`) from a previous run so we can verify the build produces fresh
+/// output.
 fn clean_generated_files(example_dir: &Path, example: &str) {
     let stem = artifact_stem(example);
     for ext in &[
@@ -3282,6 +3399,7 @@ fn clean_generated_files(example_dir: &Path, example: &str) {
         "target",
         "options",
         "cubin.target",
+        "devbin",
     ] {
         let file = example_dir.join(format!("{}.{}", stem, ext));
         if file.exists() {
@@ -3660,7 +3778,7 @@ mod tests {
             unique
         ));
         std::fs::create_dir_all(&root).unwrap();
-        for extension in ["ptx", "ll", "ltoir", "cubin", "target"] {
+        for extension in ["ptx", "ll", "ltoir", "cubin", "target", "devbin"] {
             std::fs::write(root.join(format!("my_kernel.{extension}")), b"stale").unwrap();
         }
         let cached_cubin =
@@ -3670,7 +3788,7 @@ mod tests {
 
         clean_generated_files(&root, "my-kernel");
 
-        for extension in ["ptx", "ll", "ltoir", "cubin", "target"] {
+        for extension in ["ptx", "ll", "ltoir", "cubin", "target", "devbin"] {
             assert!(!root.join(format!("my_kernel.{extension}")).exists());
         }
         assert_eq!(
@@ -4490,6 +4608,7 @@ MY_BUILD_FLAG = "configured"
             device_codegen_crate: Some("gpu-kernels, math_gpu"),
             device_cfgs: &device_cfgs,
             no_fmad: false,
+            target_backend: Some("maca"),
         };
         let cargo_args = vec![
             "-p".to_string(),
@@ -4524,6 +4643,10 @@ MY_BUILD_FLAG = "configured"
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
             Some("sm_90")
+        );
+        assert_eq!(
+            command_env(&cmd, TARGET_BACKEND_ENV).as_deref(),
+            Some("maca")
         );
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_VERBOSE").as_deref(),
@@ -4561,6 +4684,7 @@ MY_BUILD_FLAG = "configured"
             device_codegen_crate: None,
             device_cfgs: &[],
             no_fmad: false,
+            target_backend: None,
         };
 
         let cmd = cargo_passthrough_command(&ctx, "test", &opts, &[]).unwrap();
@@ -4593,6 +4717,52 @@ MY_BUILD_FLAG = "configured"
     }
 
     #[test]
+    fn target_backend_resolution_uses_cli_then_environment_then_config() {
+        assert_eq!(
+            resolve_target_backend(Some("cuda"), Some("maca"), Some("maca")).unwrap(),
+            "cuda"
+        );
+        assert_eq!(
+            resolve_target_backend(None, Some("MACA"), Some("cuda")).unwrap(),
+            "maca"
+        );
+        assert_eq!(
+            resolve_target_backend(None, None, Some("maca")).unwrap(),
+            "maca"
+        );
+        assert_eq!(resolve_target_backend(None, None, None).unwrap(), "cuda");
+        assert!(resolve_target_backend(None, Some("hip"), None).is_err());
+    }
+
+    #[test]
+    fn target_backend_env_does_not_replace_codegen_backend_path() {
+        let mut cmd = Command::new("cargo");
+        cmd.env("CUDA_OXIDE_BACKEND", "/tmp/librustc_codegen_cuda.so");
+        apply_target_backend(&mut cmd, "maca");
+
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_BACKEND").as_deref(),
+            Some("/tmp/librustc_codegen_cuda.so")
+        );
+        assert_eq!(
+            command_env(&cmd, TARGET_BACKEND_ENV).as_deref(),
+            Some("maca")
+        );
+    }
+
+    #[test]
+    fn metadata_interop_rejects_maca_target_backend() {
+        assert!(validate_interop_target_backend("cuda").is_ok());
+        assert!(validate_interop_target_backend("maca").is_err());
+    }
+
+    #[test]
+    fn compute_sanitizer_rejects_maca_target_backend() {
+        assert!(validate_sanitize_target_backend("cuda").is_ok());
+        assert!(validate_sanitize_target_backend("maca").is_err());
+    }
+
+    #[test]
     fn passthrough_fingerprint_tracks_output_affecting_settings() {
         let ctx = test_context(OxideConfig::default());
         let base = CargoPassthroughOptions {
@@ -4604,6 +4774,7 @@ MY_BUILD_FLAG = "configured"
             device_codegen_crate: None,
             device_cfgs: &[],
             no_fmad: false,
+            target_backend: None,
         };
         let inherited_env = BTreeMap::new();
         let base_hash = passthrough_codegen_fingerprint_with_env(
@@ -4611,6 +4782,7 @@ MY_BUILD_FLAG = "configured"
             &base,
             None,
             Some("sm_80"),
+            "cuda",
             &inherited_env,
         );
 
@@ -4641,6 +4813,7 @@ MY_BUILD_FLAG = "configured"
                 &arch,
                 None,
                 Some("sm_90"),
+                "cuda",
                 &inherited_env,
             )
         );
@@ -4651,6 +4824,7 @@ MY_BUILD_FLAG = "configured"
                 &emit,
                 None,
                 Some("sm_80"),
+                "cuda",
                 &inherited_env,
             )
         );
@@ -4661,6 +4835,7 @@ MY_BUILD_FLAG = "configured"
                 &no_fmad,
                 None,
                 Some("sm_80"),
+                "cuda",
                 &inherited_env,
             )
         );
@@ -4671,6 +4846,7 @@ MY_BUILD_FLAG = "configured"
                 &base,
                 Some("gpu_kernel"),
                 Some("sm_80"),
+                "cuda",
                 &inherited_env,
             )
         );
@@ -4681,9 +4857,97 @@ MY_BUILD_FLAG = "configured"
                 &base,
                 None,
                 Some("sm_80"),
+                "cuda",
                 &inherited_env,
             )
         );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("sm_80"),
+                "maca",
+                &inherited_env,
+            )
+        );
+
+        let mut sdk_a = inherited_env.clone();
+        sdk_a.insert("MACA_PATH".to_string(), Some("/opt/maca-a".to_string()));
+        let mut sdk_b = inherited_env.clone();
+        sdk_b.insert("MACA_PATH".to_string(), Some("/opt/maca-b".to_string()));
+        assert_ne!(
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("xcore1000"),
+                "maca",
+                &sdk_a,
+            ),
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("xcore1000"),
+                "maca",
+                &sdk_b,
+            )
+        );
+    }
+
+    #[test]
+    fn passthrough_fingerprint_tracks_mxcc_rebuild_at_same_sdk_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_mxcc_fingerprint_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let mxcc = root.join("mxgpu_llvm/bin/mxcc");
+        std::fs::create_dir_all(mxcc.parent().unwrap()).unwrap();
+        std::fs::write(&mxcc, b"first").unwrap();
+
+        let ctx = test_context(OxideConfig::default());
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("xcore1000"),
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: Some("maca"),
+        };
+        let inherited_env = BTreeMap::from([(
+            "MACA_PATH".to_string(),
+            Some(root.to_string_lossy().into_owned()),
+        )]);
+        let before = passthrough_codegen_fingerprint_with_env(
+            &ctx,
+            &opts,
+            None,
+            Some("xcore1000"),
+            "maca",
+            &inherited_env,
+        );
+        std::fs::write(&mxcc, b"second-build-is-larger").unwrap();
+        let after = passthrough_codegen_fingerprint_with_env(
+            &ctx,
+            &opts,
+            None,
+            Some("xcore1000"),
+            "maca",
+            &inherited_env,
+        );
+
+        assert_ne!(before, after);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4712,13 +4976,26 @@ MY_BUILD_FLAG = "configured"
             device_codegen_crate: None,
             device_cfgs: &[],
             no_fmad: false,
+            target_backend: None,
         };
         let inherited_env = BTreeMap::new();
-        let before =
-            passthrough_codegen_fingerprint_with_env(&ctx, &opts, None, None, &inherited_env);
+        let before = passthrough_codegen_fingerprint_with_env(
+            &ctx,
+            &opts,
+            None,
+            None,
+            "cuda",
+            &inherited_env,
+        );
         std::fs::write(&backend, b"second-build-is-larger").unwrap();
-        let after =
-            passthrough_codegen_fingerprint_with_env(&ctx, &opts, None, None, &inherited_env);
+        let after = passthrough_codegen_fingerprint_with_env(
+            &ctx,
+            &opts,
+            None,
+            None,
+            "cuda",
+            &inherited_env,
+        );
 
         assert_ne!(before, after);
         std::fs::remove_dir_all(root).unwrap();

@@ -47,12 +47,21 @@ struct Cli {
 }
 
 /// Target GPU backend.
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum TargetBackend {
     /// NVIDIA CUDA (default)
     Cuda,
     /// MetaX GPU (MXMACA)
     Maca,
+}
+
+impl TargetBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Maca => "maca",
+        }
+    }
 }
 
 /// Available subcommands for `cargo oxide`.
@@ -72,8 +81,8 @@ enum Commands {
         #[arg(long)]
         arch: Option<String>,
         /// Target GPU backend (cuda or maca)
-        #[arg(long, value_enum, default_value_t = TargetBackend::Cuda)]
-        target: TargetBackend,
+        #[arg(long, value_enum)]
+        target: Option<TargetBackend>,
         /// Comma-separated list of features to enable
         #[arg(long)]
         features: Option<String>,
@@ -131,8 +140,8 @@ enum Commands {
         #[arg(long)]
         arch: Option<String>,
         /// Target GPU backend (cuda or maca)
-        #[arg(long, value_enum, default_value_t = TargetBackend::Cuda)]
-        target: TargetBackend,
+        #[arg(long, value_enum)]
+        target: Option<TargetBackend>,
         /// Comma-separated list of features to enable
         #[arg(long)]
         features: Option<String>,
@@ -336,10 +345,7 @@ fn main() {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "run");
             validate_nvvm_ir_arch(&ctx, &example, emit_nvvm_ir, arch.as_deref());
-            let backend_str = match target {
-                TargetBackend::Cuda => None,
-                TargetBackend::Maca => Some("maca"),
-            };
+            let target_backend = target.map(TargetBackend::as_str);
             commands::codegen_run(
                 &ctx,
                 &example,
@@ -349,7 +355,7 @@ fn main() {
                 features.as_deref(),
                 bin.as_deref(),
                 no_fmad,
-                backend_str,
+                target_backend,
             );
         }
         Commands::Sanitize {
@@ -403,10 +409,7 @@ fn main() {
             if !passthrough {
                 let example = resolve_example_name(example, &ctx, "build");
                 validate_nvvm_ir_arch(&ctx, &example, emit_nvvm_ir, arch.as_deref());
-                let backend_str = match target {
-                    TargetBackend::Cuda => None,
-                    TargetBackend::Maca => Some("maca"),
-                };
+                let target_backend = target.map(TargetBackend::as_str);
                 commands::codegen_build(
                     &ctx,
                     &example,
@@ -415,7 +418,7 @@ fn main() {
                     arch.as_deref(),
                     features.as_deref(),
                     no_fmad,
-                    backend_str,
+                    target_backend,
                 );
             } else {
                 if example.is_some() {
@@ -437,6 +440,7 @@ fn main() {
                         device_codegen_crate: device_codegen_crate.as_deref(),
                         device_cfgs: &device_cfgs,
                         no_fmad,
+                        target_backend: target.map(TargetBackend::as_str),
                     },
                     &cargo_args,
                 );
@@ -463,6 +467,7 @@ fn main() {
                     device_codegen_crate: device_codegen_crate.as_deref(),
                     device_cfgs: &device_cfgs,
                     no_fmad: false,
+                    target_backend: None,
                 },
                 &cargo_args,
             );
@@ -645,6 +650,25 @@ mod tests {
             panic!("expected build command");
         };
         assert!(cargo_args.is_empty());
+    }
+
+    #[test]
+    fn target_backend_is_optional_and_preserves_explicit_cuda_or_maca() {
+        let default = Cli::try_parse_from(["cargo-oxide", "build", "vecadd"])
+            .expect("build target backend should be optional");
+        let Commands::Build { target, .. } = default.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(target, None);
+
+        for (value, expected) in [("cuda", TargetBackend::Cuda), ("maca", TargetBackend::Maca)] {
+            let cli =
+                Cli::try_parse_from(["cargo-oxide", "build", "vecadd", "--target", value]).unwrap();
+            let Commands::Build { target, .. } = cli.command else {
+                panic!("expected build command");
+            };
+            assert_eq!(target, Some(expected));
+        }
     }
 
     #[test]
