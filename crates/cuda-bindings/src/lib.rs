@@ -37,14 +37,42 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::env;
 
+// Type aliases to map cu-bridge types to CUDA types for compatibility
+pub type CUresult = mcDrvError_enum;
+pub type CUevent = mcDrvEvent_t;
+pub type CUdevice = mcDrvDevice_t;
+pub type CUcontext = mcDrvContext_t;
+pub type CUmodule = mcDrvModule_t;
+pub type CUfunction = mcDrvFunction_t;
+pub type CUstream = mcDrvStream_t;
+pub type CUdeviceptr = mcDrvDeviceptr_t;
+
+// Error code aliases
+pub const CUDA_SUCCESS: mcDrvError_enum = mcDrvError_enum_MC_SUCCESS;
+pub const CUDA_ERROR_INVALID_VALUE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_VALUE;
+pub const CUDA_ERROR_OUT_OF_MEMORY: mcDrvError_enum = mcDrvError_enum_MC_ERROR_OUT_OF_MEMORY;
+pub const CUDA_ERROR_NOT_INITIALIZED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_INITIALIZED;
+pub const CUDA_ERROR_DEINITIALIZED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_DEINITIALIZED;
+pub const CUDA_ERROR_NO_DEVICE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NO_DEVICE;
+pub const CUDA_ERROR_INVALID_DEVICE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_DEVICE;
+pub const CUDA_ERROR_INVALID_IMAGE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_IMAGE;
+pub const CUDA_ERROR_INVALID_CONTEXT: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_CONTEXT;
+pub const CUDA_ERROR_INVALID_HANDLE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_INVALID_HANDLE;
+pub const CUDA_ERROR_NOT_FOUND: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_FOUND;
+pub const CUDA_ERROR_NOT_READY: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_READY;
+pub const CUDA_ERROR_ILLEGAL_ADDRESS: mcDrvError_enum = mcDrvError_enum_MC_ERROR_ILLEGAL_ADDRESS;
+pub const CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES: mcDrvError_enum = mcDrvError_enum_MC_ERROR_LAUNCH_OUT_OF_RESOURCES;
+pub const CUDA_ERROR_LAUNCH_TIMEOUT: mcDrvError_enum = mcDrvError_enum_MC_ERROR_LAUNCH_TIMEOUT;
+pub const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PEER_ACCESS_ALREADY_ENABLED;
+pub const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PEER_ACCESS_NOT_ENABLED;
+pub const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: mcDrvError_enum = mcDrvError_enum_MC_ERROR_PRIMARY_CONTEXT_ACTIVE;
+pub const CUDA_ERROR_CONTEXT_IS_DESTROYED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_CONTEXT_IS_DESTROYED;
+pub const CUDA_ERROR_NOT_SUPPORTED: mcDrvError_enum = mcDrvError_enum_MC_ERROR_NOT_SUPPORTED;
+pub const CUDA_ERROR_UNKNOWN: mcDrvError_enum = mcDrvError_enum_MC_ERROR_UNKNOWN;
+
 /// Reports the elapsed time between two recorded events, dispatching to the
 /// event elapsed-time driver entry point declared by this build's toolkit
 /// headers.
-///
-/// CUDA 12.8 renamed the entry point to `cuEventElapsedTime_v2`; earlier
-/// toolkits only declare `cuEventElapsedTime`. The build script probes
-/// `cuda.h` and sets the `cuda_has_cuEventElapsedTime_v2` cfg accordingly, so
-/// callers stay source-compatible across toolkit versions.
 ///
 /// # Safety
 ///
@@ -53,17 +81,10 @@ use std::env;
 /// in the current context.
 pub unsafe fn cu_event_elapsed_time(
     elapsed_ms: *mut f32,
-    start: CUevent,
-    end: CUevent,
-) -> CUresult {
-    #[cfg(cuda_has_cuEventElapsedTime_v2)]
-    {
-        unsafe { cuEventElapsedTime_v2(elapsed_ms, start, end) }
-    }
-    #[cfg(not(cuda_has_cuEventElapsedTime_v2))]
-    {
-        unsafe { cuEventElapsedTime(elapsed_ms, start, end) }
-    }
+    start: mcDrvEvent_t,
+    end: mcDrvEvent_t,
+) -> mcDrvError_enum {
+    unsafe { wcuEventElapsedTime(elapsed_ms, start, end) }
 }
 
 /// Root directory of the CUDA toolkit used for this build, for host code that must agree with

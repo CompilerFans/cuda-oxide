@@ -61,6 +61,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         // launch_kernel_ex in cuda-core constructs this struct via raw pointer writes.
         .opaque_type("CUlaunchAttribute_st")
         .opaque_type("CUlaunchAttributeValue_union")
+        // Block duplicate constants from cu-bridge headers
+        .blocklist_item("FP_NORMAL")
+        .blocklist_item("FP_SUBNORMAL")
+        .blocklist_item("FP_ZERO")
+        .blocklist_item("FP_INFINITE")
+        .blocklist_item("FP_NAN")
         .generate()
         .map_err(|error| format!("cuda-bindings: failed to generate CUDA bindings: {error}"))?
         .write_to_file(Path::new(&env::var("OUT_DIR")?).join("bindings.rs"))?;
