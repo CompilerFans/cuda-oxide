@@ -3617,6 +3617,116 @@ fn maca_mma_f16_fails_instead_of_returning_accumulator() -> Result<(), anyhow::E
 }
 
 #[test]
+fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let (module_ptr, entry) = build_test_kernel(
+        &mut ctx,
+        vec![i64_ty.into(), i32_ty.into(), i32_ty.into(), i1_ty.into()],
+    );
+    let mask = entry.deref(&ctx).get_argument(0);
+    let value = entry.deref(&ctx).get_argument(1);
+    let lane_or_delta = entry.deref(&ctx).get_argument(2);
+    let predicate = entry.deref(&ctx).get_argument(3);
+
+    for op_info in [
+        nvvm::ShflSyncIdxI32Op::get_concrete_op_info(),
+        nvvm::ShflSyncUpI32Op::get_concrete_op_info(),
+        nvvm::ShflSyncDownI32Op::get_concrete_op_info(),
+        nvvm::ShflSyncBflyI32Op::get_concrete_op_info(),
+    ] {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i32_ty.into()],
+            vec![mask, value, lane_or_delta],
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    for (op_info, result_ty) in [
+        (
+            nvvm::VoteSyncBallotOp::get_concrete_op_info(),
+            i64_ty.into(),
+        ),
+        (nvvm::VoteSyncAllOp::get_concrete_op_info(), i1_ty.into()),
+        (nvvm::VoteSyncAnyOp::get_concrete_op_info(), i1_ty.into()),
+    ] {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![result_ty],
+            vec![mask, predicate],
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
+    let active = Operation::new(
+        &mut ctx,
+        nvvm::ActiveMaskOp::get_concrete_op_info(),
+        vec![i64_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    active.insert_at_back(entry, &ctx);
+    let sync = Operation::new(
+        &mut ctx,
+        nvvm::BarWarpSyncOp::get_concrete_op_info(),
+        vec![],
+        vec![mask],
+        vec![],
+        0,
+    );
+    sync.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let module = Operation::get_op::<ModuleOp>(module_ptr, &ctx).expect("module op");
+    let ir = llvm_export::export::export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &llvm_export::export::MacaExportConfig,
+    )
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(ir.matches("@llvm.mxc.bsm.bpermute").count(), 5);
+    assert!(ir.contains("@llvm.mxc.mbcnt.lo"));
+    assert!(ir.contains("@llvm.mxc.mbcnt.hi"));
+    assert!(ir.contains("@llvm.mxc.icmp.i64.i32"));
+    assert!(ir.contains("@llvm.mxc.barrier.warp"));
+    assert!(ir.contains("fence syncscope(\"warp\") release"));
+    assert!(ir.contains("fence syncscope(\"warp\") acquire"));
+    assert!(
+        ir.contains("and i64"),
+        "ballot must apply the Wave64 member mask"
+    );
+    for source_lane_op in ["and i32", "sub i32", "add i32", "xor i32"] {
+        assert!(
+            ir.contains(source_lane_op),
+            "missing {source_lane_op}:\n{ir}"
+        );
+    }
+    assert!(!ir.contains("llvm.nvvm"));
+    assert!(!ir.contains("asm "));
+    Ok(())
+}
+
+#[test]
 fn test_mma_m16n8k8_f32_tf32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = make_test_ctx();
     let f32_ty = pliron::builtin::types::FP32Type::get(&ctx);

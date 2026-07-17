@@ -3204,9 +3204,8 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        // Lane-position masks: zero-operand u32 special-register reads, same
-        // shape as the thread/block indexing sregs (see `emit_nvvm_intrinsic`).
-        "cuda_device::warp::lanemask_lt" => Ok(Some(helpers::emit_nvvm_intrinsic(
+        // Lane-position masks use the full Wave64 mask carrier.
+        "cuda_device::warp::lanemask_lt" => Ok(Some(helpers::emit_nvvm_intrinsic_u64(
             ctx,
             ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
             destination,
@@ -3217,7 +3216,7 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        "cuda_device::warp::lanemask_le" => Ok(Some(helpers::emit_nvvm_intrinsic(
+        "cuda_device::warp::lanemask_le" => Ok(Some(helpers::emit_nvvm_intrinsic_u64(
             ctx,
             ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
             destination,
@@ -3228,7 +3227,7 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        "cuda_device::warp::lanemask_eq" => Ok(Some(helpers::emit_nvvm_intrinsic(
+        "cuda_device::warp::lanemask_eq" => Ok(Some(helpers::emit_nvvm_intrinsic_u64(
             ctx,
             ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
             destination,
@@ -3239,7 +3238,7 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        "cuda_device::warp::lanemask_ge" => Ok(Some(helpers::emit_nvvm_intrinsic(
+        "cuda_device::warp::lanemask_ge" => Ok(Some(helpers::emit_nvvm_intrinsic_u64(
             ctx,
             ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
             destination,
@@ -3250,7 +3249,7 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        "cuda_device::warp::lanemask_gt" => Ok(Some(helpers::emit_nvvm_intrinsic(
+        "cuda_device::warp::lanemask_gt" => Ok(Some(helpers::emit_nvvm_intrinsic_u64(
             ctx,
             ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
             destination,

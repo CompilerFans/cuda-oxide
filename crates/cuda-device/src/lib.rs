@@ -14,7 +14,10 @@
 /// This constant is used by `warp::warp_id()` and cooperative groups to
 /// compute wave-level indices. The compiler backend selects the correct
 /// hardware intrinsics based on the target platform.
-pub const WAVE_SIZE: u32 = 32;
+pub const WAVE_SIZE: u32 = 64;
+
+/// Participation mask for one MetaX hardware wave.
+pub type WaveMask = u64;
 
 pub use cuda_macros::{
     cluster_launch, constant, convergent, cooperative_launch, cuda_module, device, gpu_printf,

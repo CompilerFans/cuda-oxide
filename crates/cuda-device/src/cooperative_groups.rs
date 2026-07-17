@@ -115,7 +115,7 @@ pub trait WarpCollective: ThreadGroup {
     /// Bitmask: bit `k` (within this group) set iff lane `k`'s `predicate` is true.
     ///
     /// PTX `vote.sync.ballot.b32` with the group's participation mask.
-    fn ballot(&self, predicate: bool) -> u32;
+    fn ballot(&self, predicate: bool) -> crate::WaveMask;
 
     /// True iff every lane in this group has `predicate == true`.
     ///
@@ -348,7 +348,7 @@ pub fn this_thread_block() -> ThreadBlock {
 impl ThreadBlock {
     /// Partition this block into tiles of `N` lanes.
     ///
-    /// `N` must be a power of two in `1..=32`. For `N == 32` the result
+    /// `N` must be a power of two in `1..=64`. For `N == 64` the result
     /// is a full-warp tile; for smaller `N` it's a sub-warp tile whose
     /// participation mask is computed at runtime from this lane's
     /// `lane_id()`.
@@ -359,8 +359,8 @@ impl ThreadBlock {
     pub fn tiled_partition<const N: u32>(self) -> WarpTile<N> {
         const {
             assert!(
-                N == 1 || N == 2 || N == 4 || N == 8 || N == 16 || N == 32,
-                "WarpTile size must be 1, 2, 4, 8, 16, or 32",
+                N == 1 || N == 2 || N == 4 || N == 8 || N == 16 || N == 32 || N == 64,
+                "WarpTile size must be 1, 2, 4, 8, 16, 32, or 64",
             );
         }
         WarpTile { _priv: () }
@@ -412,13 +412,13 @@ pub struct WarpTile<const N: u32> {
 impl<const N: u32> WarpTile<N> {
     /// Participation mask for this thread's tile.
     #[inline(always)]
-    fn mask(&self) -> u32 {
-        if N == 32 {
-            u32::MAX
+    fn mask(&self) -> crate::WaveMask {
+        if N == 64 {
+            crate::WaveMask::MAX
         } else {
             let lane = warp::lane_id();
             let tile_idx = lane / N;
-            ((1u32 << N) - 1) << (tile_idx * N)
+            ((1u64 << N) - 1) << (tile_idx * N)
         }
     }
 
@@ -442,8 +442,8 @@ impl<const N: u32> ThreadGroup for WarpTile<N> {
 
     #[inline(always)]
     fn sync(&self) {
-        if N == 32 {
-            warp::sync_mask(u32::MAX);
+        if N == 64 {
+            warp::sync_mask(crate::WaveMask::MAX);
         } else {
             warp::sync_mask(self.mask());
         }
@@ -452,12 +452,12 @@ impl<const N: u32> ThreadGroup for WarpTile<N> {
 
 impl<const N: u32> WarpCollective for WarpTile<N> {
     #[inline(always)]
-    fn ballot(&self, predicate: bool) -> u32 {
+    fn ballot(&self, predicate: bool) -> crate::WaveMask {
         let raw = warp::ballot_sync(self.mask(), predicate);
-        if N == 32 {
+        if N == 64 {
             raw
         } else {
-            (raw >> self.tile_base_lane()) & ((1u32 << N) - 1)
+            (raw >> self.tile_base_lane()) & ((1u64 << N) - 1)
         }
     }
 
@@ -515,22 +515,22 @@ impl<const N: u32> WarpCollective for WarpTile<N> {
 
     #[inline(always)]
     fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask(), value) & self.mask()
+        warp::match_any_sync(self.mask() as u32, value) & self.mask() as u32
     }
 
     #[inline(always)]
     fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask(), value) & self.mask()
+        warp::match_any_i64_sync(self.mask() as u32, value) & self.mask() as u32
     }
 
     #[inline(always)]
     fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask(), value)
+        warp::match_all_sync(self.mask() as u32, value)
     }
 
     #[inline(always)]
     fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask(), value)
+        warp::match_all_i64_sync(self.mask() as u32, value)
     }
 }
 
@@ -550,7 +550,7 @@ impl<const N: u32> WarpCollective for WarpTile<N> {
 /// code use [`WarpTile<32>`] instead.
 #[derive(Copy, Clone, Debug)]
 pub struct CoalescedThreads {
-    mask: u32,
+    mask: crate::WaveMask,
 }
 
 /// Capture the currently-converged lanes as a [`CoalescedThreads`] group.
@@ -564,7 +564,7 @@ pub fn coalesced_threads() -> CoalescedThreads {
 impl CoalescedThreads {
     /// The captured participation mask.
     #[inline(always)]
-    pub fn raw_mask(&self) -> u32 {
+    pub fn raw_mask(&self) -> crate::WaveMask {
         self.mask
     }
 }
@@ -578,7 +578,7 @@ impl ThreadGroup for CoalescedThreads {
     #[inline(always)]
     fn thread_rank(&self) -> u32 {
         let lane = warp::lane_id();
-        let lower = self.mask & ((1u32 << lane) - 1);
+        let lower = self.mask & ((1u64 << lane) - 1);
         lower.count_ones()
     }
 
@@ -590,7 +590,7 @@ impl ThreadGroup for CoalescedThreads {
 
 impl WarpCollective for CoalescedThreads {
     #[inline(always)]
-    fn ballot(&self, predicate: bool) -> u32 {
+    fn ballot(&self, predicate: bool) -> crate::WaveMask {
         warp::ballot_sync(self.mask, predicate) & self.mask
     }
 
@@ -675,22 +675,22 @@ impl WarpCollective for CoalescedThreads {
 
     #[inline(always)]
     fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask, value) & self.mask
+        warp::match_any_sync(self.mask as u32, value) & self.mask as u32
     }
 
     #[inline(always)]
     fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask, value) & self.mask
+        warp::match_any_i64_sync(self.mask as u32, value) & self.mask as u32
     }
 
     #[inline(always)]
     fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask, value)
+        warp::match_all_sync(self.mask as u32, value)
     }
 
     #[inline(always)]
     fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask, value)
+        warp::match_all_i64_sync(self.mask as u32, value)
     }
 }
 
@@ -935,7 +935,7 @@ impl WarpShuffle for f32 {
 /// the butterfly converges all lanes onto the same answer, which is the
 /// usual ergonomic shape and matches CUB's `WarpReduce`.
 ///
-/// `N` is the tile size (1, 2, 4, 8, 16, or 32) — already validated by
+/// `N` is the tile size (1, 2, 4, 8, 16, 32, or 64) — already validated by
 /// [`ThreadBlock::tiled_partition`] at construction time.
 ///
 /// # Convergence
@@ -951,7 +951,7 @@ impl WarpShuffle for f32 {
 /// ```rust,ignore
 /// use cuda_device::cooperative_groups::{this_thread_block, warp_reduce, ops::Sum};
 ///
-/// let warp = this_thread_block().tiled_partition::<32>();
+/// let warp = this_thread_block().tiled_partition::<64>();
 /// let total: u32 = warp_reduce::<u32, Sum, _>(&warp, my_value);
 /// // every lane now holds the warp-wide sum
 /// ```
@@ -978,14 +978,14 @@ where
 /// lane reads the value from rank `(my_rank - delta)` via `shfl.sync.up`,
 /// then combines if `my_rank >= delta`. The tile's participation mask
 /// keeps cross-tile pulls quiet (out-of-mask source ⇒ "own value"), so
-/// for `N < 32` two tiles in the same warp scan independently.
+/// for `N < 64` two tiles in the same wave scan independently.
 ///
-/// `N` is the tile size (1, 2, 4, 8, 16, or 32).
+/// `N` is the tile size (1, 2, 4, 8, 16, 32, or 64).
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let warp = this_thread_block().tiled_partition::<32>();
+/// let warp = this_thread_block().tiled_partition::<64>();
 /// let prefix: u32 = warp_scan::<u32, Sum, _>(&warp, 1u32);
 /// // lane k now holds k + 1 (inclusive prefix of all-ones)
 /// ```
@@ -1019,18 +1019,18 @@ fn warp_in_block_linear() -> u32 {
 ///
 /// Three-phase shape (the same shape CUB and cuCollections use):
 ///
-/// 1. Each warp warp-reduces its 32 lanes' values via [`warp_reduce`].
-/// 2. Lane 0 of each warp writes its warp's total to `smem[warp_id]`,
+/// 1. Each hardware wave reduces its 64 lanes' values via [`warp_reduce`].
+/// 2. Lane 0 of each wave writes its total to `smem[wave_id]`,
 ///    then `block.sync()`.
 /// 3. The first warp loads the per-warp totals (filling unused slots with
 ///    `Op::identity()`), warp-reduces them, and lane 0 writes the
 ///    block-wide result back to `smem[0]`. After a second `block.sync()`
 ///    every thread reads `smem[0]`.
 ///
-/// `NUM_WARPS` must equal `BLOCK_SIZE / 32`. It's a `usize` const-generic
+/// `NUM_WAVES` must equal `BLOCK_SIZE / 64`. It's a `usize` const-generic
 /// so it lines up with the [`SharedArray`] length parameter; the
-/// compile-time check rejects values outside `1..=32` (i.e. block sizes
-/// outside `32..=1024`).
+/// compile-time check rejects values outside `1..=16` (i.e. block sizes
+/// outside `64..=1024`).
 ///
 /// # Smem reuse
 ///
@@ -1056,8 +1056,8 @@ fn warp_in_block_linear() -> u32 {
 ///
 /// #[kernel]
 /// pub fn my_kernel(...) {
-///     // 8 = 256 / 32 warps per 256-thread block
-///     static mut SMEM: SharedArray<u32, 8> = SharedArray::UNINIT;
+///     // 4 = 256 / 64 waves per 256-thread block
+///     static mut SMEM: SharedArray<u32, 4> = SharedArray::UNINIT;
 ///     let block = this_thread_block();
 ///     let total = block_reduce::<u32, Sum, _>(&block, my_value, &raw mut SMEM);
 ///     // every thread now holds the block-wide total
@@ -1065,10 +1065,10 @@ fn warp_in_block_linear() -> u32 {
 /// ```
 #[inline(always)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn block_reduce<T, Op, const NUM_WARPS: usize>(
+pub fn block_reduce<T, Op, const NUM_WAVES: usize>(
     block: &ThreadBlock,
     value: T,
-    smem: *mut SharedArray<T, NUM_WARPS>,
+    smem: *mut SharedArray<T, NUM_WAVES>,
 ) -> T
 where
     T: WarpShuffle,
@@ -1076,23 +1076,23 @@ where
 {
     const {
         assert!(
-            NUM_WARPS > 0 && NUM_WARPS <= 32,
-            "block_reduce requires 1..=32 warps (block size 32..=1024)",
+            NUM_WAVES > 0 && NUM_WAVES <= 16,
+            "block_reduce requires 1..=16 waves (block size 64..=1024)",
         );
     }
 
     // SAFETY: The caller (a kernel) hands us a raw pointer to a `static mut
-    // SharedArray<T, NUM_WARPS>`. Within this function:
+    // SharedArray<T, NUM_WAVES>`. Within this function:
     //   - all writes occur at distinct (warp_id, lane==0) or (lane==0) sites,
     //   - all reads are separated from prior writes by `block.sync()`.
     // No other reference to the static exists for the duration of the call.
-    let smem: &mut SharedArray<T, NUM_WARPS> = unsafe { &mut *smem };
+    let smem: &mut SharedArray<T, NUM_WAVES> = unsafe { &mut *smem };
 
-    let warp = block.tiled_partition::<32>();
+    let warp = block.tiled_partition::<64>();
     let lane = warp.thread_rank();
     let warp_id = warp_in_block_linear();
 
-    let warp_total = warp_reduce::<T, Op, 32>(&warp, value);
+    let warp_total = warp_reduce::<T, Op, 64>(&warp, value);
 
     if lane == 0 {
         smem[warp_id as usize] = warp_total;
@@ -1100,12 +1100,12 @@ where
     block.sync();
 
     if warp_id == 0 {
-        let v: T = if (lane as usize) < NUM_WARPS {
+        let v: T = if (lane as usize) < NUM_WAVES {
             smem[lane as usize]
         } else {
             <Op as ops::ReduceOp<T>>::identity()
         };
-        let block_total = warp_reduce::<T, Op, 32>(&warp, v);
+        let block_total = warp_reduce::<T, Op, 64>(&warp, v);
         if lane == 0 {
             smem[0] = block_total;
         }
@@ -1122,14 +1122,14 @@ where
 /// Three-phase shape:
 ///
 /// 1. Each warp does an inclusive [`warp_scan`].
-/// 2. Lane 31 of each warp writes its warp total (= last value of its
+/// 2. Lane 63 of each wave writes its wave total (= last value of its
 ///    inclusive scan) to `smem[warp_id]`, then `block.sync()`.
 /// 3. Warp 0 inclusive-scans the warp totals, then converts to an
-///    exclusive prefix and writes back to `smem[0..NUM_WARPS]`. After
+///    exclusive prefix and writes back to `smem[0..NUM_WAVES]`. After
 ///    `block.sync()` every thread reads its own warp's exclusive prefix
 ///    and combines it with its intra-warp inclusive value.
 ///
-/// `NUM_WARPS` must equal `BLOCK_SIZE / 32`. Same `SharedArray` reuse
+/// `NUM_WAVES` must equal `BLOCK_SIZE / 64`. Same `SharedArray` reuse
 /// contract as [`block_reduce`] — caller must `block.sync()` before
 /// reusing the same smem. Same raw-pointer rationale as well: pass
 /// `&raw mut SMEM` from the call site (no `unsafe` block needed).
@@ -1142,7 +1142,7 @@ where
 ///
 /// #[kernel]
 /// pub fn my_kernel(...) {
-///     static mut SMEM: SharedArray<u32, 8> = SharedArray::UNINIT;
+///     static mut SMEM: SharedArray<u32, 4> = SharedArray::UNINIT;
 ///     let block = this_thread_block();
 ///     let prefix = block_scan::<u32, Sum, _>(&block, 1u32, &raw mut SMEM);
 ///     // thread i now holds i + 1 (inclusive scan of all-ones)
@@ -1150,10 +1150,10 @@ where
 /// ```
 #[inline(always)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn block_scan<T, Op, const NUM_WARPS: usize>(
+pub fn block_scan<T, Op, const NUM_WAVES: usize>(
     block: &ThreadBlock,
     value: T,
-    smem: *mut SharedArray<T, NUM_WARPS>,
+    smem: *mut SharedArray<T, NUM_WAVES>,
 ) -> T
 where
     T: WarpShuffle,
@@ -1161,32 +1161,32 @@ where
 {
     const {
         assert!(
-            NUM_WARPS > 0 && NUM_WARPS <= 32,
-            "block_scan requires 1..=32 warps (block size 32..=1024)",
+            NUM_WAVES > 0 && NUM_WAVES <= 16,
+            "block_scan requires 1..=16 waves (block size 64..=1024)",
         );
     }
 
     // SAFETY: see `block_reduce`.
-    let smem: &mut SharedArray<T, NUM_WARPS> = unsafe { &mut *smem };
+    let smem: &mut SharedArray<T, NUM_WAVES> = unsafe { &mut *smem };
 
-    let warp = block.tiled_partition::<32>();
+    let warp = block.tiled_partition::<64>();
     let lane = warp.thread_rank();
     let warp_id = warp_in_block_linear();
 
-    let warp_inclusive = warp_scan::<T, Op, 32>(&warp, value);
+    let warp_inclusive = warp_scan::<T, Op, 64>(&warp, value);
 
-    if lane == 31 {
+    if lane == 63 {
         smem[warp_id as usize] = warp_inclusive;
     }
     block.sync();
 
     if warp_id == 0 {
-        let v: T = if (lane as usize) < NUM_WARPS {
+        let v: T = if (lane as usize) < NUM_WAVES {
             smem[lane as usize]
         } else {
             <Op as ops::ReduceOp<T>>::identity()
         };
-        let inclusive = warp_scan::<T, Op, 32>(&warp, v);
+        let inclusive = warp_scan::<T, Op, 64>(&warp, v);
         // Inclusive -> exclusive: shift right by one lane and force
         // identity at lane 0. shfl_up at lane 0 returns own value, so
         // explicit branch is needed.
@@ -1196,7 +1196,7 @@ where
         } else {
             shifted
         };
-        if (lane as usize) < NUM_WARPS {
+        if (lane as usize) < NUM_WAVES {
             smem[lane as usize] = exclusive;
         }
     }

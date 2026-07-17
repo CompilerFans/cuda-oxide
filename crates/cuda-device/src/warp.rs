@@ -99,7 +99,7 @@ pub fn lane_id() -> u32 {
 /// `(ballot & lanemask_lt()).count_ones()` is the number of earlier lanes that
 /// satisfied the ballot predicate.
 #[inline(never)]
-pub fn lanemask_lt() -> u32 {
+pub fn lanemask_lt() -> crate::WaveMask {
     // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.lt()
     unreachable!("lanemask_lt called outside CUDA kernel context")
 }
@@ -110,7 +110,7 @@ pub fn lanemask_lt() -> u32 {
 /// `i` the result is `(1 << (i + 1)) - 1` (i.e. `lanemask_lt() | lanemask_eq()`),
 /// giving an inclusive prefix mask.
 #[inline(never)]
-pub fn lanemask_le() -> u32 {
+pub fn lanemask_le() -> crate::WaveMask {
     // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.le()
     unreachable!("lanemask_le called outside CUDA kernel context")
 }
@@ -121,7 +121,7 @@ pub fn lanemask_le() -> u32 {
 /// `i` the result is `1 << i` — equivalent to `1u32 << lane_id()` but read
 /// directly from a hardware register.
 #[inline(never)]
-pub fn lanemask_eq() -> u32 {
+pub fn lanemask_eq() -> crate::WaveMask {
     // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.eq()
     unreachable!("lanemask_eq called outside CUDA kernel context")
 }
@@ -131,7 +131,7 @@ pub fn lanemask_eq() -> u32 {
 /// PTX `%lanemask_ge` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.ge`). For lane
 /// `i` the result sets bits `i..=31` (i.e. `lanemask_gt() | lanemask_eq()`).
 #[inline(never)]
-pub fn lanemask_ge() -> u32 {
+pub fn lanemask_ge() -> crate::WaveMask {
     // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.ge()
     unreachable!("lanemask_ge called outside CUDA kernel context")
 }
@@ -142,7 +142,7 @@ pub fn lanemask_ge() -> u32 {
 /// `i` the result sets bits `(i + 1)..=31`. Useful for "lanes after me" suffix
 /// scans and for finding the next active lane via `(ballot & lanemask_gt())`.
 #[inline(never)]
-pub fn lanemask_gt() -> u32 {
+pub fn lanemask_gt() -> crate::WaveMask {
     // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.gt()
     unreachable!("lanemask_gt called outside CUDA kernel context")
 }
@@ -208,7 +208,7 @@ pub fn nwarpid() -> u32 {
 /// }
 /// ```
 #[inline(never)]
-pub fn sync_mask(mask: u32) {
+pub fn sync_mask(mask: crate::WaveMask) {
     let _ = mask;
     unreachable!("sync_mask called outside CUDA kernel context")
 }
@@ -242,7 +242,7 @@ pub fn sync_mask(mask: u32) {
 /// }
 /// ```
 #[inline(never)]
-pub fn active_mask() -> u32 {
+pub fn active_mask() -> crate::WaveMask {
     unreachable!("active_mask called outside CUDA kernel context")
 }
 
@@ -289,7 +289,7 @@ pub fn warp_id() -> u32 {
 /// - `var`: the value to share (each lane provides its own)
 /// - `src_lane`: the lane ID (0-31) to read from
 #[inline(never)]
-pub fn shuffle_sync(mask: u32, var: u32, src_lane: u32) -> u32 {
+pub fn shuffle_sync(mask: crate::WaveMask, var: u32, src_lane: u32) -> u32 {
     let _ = (mask, var, src_lane);
     unreachable!("shuffle_sync called outside CUDA kernel context")
 }
@@ -298,7 +298,7 @@ pub fn shuffle_sync(mask: u32, var: u32, src_lane: u32) -> u32 {
 ///
 /// PTX `shfl.sync.bfly.b32`. The full-warp shorthand is [`shuffle_xor`].
 #[inline(never)]
-pub fn shuffle_xor_sync(mask: u32, var: u32, lane_mask: u32) -> u32 {
+pub fn shuffle_xor_sync(mask: crate::WaveMask, var: u32, lane_mask: u32) -> u32 {
     let _ = (mask, var, lane_mask);
     unreachable!("shuffle_xor_sync called outside CUDA kernel context")
 }
@@ -307,7 +307,7 @@ pub fn shuffle_xor_sync(mask: u32, var: u32, lane_mask: u32) -> u32 {
 ///
 /// PTX `shfl.sync.down.b32`. The full-warp shorthand is [`shuffle_down`].
 #[inline(never)]
-pub fn shuffle_down_sync(mask: u32, var: u32, delta: u32) -> u32 {
+pub fn shuffle_down_sync(mask: crate::WaveMask, var: u32, delta: u32) -> u32 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_down_sync called outside CUDA kernel context")
 }
@@ -316,7 +316,7 @@ pub fn shuffle_down_sync(mask: u32, var: u32, delta: u32) -> u32 {
 ///
 /// PTX `shfl.sync.up.b32`. The full-warp shorthand is [`shuffle_up`].
 #[inline(never)]
-pub fn shuffle_up_sync(mask: u32, var: u32, delta: u32) -> u32 {
+pub fn shuffle_up_sync(mask: crate::WaveMask, var: u32, delta: u32) -> u32 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_up_sync called outside CUDA kernel context")
 }
@@ -336,7 +336,7 @@ pub fn shuffle_up_sync(mask: u32, var: u32, delta: u32) -> u32 {
 /// ```
 #[inline(always)]
 pub fn shuffle(var: u32, src_lane: u32) -> u32 {
-    shuffle_sync(u32::MAX, var, src_lane)
+    shuffle_sync(crate::WaveMask::MAX, var, src_lane)
 }
 
 /// Shuffle XOR: butterfly exchange across the full warp.
@@ -355,7 +355,7 @@ pub fn shuffle(var: u32, src_lane: u32) -> u32 {
 /// ```
 #[inline(always)]
 pub fn shuffle_xor(var: u32, lane_mask: u32) -> u32 {
-    shuffle_xor_sync(u32::MAX, var, lane_mask)
+    shuffle_xor_sync(crate::WaveMask::MAX, var, lane_mask)
 }
 
 /// Shuffle down: read from `(lane_id + delta)` across the full warp.
@@ -363,7 +363,7 @@ pub fn shuffle_xor(var: u32, lane_mask: u32) -> u32 {
 /// Equivalent to [`shuffle_down_sync`]`(u32::MAX, var, delta)`.
 #[inline(always)]
 pub fn shuffle_down(var: u32, delta: u32) -> u32 {
-    shuffle_down_sync(u32::MAX, var, delta)
+    shuffle_down_sync(crate::WaveMask::MAX, var, delta)
 }
 
 /// Shuffle up: read from `(lane_id - delta)` across the full warp.
@@ -371,7 +371,7 @@ pub fn shuffle_down(var: u32, delta: u32) -> u32 {
 /// Equivalent to [`shuffle_up_sync`]`(u32::MAX, var, delta)`.
 #[inline(always)]
 pub fn shuffle_up(var: u32, delta: u32) -> u32 {
-    shuffle_up_sync(u32::MAX, var, delta)
+    shuffle_up_sync(crate::WaveMask::MAX, var, delta)
 }
 
 // =============================================================================
@@ -380,28 +380,28 @@ pub fn shuffle_up(var: u32, delta: u32) -> u32 {
 
 /// Shuffle (masked) f32: float variant of [`shuffle_sync`].
 #[inline(never)]
-pub fn shuffle_f32_sync(mask: u32, var: f32, src_lane: u32) -> f32 {
+pub fn shuffle_f32_sync(mask: crate::WaveMask, var: f32, src_lane: u32) -> f32 {
     let _ = (mask, var, src_lane);
     unreachable!("shuffle_f32_sync called outside CUDA kernel context")
 }
 
 /// Shuffle XOR (masked) f32: float variant of [`shuffle_xor_sync`].
 #[inline(never)]
-pub fn shuffle_xor_f32_sync(mask: u32, var: f32, lane_mask: u32) -> f32 {
+pub fn shuffle_xor_f32_sync(mask: crate::WaveMask, var: f32, lane_mask: u32) -> f32 {
     let _ = (mask, var, lane_mask);
     unreachable!("shuffle_xor_f32_sync called outside CUDA kernel context")
 }
 
 /// Shuffle down (masked) f32: float variant of [`shuffle_down_sync`].
 #[inline(never)]
-pub fn shuffle_down_f32_sync(mask: u32, var: f32, delta: u32) -> f32 {
+pub fn shuffle_down_f32_sync(mask: crate::WaveMask, var: f32, delta: u32) -> f32 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_down_f32_sync called outside CUDA kernel context")
 }
 
 /// Shuffle up (masked) f32: float variant of [`shuffle_up_sync`].
 #[inline(never)]
-pub fn shuffle_up_f32_sync(mask: u32, var: f32, delta: u32) -> f32 {
+pub fn shuffle_up_f32_sync(mask: crate::WaveMask, var: f32, delta: u32) -> f32 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_up_f32_sync called outside CUDA kernel context")
 }
@@ -409,25 +409,25 @@ pub fn shuffle_up_f32_sync(mask: u32, var: f32, delta: u32) -> f32 {
 /// Shuffle f32 (full-warp): equivalent to [`shuffle_f32_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_f32(var: f32, src_lane: u32) -> f32 {
-    shuffle_f32_sync(u32::MAX, var, src_lane)
+    shuffle_f32_sync(crate::WaveMask::MAX, var, src_lane)
 }
 
 /// Shuffle XOR f32 (full-warp): equivalent to [`shuffle_xor_f32_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_xor_f32(var: f32, lane_mask: u32) -> f32 {
-    shuffle_xor_f32_sync(u32::MAX, var, lane_mask)
+    shuffle_xor_f32_sync(crate::WaveMask::MAX, var, lane_mask)
 }
 
 /// Shuffle down f32 (full-warp): equivalent to [`shuffle_down_f32_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_down_f32(var: f32, delta: u32) -> f32 {
-    shuffle_down_f32_sync(u32::MAX, var, delta)
+    shuffle_down_f32_sync(crate::WaveMask::MAX, var, delta)
 }
 
 /// Shuffle up f32 (full-warp): equivalent to [`shuffle_up_f32_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_up_f32(var: f32, delta: u32) -> f32 {
-    shuffle_up_f32_sync(u32::MAX, var, delta)
+    shuffle_up_f32_sync(crate::WaveMask::MAX, var, delta)
 }
 
 // =============================================================================
@@ -456,7 +456,7 @@ pub fn shuffle_up_f32(var: f32, delta: u32) -> f32 {
 /// - `var`: the 64-bit value to share (each lane provides its own)
 /// - `src_lane`: the lane ID (0-31) to read from
 #[inline(never)]
-pub fn shuffle_u64_sync(mask: u32, var: u64, src_lane: u32) -> u64 {
+pub fn shuffle_u64_sync(mask: crate::WaveMask, var: u64, src_lane: u32) -> u64 {
     let _ = (mask, var, src_lane);
     unreachable!("shuffle_u64_sync called outside CUDA kernel context")
 }
@@ -466,7 +466,7 @@ pub fn shuffle_u64_sync(mask: u32, var: u64, src_lane: u32) -> u64 {
 /// 64-bit analogue of [`shuffle_xor_sync`] (PTX `shfl.sync.bfly`). The full-warp
 /// shorthand is [`shuffle_xor_u64`].
 #[inline(never)]
-pub fn shuffle_xor_u64_sync(mask: u32, var: u64, lane_mask: u32) -> u64 {
+pub fn shuffle_xor_u64_sync(mask: crate::WaveMask, var: u64, lane_mask: u32) -> u64 {
     let _ = (mask, var, lane_mask);
     unreachable!("shuffle_xor_u64_sync called outside CUDA kernel context")
 }
@@ -476,7 +476,7 @@ pub fn shuffle_xor_u64_sync(mask: u32, var: u64, lane_mask: u32) -> u64 {
 /// 64-bit analogue of [`shuffle_down_sync`] (PTX `shfl.sync.down`). The full-warp
 /// shorthand is [`shuffle_down_u64`].
 #[inline(never)]
-pub fn shuffle_down_u64_sync(mask: u32, var: u64, delta: u32) -> u64 {
+pub fn shuffle_down_u64_sync(mask: crate::WaveMask, var: u64, delta: u32) -> u64 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_down_u64_sync called outside CUDA kernel context")
 }
@@ -486,7 +486,7 @@ pub fn shuffle_down_u64_sync(mask: u32, var: u64, delta: u32) -> u64 {
 /// 64-bit analogue of [`shuffle_up_sync`] (PTX `shfl.sync.up`). The full-warp
 /// shorthand is [`shuffle_up_u64`].
 #[inline(never)]
-pub fn shuffle_up_u64_sync(mask: u32, var: u64, delta: u32) -> u64 {
+pub fn shuffle_up_u64_sync(mask: crate::WaveMask, var: u64, delta: u32) -> u64 {
     let _ = (mask, var, delta);
     unreachable!("shuffle_up_u64_sync called outside CUDA kernel context")
 }
@@ -494,25 +494,25 @@ pub fn shuffle_up_u64_sync(mask: u32, var: u64, delta: u32) -> u64 {
 /// Shuffle u64 (full-warp): equivalent to [`shuffle_u64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_u64(var: u64, src_lane: u32) -> u64 {
-    shuffle_u64_sync(u32::MAX, var, src_lane)
+    shuffle_u64_sync(crate::WaveMask::MAX, var, src_lane)
 }
 
 /// Shuffle XOR u64 (full-warp): equivalent to [`shuffle_xor_u64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_xor_u64(var: u64, lane_mask: u32) -> u64 {
-    shuffle_xor_u64_sync(u32::MAX, var, lane_mask)
+    shuffle_xor_u64_sync(crate::WaveMask::MAX, var, lane_mask)
 }
 
 /// Shuffle down u64 (full-warp): equivalent to [`shuffle_down_u64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_down_u64(var: u64, delta: u32) -> u64 {
-    shuffle_down_u64_sync(u32::MAX, var, delta)
+    shuffle_down_u64_sync(crate::WaveMask::MAX, var, delta)
 }
 
 /// Shuffle up u64 (full-warp): equivalent to [`shuffle_up_u64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_up_u64(var: u64, delta: u32) -> u64 {
-    shuffle_up_u64_sync(u32::MAX, var, delta)
+    shuffle_up_u64_sync(crate::WaveMask::MAX, var, delta)
 }
 
 /// Shuffle (masked) f64: float variant of [`shuffle_u64_sync`].
@@ -520,50 +520,50 @@ pub fn shuffle_up_u64(var: u64, delta: u32) -> u64 {
 /// Bitcasts through `u64` (`f64::to_bits` / `f64::from_bits`), so it moves the
 /// exact bit pattern — NaN payloads are preserved.
 #[inline(always)]
-pub fn shuffle_f64_sync(mask: u32, var: f64, src_lane: u32) -> f64 {
+pub fn shuffle_f64_sync(mask: crate::WaveMask, var: f64, src_lane: u32) -> f64 {
     f64::from_bits(shuffle_u64_sync(mask, var.to_bits(), src_lane))
 }
 
 /// Shuffle XOR (masked) f64: float variant of [`shuffle_xor_u64_sync`].
 #[inline(always)]
-pub fn shuffle_xor_f64_sync(mask: u32, var: f64, lane_mask: u32) -> f64 {
+pub fn shuffle_xor_f64_sync(mask: crate::WaveMask, var: f64, lane_mask: u32) -> f64 {
     f64::from_bits(shuffle_xor_u64_sync(mask, var.to_bits(), lane_mask))
 }
 
 /// Shuffle down (masked) f64: float variant of [`shuffle_down_u64_sync`].
 #[inline(always)]
-pub fn shuffle_down_f64_sync(mask: u32, var: f64, delta: u32) -> f64 {
+pub fn shuffle_down_f64_sync(mask: crate::WaveMask, var: f64, delta: u32) -> f64 {
     f64::from_bits(shuffle_down_u64_sync(mask, var.to_bits(), delta))
 }
 
 /// Shuffle up (masked) f64: float variant of [`shuffle_up_u64_sync`].
 #[inline(always)]
-pub fn shuffle_up_f64_sync(mask: u32, var: f64, delta: u32) -> f64 {
+pub fn shuffle_up_f64_sync(mask: crate::WaveMask, var: f64, delta: u32) -> f64 {
     f64::from_bits(shuffle_up_u64_sync(mask, var.to_bits(), delta))
 }
 
 /// Shuffle f64 (full-warp): equivalent to [`shuffle_f64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_f64(var: f64, src_lane: u32) -> f64 {
-    shuffle_f64_sync(u32::MAX, var, src_lane)
+    shuffle_f64_sync(crate::WaveMask::MAX, var, src_lane)
 }
 
 /// Shuffle XOR f64 (full-warp): equivalent to [`shuffle_xor_f64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_xor_f64(var: f64, lane_mask: u32) -> f64 {
-    shuffle_xor_f64_sync(u32::MAX, var, lane_mask)
+    shuffle_xor_f64_sync(crate::WaveMask::MAX, var, lane_mask)
 }
 
 /// Shuffle down f64 (full-warp): equivalent to [`shuffle_down_f64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_down_f64(var: f64, delta: u32) -> f64 {
-    shuffle_down_f64_sync(u32::MAX, var, delta)
+    shuffle_down_f64_sync(crate::WaveMask::MAX, var, delta)
 }
 
 /// Shuffle up f64 (full-warp): equivalent to [`shuffle_up_f64_sync`]`(u32::MAX, ...)`.
 #[inline(always)]
 pub fn shuffle_up_f64(var: f64, delta: u32) -> f64 {
-    shuffle_up_f64_sync(u32::MAX, var, delta)
+    shuffle_up_f64_sync(crate::WaveMask::MAX, var, delta)
 }
 
 // =============================================================================
@@ -574,7 +574,7 @@ pub fn shuffle_up_f64(var: f64, delta: u32) -> f64 {
 ///
 /// PTX `vote.sync.all`. The full-warp shorthand is [`all`].
 #[inline(never)]
-pub fn all_sync(mask: u32, predicate: bool) -> bool {
+pub fn all_sync(mask: crate::WaveMask, predicate: bool) -> bool {
     let _ = (mask, predicate);
     unreachable!("all_sync called outside CUDA kernel context")
 }
@@ -583,7 +583,7 @@ pub fn all_sync(mask: u32, predicate: bool) -> bool {
 ///
 /// PTX `vote.sync.any`. The full-warp shorthand is [`any`].
 #[inline(never)]
-pub fn any_sync(mask: u32, predicate: bool) -> bool {
+pub fn any_sync(mask: crate::WaveMask, predicate: bool) -> bool {
     let _ = (mask, predicate);
     unreachable!("any_sync called outside CUDA kernel context")
 }
@@ -594,7 +594,7 @@ pub fn any_sync(mask: u32, predicate: bool) -> bool {
 /// and its predicate is true; all other bits are 0. The full-warp shorthand
 /// is [`ballot`].
 #[inline(never)]
-pub fn ballot_sync(mask: u32, predicate: bool) -> u32 {
+pub fn ballot_sync(mask: crate::WaveMask, predicate: bool) -> crate::WaveMask {
     let _ = (mask, predicate);
     unreachable!("ballot_sync called outside CUDA kernel context")
 }
@@ -611,7 +611,7 @@ pub fn ballot_sync(mask: u32, predicate: bool) -> u32 {
 /// ```
 #[inline(always)]
 pub fn all(predicate: bool) -> bool {
-    all_sync(u32::MAX, predicate)
+    all_sync(crate::WaveMask::MAX, predicate)
 }
 
 /// Warp vote: returns true if ANY active thread has predicate true.
@@ -625,7 +625,7 @@ pub fn all(predicate: bool) -> bool {
 /// ```
 #[inline(always)]
 pub fn any(predicate: bool) -> bool {
-    any_sync(u32::MAX, predicate)
+    any_sync(crate::WaveMask::MAX, predicate)
 }
 
 /// Warp ballot: 32-bit mask where bit `i` indicates lane `i`'s predicate.
@@ -642,8 +642,8 @@ pub fn any(predicate: bool) -> bool {
 /// let first_positive_lane = mask.trailing_zeros();
 /// ```
 #[inline(always)]
-pub fn ballot(predicate: bool) -> u32 {
-    ballot_sync(u32::MAX, predicate)
+pub fn ballot(predicate: bool) -> crate::WaveMask {
+    ballot_sync(crate::WaveMask::MAX, predicate)
 }
 
 /// Count threads with predicate true (population count of ballot).

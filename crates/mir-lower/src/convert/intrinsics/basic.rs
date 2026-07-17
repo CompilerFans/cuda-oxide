@@ -145,6 +145,16 @@ pub(crate) fn convert_maca_lane_id(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    let lane_id = emit_maca_lane_id(ctx, rewriter, op)?;
+    rewriter.replace_operation_with_values(ctx, op, vec![lane_id]);
+    Ok(())
+}
+
+pub(crate) fn emit_maca_lane_id(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    current_op: Ptr<Operation>,
+) -> Result<pliron::value::Value> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let neg1 = create_i32_const(ctx, rewriter, -1);
     let zero = create_i32_const(ctx, rewriter, 0);
@@ -159,7 +169,7 @@ pub(crate) fn convert_maca_lane_id(
     let mbcnt_lo = call_intrinsic(
         ctx,
         rewriter,
-        op,
+        current_op,
         "llvm_mxc_mbcnt_lo",
         func_ty,
         vec![neg1, zero],
@@ -176,13 +186,70 @@ pub(crate) fn convert_maca_lane_id(
     let mbcnt_hi = call_intrinsic(
         ctx,
         rewriter,
-        op,
+        current_op,
         "llvm_mxc_mbcnt_hi",
         func_ty2,
         vec![neg1, lo_val],
     )?;
 
-    rewriter.replace_operation(ctx, op, mbcnt_hi);
+    Ok(mbcnt_hi.deref(ctx).get_result(0))
+}
+
+pub(crate) fn convert_lanemask(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+    intrinsic_name: &str,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+
+    if lowering_options(ctx).backend == BackendTarget::Cuda {
+        let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
+        let call = call_intrinsic(ctx, rewriter, op, intrinsic_name, func_ty, vec![])?;
+        let value = call.deref(ctx).get_result(0);
+        let extended = llvm::ZExtOp::new_with_nneg(ctx, value, i64_ty.into(), false);
+        rewriter.insert_operation(ctx, extended.get_operation());
+        rewriter.replace_operation(ctx, op, extended.get_operation());
+        return Ok(());
+    }
+
+    let lane_i32 = emit_maca_lane_id(ctx, rewriter, op)?;
+    let lane = llvm::ZExtOp::new_with_nneg(ctx, lane_i32, i64_ty.into(), true);
+    rewriter.insert_operation(ctx, lane.get_operation());
+    let lane = lane.get_operation().deref(ctx).get_result(0);
+    let one = create_i64_const(ctx, rewriter, 1);
+    let all = create_i64_const(ctx, rewriter, -1);
+    let flags = IntegerOverflowFlagsAttr::default();
+    let eq = llvm::ShlOp::new_with_overflow_flag(ctx, one, lane, flags.clone());
+    rewriter.insert_operation(ctx, eq.get_operation());
+    let eq = eq.get_operation().deref(ctx).get_result(0);
+    let lt = llvm::SubOp::new_with_overflow_flag(ctx, eq, one, flags);
+    rewriter.insert_operation(ctx, lt.get_operation());
+    let lt = lt.get_operation().deref(ctx).get_result(0);
+    let le = llvm::OrOp::new(ctx, lt, eq);
+    rewriter.insert_operation(ctx, le.get_operation());
+    let le = le.get_operation().deref(ctx).get_result(0);
+
+    let result = if intrinsic_name.ends_with("_lt") {
+        lt
+    } else if intrinsic_name.ends_with("_le") {
+        le
+    } else if intrinsic_name.ends_with("_eq") {
+        eq
+    } else if intrinsic_name.ends_with("_ge") {
+        let ge = llvm::XorOp::new(ctx, lt, all);
+        rewriter.insert_operation(ctx, ge.get_operation());
+        ge.get_operation().deref(ctx).get_result(0)
+    } else if intrinsic_name.ends_with("_gt") {
+        let gt = llvm::XorOp::new(ctx, le, all);
+        rewriter.insert_operation(ctx, gt.get_operation());
+        gt.get_operation().deref(ctx).get_result(0)
+    } else {
+        return pliron::input_err_noloc!("unknown lane-mask intrinsic `{}`", intrinsic_name);
+    };
+    rewriter.replace_operation_with_values(ctx, op, vec![result]);
     Ok(())
 }
 

@@ -34,7 +34,10 @@
 use crate::BackendTarget;
 use crate::context::lowering_options;
 use crate::convert::intrinsics::common::*;
-use llvm_export::op_interfaces::BinArithOp;
+use llvm_export::attributes::{ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering};
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
 use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
@@ -62,7 +65,7 @@ pub(crate) fn convert_shuffle_i32(
 ) -> Result<()> {
     let opts = lowering_options(ctx);
     if opts.backend == BackendTarget::Maca {
-        return convert_maca_shuffle_i32(ctx, rewriter, op);
+        return convert_maca_shuffle_i32(ctx, rewriter, op, intrinsic_name);
     }
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
@@ -104,24 +107,81 @@ fn convert_maca_shuffle_i32(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
+    intrinsic_name: &str,
 ) -> Result<()> {
-    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
-
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 3 {
         return pliron::input_err_noloc!(
             "Warp shuffle i32 requires 3 operands [mask, value, lane_or_delta]"
         );
     }
-    let (_mask, val, lane) = (operands[0], operands[1], operands[2]);
+    let (_mask, val, lane_or_delta) = (operands[0], operands[1], operands[2]);
+    let result = emit_maca_shuffle_i32(ctx, rewriter, op, val, lane_or_delta, intrinsic_name)?;
+    rewriter.replace_operation_with_values(ctx, op, vec![result]);
+    Ok(())
+}
 
-    // Calculate byte offset: lane * 4
-    let four = create_i32_const(ctx, rewriter, 4);
-    let mul_op = llvm::MulOp::new(ctx, lane, four);
-    rewriter.insert_operation(ctx, mul_op.get_operation());
-    let offset = mul_op.get_operation().deref(ctx).get_result(0);
+fn emit_maca_shuffle_i32(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    current_op: Ptr<Operation>,
+    val: pliron::value::Value,
+    lane_or_delta: pliron::value::Value,
+    intrinsic_name: &str,
+) -> Result<pliron::value::Value> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let lane = crate::convert::intrinsics::basic::emit_maca_lane_id(ctx, rewriter, current_op)?;
+    let wave_mask = create_i32_const(ctx, rewriter, 63);
+    let wave_size = create_i32_const(ctx, rewriter, 64);
+    let overflow_flags = IntegerOverflowFlagsAttr::default();
 
-    // Call bsm.bpermute(offset, value)
+    let source_lane = if intrinsic_name.contains("idx") {
+        let masked = llvm::AndOp::new(ctx, lane_or_delta, wave_mask);
+        rewriter.insert_operation(ctx, masked.get_operation());
+        masked.get_operation().deref(ctx).get_result(0)
+    } else if intrinsic_name.contains("up") {
+        let candidate =
+            llvm::SubOp::new_with_overflow_flag(ctx, lane, lane_or_delta, overflow_flags.clone());
+        rewriter.insert_operation(ctx, candidate.get_operation());
+        let out_of_range = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::ULT, lane, lane_or_delta);
+        rewriter.insert_operation(ctx, out_of_range.get_operation());
+        let out_of_range_value = out_of_range.get_operation().deref(ctx).get_result(0);
+        let candidate_value = candidate.get_operation().deref(ctx).get_result(0);
+        let selected = llvm::SelectOp::new(ctx, out_of_range_value, lane, candidate_value);
+        rewriter.insert_operation(ctx, selected.get_operation());
+        selected.get_operation().deref(ctx).get_result(0)
+    } else {
+        let candidate = if intrinsic_name.contains("down") {
+            let candidate = llvm::AddOp::new_with_overflow_flag(
+                ctx,
+                lane,
+                lane_or_delta,
+                overflow_flags.clone(),
+            );
+            rewriter.insert_operation(ctx, candidate.get_operation());
+            candidate.get_operation().deref(ctx).get_result(0)
+        } else if intrinsic_name.contains("bfly") {
+            let candidate = llvm::XorOp::new(ctx, lane, lane_or_delta);
+            rewriter.insert_operation(ctx, candidate.get_operation());
+            candidate.get_operation().deref(ctx).get_result(0)
+        } else {
+            return pliron::input_err_noloc!(
+                "unknown MACA shuffle mode for intrinsic `{}`",
+                intrinsic_name
+            );
+        };
+        let out_of_range = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::UGE, candidate, wave_size);
+        rewriter.insert_operation(ctx, out_of_range.get_operation());
+        let out_of_range_value = out_of_range.get_operation().deref(ctx).get_result(0);
+        let selected = llvm::SelectOp::new(ctx, out_of_range_value, lane, candidate);
+        rewriter.insert_operation(ctx, selected.get_operation());
+        selected.get_operation().deref(ctx).get_result(0)
+    };
+
+    let two = create_i32_const(ctx, rewriter, 2);
+    let byte_offset = llvm::ShlOp::new_with_overflow_flag(ctx, source_lane, two, overflow_flags);
+    rewriter.insert_operation(ctx, byte_offset.get_operation());
+    let byte_offset_value = byte_offset.get_operation().deref(ctx).get_result(0);
     let func_ty = llvm_types::FuncType::get(
         ctx,
         i32_ty.into(),
@@ -131,13 +191,12 @@ fn convert_maca_shuffle_i32(
     let call_op = call_intrinsic(
         ctx,
         rewriter,
-        op,
+        current_op,
         "llvm_mxc_bsm_bpermute",
         func_ty,
-        vec![offset, val],
+        vec![byte_offset_value, val],
     )?;
-    rewriter.replace_operation(ctx, op, call_op);
-    Ok(())
+    Ok(call_op.deref(ctx).get_result(0))
 }
 
 /// Convert f32 shuffle operation to LLVM intrinsic call.
@@ -154,6 +213,30 @@ pub(crate) fn convert_shuffle_f32(
 ) -> Result<()> {
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let f32_ty = FP32Type::get(ctx);
+
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        let operands: Vec<_> = op.deref(ctx).operands().collect();
+        if operands.len() != 3 {
+            return pliron::input_err_noloc!(
+                "Warp shuffle f32 requires 3 operands [mask, value, lane_or_delta]"
+            );
+        }
+        let value_bits = llvm::BitcastOp::new(ctx, operands[1], i32_ty.into());
+        rewriter.insert_operation(ctx, value_bits.get_operation());
+        let value_bits_value = value_bits.get_operation().deref(ctx).get_result(0);
+        let shuffled_bits = emit_maca_shuffle_i32(
+            ctx,
+            rewriter,
+            op,
+            value_bits_value,
+            operands[2],
+            intrinsic_name,
+        )?;
+        let result = llvm::BitcastOp::new(ctx, shuffled_bits, f32_ty.into());
+        rewriter.insert_operation(ctx, result.get_operation());
+        rewriter.replace_operation(ctx, op, result.get_operation());
+        return Ok(());
+    }
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 3 {
@@ -250,8 +333,8 @@ pub(crate) fn convert_vote(
     intrinsic_name: &str,
 ) -> Result<()> {
     let opts = lowering_options(ctx);
-    if opts.backend == BackendTarget::Maca && intrinsic_name.contains("ballot") {
-        return convert_maca_ballot(ctx, rewriter, op);
+    if opts.backend == BackendTarget::Maca {
+        return convert_maca_vote(ctx, rewriter, op, intrinsic_name);
     }
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
@@ -283,54 +366,60 @@ pub(crate) fn convert_vote(
     Ok(())
 }
 
-/// Convert ballot for MXMACA using `fcmp.i64.f32`.
-///
-/// MXMACA ballot uses fcmp.i64.f32(predicate_as_float, 0.0, 2) which returns
-/// a 64-bit mask. The predicate is converted from i1 to f32 first.
-fn convert_maca_ballot(
+/// Convert Wave64 vote operations using the integer predicate-mask intrinsic.
+fn convert_maca_vote(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
+    intrinsic_name: &str,
 ) -> Result<()> {
     let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let f32_ty = FP32Type::get(ctx);
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 2 {
         return pliron::input_err_noloc!("Warp ballot requires 2 operands [mask, predicate]");
     }
-    let (_mask, predicate) = (operands[0], operands[1]);
-
-    // Convert i1 predicate to f32 (0.0 or 1.0)
-    let zero_f32 = create_f32_const(ctx, rewriter, 0.0);
-    let one_f32 = create_f32_const(ctx, rewriter, 1.0);
-
-    // Select: if predicate then 1.0 else 0.0
-    let select_op = llvm::SelectOp::new(ctx, predicate, one_f32, zero_f32);
-    rewriter.insert_operation(ctx, select_op.get_operation());
-    let pred_f32 = select_op.get_operation().deref(ctx).get_result(0);
-
-    // Call fcmp.i64.f32(pred_f32, 0.0, 2) — returns i64 mask
+    let (mask, predicate) = (operands[0], operands[1]);
+    let predicate_i32 = llvm::ZExtOp::new_with_nneg(ctx, predicate, i32_ty.into(), false);
+    rewriter.insert_operation(ctx, predicate_i32.get_operation());
+    let predicate_i32_value = predicate_i32.get_operation().deref(ctx).get_result(0);
+    let zero = create_i32_const(ctx, rewriter, 0);
+    let compare_ne = create_i32_const(ctx, rewriter, 33);
     let func_ty = llvm_types::FuncType::get(
         ctx,
         i64_ty.into(),
-        vec![
-            f32_ty.into(),
-            f32_ty.into(),
-            IntegerType::get(ctx, 32, Signedness::Signless).into(),
-        ],
+        vec![i32_ty.into(), i32_ty.into(), i32_ty.into()],
         false,
     );
-    let cmp_mode = create_i32_const(ctx, rewriter, 2); // OGT
     let call_op = call_intrinsic(
         ctx,
         rewriter,
         op,
-        "llvm_mxc_fcmp_i64_f32",
+        "llvm_mxc_icmp_i64_i32",
         func_ty,
-        vec![pred_f32, zero_f32, cmp_mode],
+        vec![predicate_i32_value, zero, compare_ne],
     )?;
-    rewriter.replace_operation(ctx, op, call_op);
+    let predicate_mask = call_op.deref(ctx).get_result(0);
+    let masked = llvm::AndOp::new(ctx, predicate_mask, mask);
+    rewriter.insert_operation(ctx, masked.get_operation());
+    let masked_value = masked.get_operation().deref(ctx).get_result(0);
+
+    if intrinsic_name.contains("ballot") {
+        rewriter.replace_operation(ctx, op, masked.get_operation());
+    } else {
+        let zero_mask = create_i64_const(ctx, rewriter, 0);
+        let (predicate, rhs) = if intrinsic_name.contains("all") {
+            (ICmpPredicateAttr::EQ, mask)
+        } else if intrinsic_name.contains("any") {
+            (ICmpPredicateAttr::NE, zero_mask)
+        } else {
+            return pliron::input_err_noloc!("unknown MACA vote intrinsic `{}`", intrinsic_name);
+        };
+        let result = llvm::ICmpOp::new(ctx, predicate, masked_value, rhs);
+        rewriter.insert_operation(ctx, result.get_operation());
+        rewriter.replace_operation(ctx, op, result.get_operation());
+    }
     Ok(())
 }
 
@@ -418,6 +507,30 @@ pub(crate) fn convert_active_mask(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+        let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+        let one = create_i32_const(ctx, rewriter, 1);
+        let zero = create_i32_const(ctx, rewriter, 0);
+        let compare_ne = create_i32_const(ctx, rewriter, 33);
+        let func_ty = llvm_types::FuncType::get(
+            ctx,
+            i64_ty.into(),
+            vec![i32_ty.into(), i32_ty.into(), i32_ty.into()],
+            false,
+        );
+        let call = call_intrinsic(
+            ctx,
+            rewriter,
+            op,
+            "llvm_mxc_icmp_i64_i32",
+            func_ty,
+            vec![one, zero, compare_ne],
+        )?;
+        rewriter.replace_operation(ctx, op, call);
+        return Ok(());
+    }
+
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
     let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
@@ -437,6 +550,24 @@ pub(crate) fn convert_bar_warp_sync(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        let operands: Vec<_> = op.deref(ctx).operands().collect();
+        if operands.len() != 1 {
+            return pliron::input_err_noloc!("bar.warp.sync requires 1 operand [mask]");
+        }
+        let release =
+            llvm::FenceOp::new(ctx, LlvmAtomicOrdering::Release, Some("warp".to_string()));
+        rewriter.insert_operation(ctx, release.get_operation());
+        let void_ty = llvm_types::VoidType::get(ctx);
+        let func_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
+        call_intrinsic(ctx, rewriter, op, "llvm_mxc_barrier_warp", func_ty, vec![])?;
+        let acquire =
+            llvm::FenceOp::new(ctx, LlvmAtomicOrdering::Acquire, Some("warp".to_string()));
+        rewriter.insert_operation(ctx, acquire.get_operation());
+        rewriter.erase_operation(ctx, op);
+        return Ok(());
+    }
+
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let void_ty = llvm_types::VoidType::get(ctx);
 

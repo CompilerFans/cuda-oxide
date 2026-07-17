@@ -133,13 +133,14 @@ pub mod type_conversion_interface;
 use rustc_hash::FxHashMap;
 
 use pliron::{
+    builtin::op_interfaces::SymbolOpInterface,
     builtin::types::{IntegerType, Signedness},
     context::{Context, Ptr},
     irbuild::dialect_conversion::{
         DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
     },
-    location::Located,
     linked_list::ContainsLinkedList,
+    location::Located,
     op::{Op, op_cast},
     operation::Operation,
     result::Result,
@@ -360,22 +361,31 @@ pub fn lower_mir_to_llvm_with_options(
     // lowering only cares about success, so discard it.
     apply_dialect_conversion(ctx, &mut conversion, module_op)?;
     if options.backend == BackendTarget::Maca {
-        reject_maca_inline_asm(ctx, module_op)?;
+        reject_maca_unsupported_ir(ctx, module_op)?;
     }
     Ok(())
 }
 
-fn reject_maca_inline_asm(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
+fn reject_maca_unsupported_ir(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
     if Operation::get_op::<llvm_export::ops::InlineAsmOp>(op, ctx).is_some() {
         return pliron::input_err_noloc!(
             "MACA lowering produced unsupported inline PTX; add a native C500 lowering for this operation"
         );
     }
+    if let Some(function) = Operation::get_op::<llvm_export::ops::FuncOp>(op, ctx) {
+        let name = function.get_symbol_name(ctx).to_string();
+        if name.starts_with("llvm_nvvm_") {
+            return pliron::input_err_noloc!(
+                "MACA lowering produced unsupported NVVM intrinsic `{}`; add a native C500 lowering",
+                name
+            );
+        }
+    }
 
     for region in op.deref(ctx).regions() {
         for block in region.deref(ctx).iter(ctx) {
             for child in block.deref(ctx).iter(ctx) {
-                reject_maca_inline_asm(ctx, child)?;
+                reject_maca_unsupported_ir(ctx, child)?;
             }
         }
     }

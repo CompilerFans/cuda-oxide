@@ -78,7 +78,7 @@ pub fn emit_lane_id(
     )
 }
 
-/// Emits `active_mask()`: a 32-bit mask of currently-converged lanes.
+/// Emits `active_mask()`: a 64-bit mask of currently-converged lanes.
 ///
 /// Generates an `nvvm.activemask` op that lowers to PTX `activemask.b32`
 /// / `@llvm.nvvm.activemask`. Useful for building the mask passed to
@@ -94,12 +94,12 @@ pub fn emit_active_mask(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
+    let u64_type = IntegerType::get(ctx, 64, Signedness::Unsigned);
 
     let active_mask_op = Operation::new(
         ctx,
         ActiveMaskOp::get_concrete_op_info(),
-        vec![u32_type.to_handle()],
+        vec![u64_type.to_handle()],
         vec![],
         vec![],
         0,
@@ -793,7 +793,7 @@ pub fn emit_elect_sync(
 ///
 /// # Parameters
 /// - `vote_opid`: The NVVM opid for the specific vote variant
-/// - `result_is_i32`: true for `ballot` (returns i32 bitmask), false for `all`/`any` (returns i1)
+/// - `result_is_mask`: true for `ballot` (returns i64 bitmask), false for `all`/`any` (returns i1)
 /// - `args`: `[mask, predicate]`
 pub fn emit_warp_vote(
     ctx: &mut Context,
@@ -802,7 +802,7 @@ pub fn emit_warp_vote(
         fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
         std::any::TypeId,
     ),
-    result_is_i32: bool,
+    result_is_mask: bool,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -843,8 +843,8 @@ pub fn emit_warp_vote(
     )?;
     last_op = last_op_after;
 
-    let result_type = if result_is_i32 {
-        IntegerType::get(ctx, 32, Signedness::Unsigned).to_handle()
+    let result_type = if result_is_mask {
+        IntegerType::get(ctx, 64, Signedness::Unsigned).to_handle()
     } else {
         types::get_bool_type(ctx).to_handle()
     };

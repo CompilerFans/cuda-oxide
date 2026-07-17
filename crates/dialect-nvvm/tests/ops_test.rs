@@ -735,17 +735,17 @@ fn test_thread_register_ops_reject_non_i32_results() {
 }
 
 #[test]
-fn test_lanemask_ops_verify_i32_results() {
+fn test_lanemask_ops_verify_i64_results() {
     let mut ctx = Context::new();
     dialect_nvvm::register(&mut ctx);
 
-    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
 
-    // Each lane-position mask is a zero-operand, single-i32-result sreg read.
+    // Each lane-position mask uses the full Wave64 mask carrier.
     let lt = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
+        vec![i64_ty.into()],
         vec![],
         vec![],
         0,
@@ -755,7 +755,7 @@ fn test_lanemask_ops_verify_i32_results() {
     let le = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
+        vec![i64_ty.into()],
         vec![],
         vec![],
         0,
@@ -765,7 +765,7 @@ fn test_lanemask_ops_verify_i32_results() {
     let eq = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
+        vec![i64_ty.into()],
         vec![],
         vec![],
         0,
@@ -775,7 +775,7 @@ fn test_lanemask_ops_verify_i32_results() {
     let ge = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
+        vec![i64_ty.into()],
         vec![],
         vec![],
         0,
@@ -785,7 +785,7 @@ fn test_lanemask_ops_verify_i32_results() {
     let gt = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
-        vec![i32_ty.into()],
+        vec![i64_ty.into()],
         vec![],
         vec![],
         0,
@@ -794,16 +794,16 @@ fn test_lanemask_ops_verify_i32_results() {
 }
 
 #[test]
-fn test_lanemask_op_rejects_non_i32_result() {
+fn test_lanemask_op_rejects_non_i64_result() {
     let mut ctx = Context::new();
     dialect_nvvm::register(&mut ctx);
 
-    // A 64-bit result must fail the shared lane-position mask verifier.
-    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    // A 32-bit result cannot represent all C500 lanes.
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let op = Operation::new(
         &mut ctx,
         ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
-        vec![i64_ty.into()],
+        vec![i32_ty.into()],
         vec![],
         vec![],
         0,

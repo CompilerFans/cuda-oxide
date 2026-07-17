@@ -1264,7 +1264,7 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskLtOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
+        super::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1282,7 +1282,7 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskLeOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
+        super::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1300,7 +1300,7 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskEqOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
+        super::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1318,7 +1318,7 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskGeOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
+        super::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
@@ -1336,7 +1336,7 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskGtOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        super::intrinsics::basic::convert_sreg_read_i32(
+        super::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),

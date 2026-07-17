@@ -261,8 +261,17 @@ impl Verify for ReadPtxSregLanemaskGtOp {
     }
 }
 
-/// Shared verifier for the lane-position mask ops: a single 32-bit integer result.
+/// Shared verifier for the lane-position mask ops: a single 64-bit integer result.
 fn verify_lanemask_result(ctx: &Context, op: Ptr<Operation>, op_name: &str) -> Result<(), Error> {
+    verify_integer_result_width(ctx, op, op_name, 64)
+}
+
+fn verify_integer_result_width(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    op_name: &str,
+    width: u32,
+) -> Result<(), Error> {
     let op = &*op.deref(ctx);
     let res = op.get_result(0);
     let ty = res.get_type(ctx);
@@ -275,8 +284,8 @@ fn verify_lanemask_result(ctx: &Context, op: Ptr<Operation>, op_name: &str) -> R
         }
     };
 
-    if int_ty.width() != 32 {
-        return verify_err!(op.loc(), "{} result must be 32-bit integer", op_name);
+    if int_ty.width() != width {
+        return verify_err!(op.loc(), "{} result must be {}-bit integer", op_name, width);
     }
     Ok(())
 }
@@ -708,7 +717,7 @@ impl VoteSyncAnyOp {
 /// Read the active-thread mask of the current warp.
 ///
 /// Corresponds to `llvm.nvvm.activemask` / PTX `activemask.b32` (PTX 6.2+).
-/// The result is a 32-bit bitmask: bit `k` is set iff lane `k` is currently
+/// The result is a 64-bit bitmask: bit `k` is set iff lane `k` is currently
 /// converged with this thread (i.e. participating in this dynamic execution
 /// region). For full-warp execution this is `0xFFFFFFFF`; in divergent code
 /// it shrinks to whatever subset of lanes reached this point together.
@@ -716,7 +725,7 @@ impl VoteSyncAnyOp {
 /// # Verification
 ///
 /// - Must have 0 operands
-/// - Must have 1 result of type `i32`
+/// - Must have 1 result of type `i64`
 #[pliron_op(
     name = "nvvm.activemask",
     format,
@@ -745,8 +754,8 @@ impl Verify for ActiveMaskOp {
             }
         };
 
-        if int_ty.width() != 32 {
-            return verify_err!(op.loc(), "nvvm.activemask result must be 32-bit integer");
+        if int_ty.width() != 64 {
+            return verify_err!(op.loc(), "nvvm.activemask result must be 64-bit integer");
         }
         Ok(())
     }
@@ -1160,7 +1169,7 @@ impl ReadPtxSregWarpIdOp {
 
 impl Verify for ReadPtxSregWarpIdOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {
-        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_warpid")
+        verify_integer_result_width(ctx, self.get_operation(), "nvvm.read_ptx_sreg_warpid", 32)
     }
 }
 
@@ -1188,7 +1197,7 @@ impl ReadPtxSregNwarpIdOp {
 
 impl Verify for ReadPtxSregNwarpIdOp {
     fn verify(&self, ctx: &Context) -> Result<(), Error> {
-        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_nwarpid")
+        verify_integer_result_width(ctx, self.get_operation(), "nvvm.read_ptx_sreg_nwarpid", 32)
     }
 }
 
