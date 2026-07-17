@@ -47,6 +47,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for DebugConfig<C> {
         self.inner.datalayout()
     }
 
+    fn target_triple(&self) -> &str {
+        self.inner.target_triple()
+    }
+
     fn emit_llvm_used(&self) -> bool {
         self.inner.emit_llvm_used()
     }

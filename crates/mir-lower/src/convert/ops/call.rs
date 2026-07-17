@@ -1485,6 +1485,7 @@ mod tests {
             &mut ctx,
             crate::LoweringOptions {
                 allow_fma_contraction: false,
+                backend: crate::BackendTarget::Cuda,
             },
         );
 
