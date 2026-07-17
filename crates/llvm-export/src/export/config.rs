@@ -51,6 +51,18 @@ pub enum DebugKind {
     Full,
 }
 
+/// Calling convention emitted for functions marked as GPU kernels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KernelCallingConvention {
+    /// Ordinary C calling convention. Kernel identity is carried by metadata.
+    #[default]
+    C,
+    /// NVPTX kernel calling convention used by the direct PTX pipeline.
+    PtxKernel,
+    /// MXMACA kernel calling convention consumed by `mxcc`.
+    MetaxGpuKernel,
+}
+
 impl DebugKind {
     pub fn line_tables_enabled(self) -> bool {
         !matches!(self, Self::Off)
@@ -88,7 +100,22 @@ pub trait ExportBackendConfig {
     fn emit_all_kernel_annotations(&self) -> bool;
 
     /// Whether kernel definitions should use the `ptx_kernel` calling convention.
-    fn emit_ptx_kernel_keyword(&self) -> bool;
+    ///
+    /// This is the original backend hook and remains the compatibility surface
+    /// for external configurations. New backends with a non-PTX convention
+    /// should override [`Self::kernel_calling_convention`] as well.
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        false
+    }
+
+    /// Calling convention to emit for GPU kernel declarations and definitions.
+    fn kernel_calling_convention(&self) -> KernelCallingConvention {
+        if self.emit_ptx_kernel_keyword() {
+            KernelCallingConvention::PtxKernel
+        } else {
+            KernelCallingConvention::C
+        }
+    }
 
     /// NVVM input dialect, when this is an NVVM export.
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {
@@ -256,6 +283,10 @@ impl ExportBackendConfig for MacaExportConfig {
     }
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
-        false // MXMACA uses metaxgpu_kernel calling convention, not ptx_kernel
+        false
+    }
+
+    fn kernel_calling_convention(&self) -> KernelCallingConvention {
+        KernelCallingConvention::MetaxGpuKernel
     }
 }

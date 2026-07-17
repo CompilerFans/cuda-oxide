@@ -141,6 +141,87 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 }
 
 #[test]
+fn maca_blockdim_uses_byte_offset_in_dispatch_record() -> Result<(), anyhow::Error> {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+
+    let module = ModuleOp::new(&mut ctx, "maca_dispatch".try_into().unwrap());
+    let module_ptr = module.get_operation();
+    let func_ty = pliron::builtin::types::FunctionType::get(&ctx, vec![], vec![]);
+    let func_op_ptr = Operation::new(
+        &mut ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let func_ty_attr = pliron::builtin::attributes::TypeAttr::new(func_ty.into());
+    let func = mir::MirFuncOp::new(&mut ctx, func_op_ptr, func_ty_attr);
+    func.set_symbol_name(&mut ctx, "blockdim_kernel".try_into().unwrap());
+    let region = func.get_operation().deref(&ctx).get_region(0);
+    let block = pliron::basic_block::BasicBlock::new(&mut ctx, None, vec![]);
+    block.insert_at_back(region, &ctx);
+
+    let i32_ty = pliron::builtin::types::IntegerType::get(
+        &ctx,
+        32,
+        pliron::builtin::types::Signedness::Signless,
+    );
+    let ntid_op = Operation::new(
+        &mut ctx,
+        nvvm::ReadPtxSregNtidXOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    ntid_op.insert_at_back(block, &ctx);
+    let ret_op = Operation::new(
+        &mut ctx,
+        mir::MirReturnOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    ret_op.insert_at_back(block, &ctx);
+
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            allow_fma_contraction: true,
+            backend: mir_lower::BackendTarget::Maca,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let ir = llvm_export::export::export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &llvm_export::export::MacaExportConfig,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let gep = ir
+        .lines()
+        .find(|line| line.contains("getelementptr inbounds"))
+        .expect("blockDim lowering emits a dispatch GEP");
+    assert!(
+        gep.contains("getelementptr inbounds i8, ptr addrspace(4)") && gep.contains("i32 4"),
+        "dispatch offset must be four bytes, not four pointer elements:\n{gep}\n\n{ir}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
     dialect_mir::register(&mut ctx);

@@ -157,7 +157,13 @@ pub fn export_llvm_ir(
     debug_kind: DebugKind,
 ) -> Result<String, PipelineError> {
     export_llvm_ir_with_backend(
-        ctx, module_op_ptr, device_externs, path, emit_nvvm_ir, nvvm_dialect, debug_kind,
+        ctx,
+        module_op_ptr,
+        device_externs,
+        path,
+        emit_nvvm_ir,
+        nvvm_dialect,
+        debug_kind,
         crate::options::TargetBackend::Cuda,
     )
 }
@@ -176,7 +182,13 @@ pub fn export_llvm_ir_with_backend(
     backend: crate::options::TargetBackend,
 ) -> Result<String, PipelineError> {
     let llvm_ir = render_llvm_ir_with_backend(
-        ctx, module_op_ptr, device_externs, emit_nvvm_ir, nvvm_dialect, debug_kind, backend,
+        ctx,
+        module_op_ptr,
+        device_externs,
+        emit_nvvm_ir,
+        nvvm_dialect,
+        debug_kind,
+        backend,
     )?;
 
     std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
@@ -200,7 +212,12 @@ pub fn render_llvm_ir(
     debug_kind: DebugKind,
 ) -> Result<String, PipelineError> {
     render_llvm_ir_with_backend(
-        ctx, module_op_ptr, device_externs, emit_nvvm_ir, nvvm_dialect, debug_kind,
+        ctx,
+        module_op_ptr,
+        device_externs,
+        emit_nvvm_ir,
+        nvvm_dialect,
+        debug_kind,
         crate::options::TargetBackend::Cuda,
     )
 }
@@ -226,27 +243,44 @@ pub fn render_llvm_ir_with_backend(
                 inner: llvm_export::export::MacaExportConfig,
                 debug_kind,
             };
-            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-                .map_err(PipelineError::Export)?
+            llvm_export::export::export_module_with_externs(
+                ctx,
+                &module_op,
+                device_externs,
+                &config,
+            )
+            .map_err(PipelineError::Export)?
         }
         crate::options::TargetBackend::Cuda if emit_nvvm_ir => {
             let dialect = nvvm_dialect.ok_or_else(|| {
-                PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
+                PipelineError::Export(
+                    "NVVM export reached without a selected IR dialect".to_string(),
+                )
             })?;
             let config = PipelineExportConfig {
                 inner: llvm_export::export::NvvmExportConfig::new(dialect),
                 debug_kind,
             };
-            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-                .map_err(PipelineError::Export)?
+            llvm_export::export::export_module_with_externs(
+                ctx,
+                &module_op,
+                device_externs,
+                &config,
+            )
+            .map_err(PipelineError::Export)?
         }
         crate::options::TargetBackend::Cuda => {
             let config = PipelineExportConfig {
                 inner: llvm_export::export::PtxExportConfig,
                 debug_kind,
             };
-            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-                .map_err(PipelineError::Export)?
+            llvm_export::export::export_module_with_externs(
+                ctx,
+                &module_op,
+                device_externs,
+                &config,
+            )
+            .map_err(PipelineError::Export)?
         }
     };
 
@@ -285,6 +319,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         self.inner.emit_ptx_kernel_keyword()
+    }
+
+    fn kernel_calling_convention(&self) -> llvm_export::export::KernelCallingConvention {
+        self.inner.kernel_calling_convention()
     }
 
     fn nvvm_ir_dialect(&self) -> Option<NvvmIrDialect> {

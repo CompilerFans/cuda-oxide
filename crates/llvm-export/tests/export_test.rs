@@ -7,8 +7,8 @@ use combine::stream::position::SourcePosition;
 use llvm_export::{
     export::{
         DebugKind, DeviceExternAttrs, DeviceExternDecl, DeviceExternType, ExportBackendConfig,
-        NvvmExportConfig, NvvmIrDialect, PtxExportConfig, export_module_to_string,
-        export_module_to_string_with_config, export_module_with_externs,
+        MacaExportConfig, NvvmExportConfig, NvvmIrDialect, PtxExportConfig,
+        export_module_to_string, export_module_to_string_with_config, export_module_with_externs,
     },
     op_interfaces::CastOpInterface,
     ops::{
@@ -69,6 +69,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for DebugConfig<C> {
 
     fn emit_ptx_kernel_keyword(&self) -> bool {
         self.inner.emit_ptx_kernel_keyword()
+    }
+
+    fn kernel_calling_convention(&self) -> llvm_export::export::KernelCallingConvention {
+        self.inner.kernel_calling_convention()
     }
 
     fn nvvm_ir_dialect(&self) -> Option<llvm_export::export::NvvmIrDialect> {
@@ -1188,6 +1192,76 @@ fn legacy_kernel_metadata_uses_typed_function_references() {
     assert!(
         ir.contains("!{void (i8*)* @metadata_kernel, !\"kernel\", i32 1}"),
         "{ir}"
+    );
+}
+
+#[test]
+fn kernel_calling_convention_matches_export_backend() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "maca_kernel_cc".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+
+    let declaration = FuncOp::new(&mut ctx, "declared_kernel".try_into().unwrap(), func_ty);
+    declaration.get_operation().deref_mut(&ctx).attributes.set(
+        "gpu_kernel".try_into().unwrap(),
+        StringAttr::new("true".into()),
+    );
+    declaration
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    let definition = FuncOp::new(&mut ctx, "defined_kernel".try_into().unwrap(), func_ty);
+    definition.get_operation().deref_mut(&ctx).attributes.set(
+        "gpu_kernel".try_into().unwrap(),
+        StringAttr::new("true".into()),
+    );
+    let entry = definition.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    definition
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    let ptx_ir = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig)
+        .expect("PTX export succeeds");
+    assert!(
+        ptx_ir.contains("declare ptx_kernel void @declared_kernel()"),
+        "{ptx_ir}"
+    );
+    assert!(
+        ptx_ir.contains("define ptx_kernel void @defined_kernel()"),
+        "{ptx_ir}"
+    );
+
+    let nvvm_ir = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("NVVM export succeeds");
+    assert!(
+        nvvm_ir.contains("declare void @declared_kernel()"),
+        "{nvvm_ir}"
+    );
+    assert!(
+        nvvm_ir.contains("define void @defined_kernel()"),
+        "{nvvm_ir}"
+    );
+    assert!(!nvvm_ir.contains("ptx_kernel"), "{nvvm_ir}");
+    assert!(!nvvm_ir.contains("metaxgpu_kernel"), "{nvvm_ir}");
+
+    let maca_ir = export_module_to_string_with_config(&ctx, &module, &MacaExportConfig)
+        .expect("MACA export succeeds");
+    assert!(
+        maca_ir.contains("declare metaxgpu_kernel void @declared_kernel()"),
+        "{maca_ir}"
+    );
+    assert!(
+        maca_ir.contains("define metaxgpu_kernel void @defined_kernel()"),
+        "{maca_ir}"
     );
 }
 

@@ -96,6 +96,8 @@ pub enum CompilationArtifactKind {
     Ltoir,
     /// Final cubin image, loadable by the CUDA driver.
     Cubin,
+    /// Final MXMACA ELF device image, loadable by the MACA runtime.
+    MacaDeviceBinary,
 }
 
 /// Output paths, target, and artifact format from successful compilation.
@@ -288,11 +290,16 @@ pub fn run_pipeline(
     let ptx_path = config
         .output_dir
         .join(format!("{}.ptx", config.output_name));
+    let maca_device_binary_path = config
+        .output_dir
+        .join(format!("{}.devbin", config.output_name));
     let stale_artifacts = stale_compilation_artifact_paths(&config.output_dir, &config.output_name);
 
     // Environment-derived compatibility options are read once at the rustc
     // frontend boundary. Explicit pipeline configuration retains precedence.
-    let mut backend_options = BackendOptions::from_env();
+    let mut backend_options = BackendOptions::try_from_env().map_err(|message| {
+        PipelineError::Export(format!("invalid codegen configuration: {message}"))
+    })?;
     if config.target_arch.is_some() {
         backend_options.target_arch = config.target_arch.clone();
     }
@@ -310,6 +317,7 @@ pub fn run_pipeline(
         OutputFiles {
             llvm_ir: &ll_path,
             ptx: &ptx_path,
+            maca_device_binary: &maca_device_binary_path,
             stale_before_export: &stale_artifacts,
         },
         PipelineTrace {
@@ -348,18 +356,14 @@ pub fn run_pipeline(
             target: generated.target,
             allow_fma_contraction: config.allow_fma_contraction,
         }),
-        ModuleArtifactKind::MacaLlvmIr => {
-            // MXMACA backend outputs LLVM IR consumed by mxcc.
-            // The .ll file is the artifact; no PTX is generated.
-            Ok(CompilationResult {
-                artifact_path: ll_path.clone(),
-                artifact_kind: CompilationArtifactKind::Ptx, // Reuse Ptx kind for now
-                ll_path,
-                ptx_path,
-                target: generated.target,
-                allow_fma_contraction: config.allow_fma_contraction,
-            })
-        }
+        ModuleArtifactKind::MacaDeviceBinary => Ok(CompilationResult {
+            artifact_path: maca_device_binary_path,
+            artifact_kind: CompilationArtifactKind::MacaDeviceBinary,
+            ll_path,
+            ptx_path,
+            target: generated.target,
+            allow_fma_contraction: config.allow_fma_contraction,
+        }),
     }
 }
 
@@ -435,6 +439,7 @@ fn stale_compilation_artifact_paths(
         "ltoir",
         "cubin",
         "cubin.target",
+        "devbin",
     ]
     .into_iter()
     .map(|suffix| output_dir.join(format!("{output_name}.{suffix}")))
@@ -480,6 +485,7 @@ mod tests {
             "ltoir",
             "cubin",
             "cubin.target",
+            "devbin",
         ] {
             fs::write(root.join(format!("kernel.{suffix}")), b"stale").unwrap();
         }
@@ -504,7 +510,7 @@ mod tests {
 
         assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
         assert_ne!(fs::read(&result.ll_path).unwrap(), b"stale");
-        for suffix in ["ptx", "ltoir", "cubin", "cubin.target"] {
+        for suffix in ["ptx", "ltoir", "cubin", "cubin.target", "devbin"] {
             assert!(!root.join(format!("kernel.{suffix}")).exists(), "{suffix}");
         }
         assert_ne!(fs::read(root.join("kernel.target")).unwrap(), b"stale");

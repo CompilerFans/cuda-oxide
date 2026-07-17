@@ -364,11 +364,11 @@ pub(super) fn export_module_with_externs_impl(
     validate_export_config(config)?;
     let mut output = String::new();
     let emit_all_annotations = config.emit_all_kernel_annotations();
-    let emit_ptx_kernel_keyword = config.emit_ptx_kernel_keyword();
+    let kernel_calling_convention = config.kernel_calling_convention();
     let mut state = ModuleExportState::new(
         ctx,
         emit_all_annotations,
-        emit_ptx_kernel_keyword,
+        kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
     );
@@ -394,7 +394,12 @@ pub(super) fn export_module_with_externs_impl(
         config.datalayout()
     )
     .unwrap();
-    writeln!(&mut output, "target triple = \"{}\"", config.target_triple()).unwrap();
+    writeln!(
+        &mut output,
+        "target triple = \"{}\"",
+        config.target_triple()
+    )
+    .unwrap();
     writeln!(&mut output).unwrap();
 
     // 2. Device extern declarations (before function definitions)
@@ -536,11 +541,11 @@ pub(super) fn export_module_to_string_with_config(
     validate_export_config(config)?;
     let mut output = String::new();
     let emit_all_annotations = config.emit_all_kernel_annotations();
-    let emit_ptx_kernel_keyword = config.emit_ptx_kernel_keyword();
+    let kernel_calling_convention = config.kernel_calling_convention();
     let mut state = ModuleExportState::new(
         ctx,
         emit_all_annotations,
-        emit_ptx_kernel_keyword,
+        kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
     );
@@ -567,7 +572,12 @@ pub(super) fn export_module_to_string_with_config(
         config.datalayout()
     )
     .unwrap();
-    writeln!(&mut output, "target triple = \"{}\"", config.target_triple()).unwrap();
+    writeln!(
+        &mut output,
+        "target triple = \"{}\"",
+        config.target_triple()
+    )
+    .unwrap();
     writeln!(&mut output).unwrap(); // Separate header from body
 
     // 2. Process Globals and Functions (including intrinsic declarations)

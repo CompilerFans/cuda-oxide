@@ -16,8 +16,8 @@
 //! | `ThreadfenceSystem` | inline PTX `membar.sys`     |
 
 use crate::BackendTarget;
-use crate::convert::intrinsics::common::*;
 use crate::context::lowering_options;
+use crate::convert::intrinsics::common::*;
 use llvm_export::attributes::LlvmAtomicOrdering;
 use llvm_export::op_interfaces::BinArithOp;
 use llvm_export::ops as llvm;
@@ -70,9 +70,7 @@ pub(crate) fn convert_sreg_read_i32(
     let opts = lowering_options(ctx);
     let resolved_name = match opts.backend {
         BackendTarget::Cuda => intrinsic_name,
-        BackendTarget::Maca => {
-            maca_intrinsic_for(intrinsic_name).unwrap_or(intrinsic_name)
-        }
+        BackendTarget::Maca => maca_intrinsic_for(intrinsic_name).unwrap_or(intrinsic_name),
     };
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
@@ -136,10 +134,9 @@ pub(crate) fn convert_barrier0(
 
 /// Convert `lane_id` for MXMACA: `mbcnt.lo(-1, 0)` + `mbcnt.hi(-1, lo)`.
 ///
-/// MXMACA uses two intrinsics to compute the 64-bit wave lane ID:
-/// 1. `mbcnt.lo(-1, 0)` — count of active lanes in lower 32 bits
-/// 2. `mbcnt.hi(-1, lo)` — count of active lanes in upper 32 bits
-/// Combined they give the lane ID within a 64-thread wave.
+/// MXMACA uses two `i32` intrinsics to count preceding lanes across both halves
+/// of the 64-thread wave. The second call continues from the first call's
+/// accumulator and yields the lane ID in the range 0..63.
 pub(crate) fn convert_maca_lane_id(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -151,13 +148,37 @@ pub(crate) fn convert_maca_lane_id(
     let zero = create_i32_const(ctx, rewriter, 0);
 
     // mbcnt.lo(-1, 0)
-    let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![i32_ty.into(), i32_ty.into()], false);
-    let mbcnt_lo = call_intrinsic(ctx, rewriter, op, "llvm_mxc_mbcnt_lo", func_ty, vec![neg1, zero])?;
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        i32_ty.into(),
+        vec![i32_ty.into(), i32_ty.into()],
+        false,
+    );
+    let mbcnt_lo = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        "llvm_mxc_mbcnt_lo",
+        func_ty,
+        vec![neg1, zero],
+    )?;
     let lo_val = mbcnt_lo.deref(ctx).get_result(0);
 
     // mbcnt.hi(-1, lo)
-    let func_ty2 = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![i32_ty.into(), i32_ty.into()], false);
-    let mbcnt_hi = call_intrinsic(ctx, rewriter, op, "llvm_mxc_mbcnt_hi", func_ty2, vec![neg1, lo_val])?;
+    let func_ty2 = llvm_types::FuncType::get(
+        ctx,
+        i32_ty.into(),
+        vec![i32_ty.into(), i32_ty.into()],
+        false,
+    );
+    let mbcnt_hi = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        "llvm_mxc_mbcnt_hi",
+        func_ty2,
+        vec![neg1, lo_val],
+    )?;
 
     rewriter.replace_operation(ctx, op, mbcnt_hi);
     Ok(())
@@ -168,10 +189,10 @@ pub(crate) fn convert_maca_lane_id(
 // ============================================================================
 
 /// MXMACA dispatch structure offsets (from LLVM IR analysis).
-const MACA_DISPATCH_BLOCKDIM_OFFSET: u32 = 4;   // blockDim.x (i16) | blockDim.y (i16) packed as i32
-const MACA_DISPATCH_GRIDDIM_X_OFFSET: u32 = 12;  // gridDim.x (i32)
-const MACA_DISPATCH_GRIDDIM_Y_OFFSET: u32 = 16;  // gridDim.y (i32)
-const MACA_DISPATCH_GRIDDIM_Z_OFFSET: u32 = 20;  // gridDim.z (i32)
+const MACA_DISPATCH_BLOCKDIM_OFFSET: u32 = 4; // blockDim.x (i16) | blockDim.y (i16) packed as i32
+const MACA_DISPATCH_GRIDDIM_X_OFFSET: u32 = 12; // gridDim.x (i32)
+const MACA_DISPATCH_GRIDDIM_Y_OFFSET: u32 = 16; // gridDim.y (i32)
+const MACA_DISPATCH_GRIDDIM_Z_OFFSET: u32 = 20; // gridDim.z (i32)
 
 /// Call `@llvm.mxc.dispatch.ptr()` and return the dispatch pointer value.
 fn get_maca_dispatch_ptr(
@@ -181,7 +202,14 @@ fn get_maca_dispatch_ptr(
 ) -> Result<pliron::value::Value> {
     let ptr_ty = llvm_types::PointerType::get(ctx, 4); // addrspace(4)
     let func_ty = llvm_types::FuncType::get(ctx, ptr_ty.into(), vec![], false);
-    let call_op = call_intrinsic(ctx, rewriter, current_op, "llvm_mxc_dispatch_ptr", func_ty, vec![])?;
+    let call_op = call_intrinsic(
+        ctx,
+        rewriter,
+        current_op,
+        "llvm_mxc_dispatch_ptr",
+        func_ty,
+        vec![],
+    )?;
     Ok(call_op.deref(ctx).get_result(0))
 }
 
@@ -194,12 +222,10 @@ fn read_dispatch_i32(
 ) -> Result<pliron::value::Value> {
     let dispatch_ptr = get_maca_dispatch_ptr(ctx, rewriter, current_op)?;
 
-    // GEP to the offset (byte-level GEP via i8 pointer)
-    let i8_ptr_ty = llvm_types::PointerType::get(ctx, 4); // addrspace(4) i8*
-    let gep_indices = vec![
-        llvm::GepIndex::Constant(offset),
-    ];
-    let gep_op = llvm::GetElementPtrOp::new(ctx, dispatch_ptr, gep_indices, i8_ptr_ty.into());
+    // GEP to the offset using i8 as the source element type.
+    let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+    let gep_indices = vec![llvm::GepIndex::Constant(offset)];
+    let gep_op = llvm::GetElementPtrOp::new(ctx, dispatch_ptr, gep_indices, i8_ty.into());
     rewriter.insert_operation(ctx, gep_op.get_operation());
     let field_ptr = gep_op.get_operation().deref(ctx).get_result(0);
 

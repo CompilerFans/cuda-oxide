@@ -145,14 +145,14 @@ pub(super) fn emit_nvvmir_version(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::config::DebugKind;
+    use crate::export::config::{DebugKind, KernelCallingConvention};
     use crate::export::state::{
         KernelClusterConfig, KernelInfo, KernelLaunchBounds, ModuleExportState,
     };
     use pliron::context::Context;
 
     fn test_state<'a>(ctx: &'a Context) -> ModuleExportState<'a> {
-        ModuleExportState::new(ctx, true, false, DebugKind::Off, None)
+        ModuleExportState::new(ctx, true, KernelCallingConvention::C, DebugKind::Off, None)
     }
 
     #[test]

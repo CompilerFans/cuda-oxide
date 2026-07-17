@@ -520,13 +520,13 @@ pub fn convert(
         return convert_rust_float_math_intrinsic(ctx, rewriter, op, intrinsic);
     }
 
-    let callee_ident: pliron::identifier::Identifier = {
-        let resolved_name = resolve_device_extern_symbol(&callee_name);
-
-        resolved_name
-            .try_into()
-            .expect("callee name should have been legalized during MIR import")
-    };
+    let cuda_callee_name = resolve_device_extern_symbol(&callee_name);
+    let is_device_math_call = cuda_callee_name.starts_with("__nv_");
+    let resolved_callee_name = backend_math_symbol(ctx, &cuda_callee_name);
+    let callee_ident: pliron::identifier::Identifier = resolved_callee_name
+        .as_str()
+        .try_into()
+        .expect("callee name should have been legalized during MIR import");
 
     let args: Vec<Value> = op.deref(ctx).operands().collect();
 
@@ -588,20 +588,17 @@ pub fn convert(
     // have no MIR body and therefore no emitted declaration. Without a module
     // declaration the verifier rejects the call ("Symbol __nv_asinf not found").
     // Declare it here with the call's signature, mirroring the float-math
-    // intrinsic path; the symbol is bound against libdevice at the cubin-link
-    // stage just like `__nv_expf`/`__nv_sqrtf`.
+    // intrinsic path. CUDA binds it against libdevice; MACA rewrites it to
+    // `mc_math_func_*`, which mxcc resolves from the SDK device math library.
     {
-        let resolved_name = resolve_device_extern_symbol(&callee_name);
         let parent_block = op.deref(ctx).get_parent_block();
-        if resolved_name.starts_with("__nv_")
-            && let Some(parent_block) = parent_block
-        {
+        if is_device_math_call && let Some(parent_block) = parent_block {
             let loc = op.deref(ctx).loc();
-            helpers::ensure_intrinsic_declared(ctx, parent_block, &resolved_name, func_type)
+            helpers::ensure_intrinsic_declared(ctx, parent_block, &resolved_callee_name, func_type)
                 .map_err(|e| {
                     pliron::input_error!(
                         loc,
-                        "Failed to declare libdevice extern {resolved_name}: {e}"
+                        "Failed to declare device math extern {resolved_callee_name}: {e}"
                     )
                 })?;
         }
@@ -985,7 +982,7 @@ fn convert_rust_carrying_mul_add(
     Ok(())
 }
 
-/// Lower placeholder calls for rustc's `f32` / `f64` math intrinsics to libdevice.
+/// Lower rustc's `f32` / `f64` math intrinsics to the target device math library.
 fn convert_rust_float_math_intrinsic(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -1016,7 +1013,8 @@ fn convert_rust_float_math_intrinsic(
 
     let result_mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
     let result_ty = convert_type(ctx, result_mir_ty).map_err(anyhow_to_pliron)?;
-    let intrinsic_name = intrinsic.libdevice_name(ctx, result_ty, loc.clone())?;
+    let cuda_intrinsic_name = intrinsic.libdevice_name(ctx, result_ty, loc.clone())?;
+    let intrinsic_name = backend_math_symbol(ctx, cuda_intrinsic_name);
     let arg_types = args.iter().map(|arg| arg.get_type(ctx)).collect::<Vec<_>>();
     let func_ty = llvm_types::FuncType::get(ctx, result_ty, arg_types, false);
     let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
@@ -1025,10 +1023,11 @@ fn convert_rust_float_math_intrinsic(
             "Rust float math intrinsic call has no parent block"
         )
     })?;
-    helpers::ensure_intrinsic_declared(ctx, parent_block, intrinsic_name, func_ty)
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic_name, func_ty)
         .map_err(|e| pliron::input_error!(loc.clone(), "Failed to declare intrinsic: {e}"))?;
 
     let sym_name: pliron::identifier::Identifier = intrinsic_name
+        .as_str()
         .try_into()
         .map_err(|e| pliron::input_error!(loc.clone(), "Invalid intrinsic name: {:?}", e))?;
     let llvm_call = llvm::CallOp::new(ctx, CallOpCallable::Direct(sym_name), func_ty, args);
@@ -1474,9 +1473,41 @@ fn resolve_device_extern_symbol(callee_name: &str) -> String {
         .unwrap_or_else(|| callee_name.to_string())
 }
 
+/// Map CUDA libdevice spellings to the matching MXMACA device-math symbols.
+///
+/// MXMACA's math bitcode exports the same suffix table under
+/// `mc_math_func_*`; `mxcc --maca-path` links that library automatically.
+fn backend_math_symbol(ctx: &Context, cuda_name: &str) -> String {
+    if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca
+        && let Some(suffix) = cuda_name.strip_prefix("__nv_")
+    {
+        return format!("mc_math_func_{suffix}");
+    }
+    cuda_name.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maca_rewrites_cuda_libdevice_names_to_device_math_library() {
+        let mut ctx = Context::new();
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: true,
+                backend: crate::BackendTarget::Maca,
+            },
+        );
+
+        assert_eq!(backend_math_symbol(&ctx, "__nv_sinf"), "mc_math_func_sinf");
+        assert_eq!(
+            backend_math_symbol(&ctx, "__nv_powif"),
+            "mc_math_func_powif"
+        );
+        assert_eq!(backend_math_symbol(&ctx, "user_function"), "user_function");
+    }
 
     #[test]
     fn no_fma_policy_removes_only_contract_from_fast_float_intrinsics() {

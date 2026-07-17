@@ -25,7 +25,7 @@
 //!   2. During lowering (lowering.rs:132) `propagate_kernel_attrs` copies a
 //!      `gpu_kernel="true"` `StringAttr` onto the produced `llvm::FuncOp` (plus
 //!      any optional `cluster_dim_*`/`maxntid`/`minctasm` ints).
-//!   3. `llvm-export`'s `PtxExportConfig::emit_ptx_kernel_keyword()` is `true`,
+//!   3. `llvm-export` selects the `ptx_kernel` calling convention,
 //!      so a func carrying `gpu_kernel` is emitted with the `ptx_kernel`
 //!      calling convention, which `llc` renders as `.visible .entry`.
 //!

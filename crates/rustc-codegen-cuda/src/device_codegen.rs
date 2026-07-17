@@ -253,6 +253,7 @@ pub enum DeviceCodegenArtifactKind {
     NvvmIr,
     Ltoir,
     Cubin,
+    MacaDeviceBinary,
 }
 
 pub struct DeviceCodegenArtifact {
@@ -790,6 +791,9 @@ fn read_compilation_artifact(
         mir_importer::CompilationArtifactKind::NvvmIr => DeviceCodegenArtifactKind::NvvmIr,
         mir_importer::CompilationArtifactKind::Ltoir => DeviceCodegenArtifactKind::Ltoir,
         mir_importer::CompilationArtifactKind::Cubin => DeviceCodegenArtifactKind::Cubin,
+        mir_importer::CompilationArtifactKind::MacaDeviceBinary => {
+            DeviceCodegenArtifactKind::MacaDeviceBinary
+        }
     };
 
     match std::fs::read(&result.artifact_path) {
@@ -899,6 +903,34 @@ mod tests {
         assert_eq!(artifact.kind, DeviceCodegenArtifactKind::Cubin);
         assert_eq!(artifact.name, "demo.cubin");
         assert_eq!(artifact.bytes, b"cubin");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn read_compilation_artifact_reads_declared_maca_device_binary_path() {
+        let temp_dir = unique_temp_dir("maca-codegen-artifact");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let ll_path = temp_dir.join("demo.ll");
+        let ptx_path = temp_dir.join("demo.ptx");
+        let maca_path = temp_dir.join("demo.devbin");
+        std::fs::write(&ll_path, b"stale llvm ir").unwrap();
+        std::fs::write(&ptx_path, b"stale ptx").unwrap();
+        std::fs::write(&maca_path, b"\x7fELFmaca device image").unwrap();
+
+        let result = mir_importer::CompilationResult {
+            ll_path,
+            ptx_path,
+            artifact_path: maca_path,
+            artifact_kind: mir_importer::CompilationArtifactKind::MacaDeviceBinary,
+            target: "xcore1000".to_string(),
+            allow_fma_contraction: true,
+        };
+
+        let artifact = read_compilation_artifact(&result).unwrap().unwrap();
+        assert_eq!(artifact.kind, DeviceCodegenArtifactKind::MacaDeviceBinary);
+        assert_eq!(artifact.name, "demo.devbin");
+        assert_eq!(artifact.bytes, b"\x7fELFmaca device image");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

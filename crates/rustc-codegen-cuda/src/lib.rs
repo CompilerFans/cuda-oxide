@@ -801,6 +801,9 @@ fn write_device_artifact_object(
         device_codegen::DeviceCodegenArtifactKind::Cubin => {
             oxide_artifacts::ArtifactPayloadKind::Cubin
         }
+        device_codegen::DeviceCodegenArtifactKind::MacaDeviceBinary => {
+            oxide_artifacts::ArtifactPayloadKind::MacaDeviceBinary
+        }
     };
     let compile_options = if matches!(
         artifact.kind,

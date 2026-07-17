@@ -35,6 +35,7 @@ crates/dialect-mir/src/passes/
 .oxide-artifacts/
 **/.oxide-artifacts/
 *.cubin
+*.devbin
 *.gpu
 *.fatbin
 vendor/

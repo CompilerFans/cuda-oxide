@@ -102,6 +102,7 @@ pub enum ArtifactPayloadKind {
     NvvmIr,
     Ltoir,
     Cubin,
+    MacaDeviceBinary,
 }
 
 impl ArtifactPayloadKind {
@@ -111,6 +112,7 @@ impl ArtifactPayloadKind {
             Self::NvvmIr => 0x110,
             Self::Ltoir => 0x120,
             Self::Cubin => 0x200,
+            Self::MacaDeviceBinary => 0x210,
         }
     }
 
@@ -120,6 +122,7 @@ impl ArtifactPayloadKind {
             0x110 => Some(Self::NvvmIr),
             0x120 => Some(Self::Ltoir),
             0x200 => Some(Self::Cubin),
+            0x210 => Some(Self::MacaDeviceBinary),
             _ => None,
         }
     }
@@ -962,6 +965,11 @@ mod tests {
                     ArtifactPayloadKind::Cubin,
                     "demo.cubin",
                     b"cubin",
+                ))
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::MacaDeviceBinary,
+                    "demo.devbin",
+                    b"\x7fELFmaca",
                 )),
         )
         .unwrap();
@@ -981,6 +989,19 @@ mod tests {
         assert_eq!(
             bundles[0].payload(ArtifactPayloadKind::Cubin),
             Some(&b"cubin"[..])
+        );
+        assert_eq!(
+            bundles[0].payload(ArtifactPayloadKind::MacaDeviceBinary),
+            Some(&b"\x7fELFmaca"[..])
+        );
+    }
+
+    #[test]
+    fn maca_device_binary_payload_kind_has_stable_wire_value() {
+        assert_eq!(ArtifactPayloadKind::MacaDeviceBinary.to_u16(), 0x210);
+        assert_eq!(
+            ArtifactPayloadKind::from_u16(0x210),
+            Some(ArtifactPayloadKind::MacaDeviceBinary)
         );
     }
 

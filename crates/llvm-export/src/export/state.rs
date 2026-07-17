@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use crate::ops::{DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap};
 
 use super::{
-    config::{DebugKind, NvvmIrDialect},
+    config::{DebugKind, KernelCallingConvention, NvvmIrDialect},
     externs::DeviceExternDecl,
 };
 
@@ -59,8 +59,8 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) all_kernels: Vec<KernelInfo>,
     /// Whether to track all kernels (set by backend config)
     pub(super) track_all_kernels: bool,
-    /// Whether to print `ptx_kernel` on kernel definitions.
-    pub(super) emit_ptx_kernel_keyword: bool,
+    /// Calling convention printed on kernel declarations and definitions.
+    pub(super) kernel_calling_convention: KernelCallingConvention,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
     /// Emitted function signatures keyed by their final, prefix-stripped name.
@@ -134,7 +134,7 @@ impl<'a> ModuleExportState<'a> {
     pub(super) fn new(
         ctx: &'a pliron::context::Context,
         track_all_kernels: bool,
-        emit_ptx_kernel_keyword: bool,
+        kernel_calling_convention: KernelCallingConvention,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
     ) -> Self {
@@ -145,7 +145,7 @@ impl<'a> ModuleExportState<'a> {
             launch_bounds_kernels: Vec::new(),
             all_kernels: Vec::new(),
             track_all_kernels,
-            emit_ptx_kernel_keyword,
+            kernel_calling_convention,
             device_functions: Vec::new(),
             function_types: FxHashMap::default(),
             function_source_names: FxHashMap::default(),

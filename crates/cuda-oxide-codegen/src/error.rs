@@ -30,6 +30,8 @@ pub enum PipelineError {
     Export(String),
     /// PTX generation via `llc` failed.
     PtxGeneration(String),
+    /// MXMACA device-binary generation via `mxcc` failed.
+    MacaGeneration(String),
     /// The requested LLVM middle-end optimization failed.
     Optimization(String),
 }
@@ -66,6 +68,9 @@ impl std::fmt::Display for PipelineError {
             ),
             Self::Export(msg) => write!(f, "Export failed: {}", msg),
             Self::PtxGeneration(msg) => write!(f, "PTX generation failed: {}", msg),
+            Self::MacaGeneration(msg) => {
+                write!(f, "MXMACA device-binary generation failed: {msg}")
+            }
             Self::Optimization(msg) => write!(f, "LLVM optimization failed: {msg}"),
         }
     }

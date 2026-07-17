@@ -35,7 +35,12 @@ pub fn lower_to_llvm(
     module_op_ptr: Ptr<Operation>,
     allow_fma_contraction: bool,
 ) -> Result<(), PipelineError> {
-    lower_to_llvm_with_backend(ctx, module_op_ptr, allow_fma_contraction, crate::options::TargetBackend::Cuda)
+    lower_to_llvm_with_backend(
+        ctx,
+        module_op_ptr,
+        allow_fma_contraction,
+        crate::options::TargetBackend::Cuda,
+    )
 }
 
 /// Lowers `dialect-mir` operations to the LLVM dialect with explicit backend target.

@@ -49,8 +49,8 @@ mod state;
 mod types;
 
 pub use config::{
-    DebugKind, ExportBackendConfig, MacaExportConfig, NvvmExportConfig, NvvmIrDialect,
-    PtxExportConfig,
+    DebugKind, ExportBackendConfig, KernelCallingConvention, MacaExportConfig, NvvmExportConfig,
+    NvvmIrDialect, PtxExportConfig,
 };
 pub use externs::{AsDeviceExtern, DeviceExternAttrs, DeviceExternDecl, DeviceExternType};
 

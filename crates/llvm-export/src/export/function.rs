@@ -37,6 +37,7 @@ use crate::{
 };
 
 use super::{
+    config::KernelCallingConvention,
     literals::{format_float_literal, format_half_literal},
     names::{has_device_prefix, strip_device_prefix},
     state::{
@@ -45,6 +46,15 @@ use super::{
 };
 
 impl<'a> ModuleExportState<'a> {
+    fn emit_kernel_calling_convention(&self, output: &mut String) {
+        let convention = match self.kernel_calling_convention {
+            KernelCallingConvention::C => return,
+            KernelCallingConvention::PtxKernel => "ptx_kernel ",
+            KernelCallingConvention::MetaxGpuKernel => "metaxgpu_kernel ",
+        };
+        write!(output, "{convention}").unwrap();
+    }
+
     /// Export a global variable (typically shared memory for GPU kernels).
     pub(super) fn export_global(
         &mut self,
@@ -264,6 +274,9 @@ impl<'a> ModuleExportState<'a> {
         if func.get_operation().deref(self.ctx).regions().count() == 0 {
             // Function Declaration
             write!(output, "declare ").unwrap();
+            if is_kernel {
+                self.emit_kernel_calling_convention(output);
+            }
             self.export_type(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();
 
@@ -313,8 +326,8 @@ impl<'a> ModuleExportState<'a> {
             }
 
             write!(output, "define ").unwrap();
-            if is_kernel && self.emit_ptx_kernel_keyword {
-                write!(output, "ptx_kernel ").unwrap();
+            if is_kernel {
+                self.emit_kernel_calling_convention(output);
             }
             self.export_type(ret_ty, output)?;
             write!(output, " @{fixed_func_name}(").unwrap();

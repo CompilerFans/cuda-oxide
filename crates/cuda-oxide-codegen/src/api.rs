@@ -530,6 +530,7 @@ impl Compiler {
         let scratch = ScratchDirectory::new()?;
         let ll_path = scratch.path().join("module.ll");
         let ptx_path = scratch.path().join("module.ptx");
+        let maca_device_binary_path = scratch.path().join("module.devbin");
         let backend_options = BackendOptions {
             target_arch: Some(options.target.sm()),
             device_arch_hint: None,
@@ -538,6 +539,8 @@ impl Compiler {
             verbose: false,
             llc_override: None,
             opt_override: None,
+            mxcc_override: None,
+            maca_path: None,
             backend: crate::options::TargetBackend::Cuda,
         };
         let request = ModulePipelineRequest::for_standalone_ptx(
@@ -547,6 +550,7 @@ impl Compiler {
             OutputFiles {
                 llvm_ir: &ll_path,
                 ptx: &ptx_path,
+                maca_device_binary: &maca_device_binary_path,
                 stale_before_export: &[],
             },
         );
@@ -807,6 +811,7 @@ impl From<PipelineError> for CompileError {
             PipelineError::UnsupportedLinking { symbols } => Self::UnsupportedLinking { symbols },
             PipelineError::Export(message) => Self::Export { message },
             PipelineError::PtxGeneration(message) => Self::Codegen { message },
+            PipelineError::MacaGeneration(message) => Self::Codegen { message },
             PipelineError::Optimization(message) => Self::OptimizationFailed { message },
             PipelineError::NoBody(message) | PipelineError::Translation(message) => {
                 Self::Verification {

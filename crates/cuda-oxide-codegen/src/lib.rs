@@ -20,6 +20,7 @@ mod error;
 mod export;
 mod llvm_tools;
 mod lower;
+mod maca;
 mod options;
 mod pipeline;
 mod prep;
