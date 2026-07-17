@@ -1,0 +1,33 @@
+/*
+ * vecadd_launcher.c - Kernel launcher for MXMACA
+ *
+ * This file compiles with mxcc and exports a launch function
+ * that can be called from Rust.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+__global__ void vecadd(float *out, const float *a, const float *b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+// Export a launch function that Rust can call
+extern "C" int launch_vecadd(float *d_out, const float *d_a, const float *d_b, int n) {
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    // Use the <<<>>> syntax which mxcc compiles to proper mcLaunchKernel
+    vecadd<<<grid_size, block_size>>>(d_out, d_a, d_b, n);
+
+    // Synchronize to ensure kernel completes
+    mcError_t err = mcDeviceSynchronize();
+    if (err != mcSuccess) {
+        return (int)err;
+    }
+
+    return 0; // Success
+}
