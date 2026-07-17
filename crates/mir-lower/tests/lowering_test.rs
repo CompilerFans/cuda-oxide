@@ -3649,6 +3649,22 @@ fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error
         );
         op.insert_at_back(entry, &ctx);
     }
+    for op_info in [
+        nvvm::ShflSyncIdxI64Op::get_concrete_op_info(),
+        nvvm::ShflSyncUpI64Op::get_concrete_op_info(),
+        nvvm::ShflSyncDownI64Op::get_concrete_op_info(),
+        nvvm::ShflSyncBflyI64Op::get_concrete_op_info(),
+    ] {
+        let op = Operation::new(
+            &mut ctx,
+            op_info,
+            vec![i64_ty.into()],
+            vec![mask, mask, lane_or_delta],
+            vec![],
+            0,
+        );
+        op.insert_at_back(entry, &ctx);
+    }
     for (op_info, result_ty) in [
         (
             nvvm::VoteSyncBallotOp::get_concrete_op_info(),
@@ -3704,7 +3720,7 @@ fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error
         &llvm_export::export::MacaExportConfig,
     )
     .map_err(anyhow::Error::msg)?;
-    assert_eq!(ir.matches("@llvm.mxc.bsm.bpermute").count(), 5);
+    assert_eq!(ir.matches("@llvm.mxc.bsm.bpermute").count(), 13);
     assert!(ir.contains("@llvm.mxc.mbcnt.lo"));
     assert!(ir.contains("@llvm.mxc.mbcnt.hi"));
     assert!(ir.contains("@llvm.mxc.icmp.i64.i32"));
@@ -3714,6 +3730,10 @@ fn maca_wave64_shuffle_and_vote_lower_to_native_ir() -> Result<(), anyhow::Error
     assert!(
         ir.contains("and i64"),
         "ballot must apply the Wave64 member mask"
+    );
+    assert!(
+        ir.contains("lshr i64"),
+        "i64 shuffle must split its high half"
     );
     for source_lane_op in ["and i32", "sub i32", "add i32", "xor i32"] {
         assert!(

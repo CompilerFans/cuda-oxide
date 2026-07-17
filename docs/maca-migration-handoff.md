@@ -37,7 +37,7 @@
   现在会在编译期明确报错，lowering 后置校验也禁止残留 inline PTX/NVVM intrinsic。
 - **Wave64 核心已闭环**：`WAVE_SIZE=64`、mask/ballot/active/lanemask 为 u64；idx/up/down/xor
   shuffle、all/any/ballot、sync_mask、block reduce/scan 已在 C500 真机通过。
-- **仍未完成**：u64/f64 shuffle、match/redux 和 16x16x16 原生 MMA。
+- **仍未完成**：match/redux 和 16x16x16 原生 MMA。
 
 ---
 
@@ -153,7 +153,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 | barrier → `llvm_mxc_barrier` | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | fence → LLVM fence 指令 | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
 | lane_id → mbcnt.lo+mbcnt.hi | `mir-lower/src/convert/intrinsics/basic.rs` | ✅ |
-| i32/f32 shuffle → 源 lane 计算 + bsm.bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
+| i32/f32/u64/f64 shuffle → 源 lane 计算 + bsm.bpermute | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
 | ballot/all/any → icmp.i64.i32 + u64 mask | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
 | sync_mask → warp fence + barrier | `mir-lower/src/convert/intrinsics/warp.rs` | ✅ C500 |
 | CUDA WMMA | `mir-lower/src/convert/intrinsics/wmma.rs` | ✅ MACA 编译期明确拒绝 |
@@ -419,11 +419,10 @@ cargo oxide doctor
 
 ## 9. 下一步建议
 
-1. **u64/f64 shuffle** — 用双 i32 bpermute 组合替换当前 CUDA inline PTX 路径
-2. **match/redux 原生 lowering** — 当前由 MACA 后置校验明确拒绝
-3. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
-4. **GEMM 示例** — 在 Wave64/MMA 正确性稳定后进入端到端矩阵乘
-5. **性能基线** — 与 MXMACA C++/库实现同口径比较
+1. **match/redux 原生 lowering** — 当前由 MACA 后置校验明确拒绝
+2. **MMA builtin 映射** — 实现并验证 `__builtin_mxc_mma_16x16x16f16/bf16/i8`
+3. **GEMM 示例** — 在 Wave64/MMA 正确性稳定后进入端到端矩阵乘
+4. **性能基线** — 与 MXMACA C++/库实现同口径比较
 
 ---
 

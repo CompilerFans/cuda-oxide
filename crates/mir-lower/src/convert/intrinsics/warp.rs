@@ -294,6 +294,7 @@ pub(crate) fn convert_shuffle_i64(
     clamp: i32,
 ) -> Result<()> {
     let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
     let operands: Vec<_> = op.deref(ctx).operands().collect();
     if operands.len() != 3 {
@@ -302,6 +303,47 @@ pub(crate) fn convert_shuffle_i64(
         );
     }
     let (mask, val, lane_or_delta) = (operands[0], operands[1], operands[2]);
+
+    if lowering_options(ctx).backend == BackendTarget::Maca {
+        let low = llvm::TruncOp::new(ctx, val, i32_ty.into());
+        rewriter.insert_operation(ctx, low.get_operation());
+        let low = low.get_operation().deref(ctx).get_result(0);
+        let shift_32 = create_i64_const(ctx, rewriter, 32);
+        let high_shifted = llvm::LShrOp::new(ctx, val, shift_32);
+        rewriter.insert_operation(ctx, high_shifted.get_operation());
+        let high_shifted = high_shifted.get_operation().deref(ctx).get_result(0);
+        let high = llvm::TruncOp::new(ctx, high_shifted, i32_ty.into());
+        rewriter.insert_operation(ctx, high.get_operation());
+        let high = high.get_operation().deref(ctx).get_result(0);
+
+        let intrinsic_name = match mode {
+            "idx" => "llvm_nvvm_shfl_sync_idx_i64",
+            "bfly" => "llvm_nvvm_shfl_sync_bfly_i64",
+            "down" => "llvm_nvvm_shfl_sync_down_i64",
+            "up" => "llvm_nvvm_shfl_sync_up_i64",
+            _ => return pliron::input_err_noloc!("unknown MACA i64 shuffle mode `{}`", mode),
+        };
+        let low = emit_maca_shuffle_i32(ctx, rewriter, op, low, lane_or_delta, intrinsic_name)?;
+        let high = emit_maca_shuffle_i32(ctx, rewriter, op, high, lane_or_delta, intrinsic_name)?;
+        let low = llvm::ZExtOp::new_with_nneg(ctx, low, i64_ty.into(), false);
+        rewriter.insert_operation(ctx, low.get_operation());
+        let low = low.get_operation().deref(ctx).get_result(0);
+        let high = llvm::ZExtOp::new_with_nneg(ctx, high, i64_ty.into(), false);
+        rewriter.insert_operation(ctx, high.get_operation());
+        let high = high.get_operation().deref(ctx).get_result(0);
+        let high = llvm::ShlOp::new_with_overflow_flag(
+            ctx,
+            high,
+            shift_32,
+            IntegerOverflowFlagsAttr::default(),
+        );
+        rewriter.insert_operation(ctx, high.get_operation());
+        let high = high.get_operation().deref(ctx).get_result(0);
+        let combined = llvm::OrOp::new(ctx, low, high);
+        rewriter.insert_operation(ctx, combined.get_operation());
+        rewriter.replace_operation(ctx, op, combined.get_operation());
+        return Ok(());
+    }
 
     let asm_template = format!(
         "{{ .reg .b32 lo; .reg .b32 hi; mov.b64 {{lo, hi}}, $1; \

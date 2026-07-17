@@ -25,6 +25,7 @@ mod kernels {
         mut ballot: DisjointSlice<u64>,
         mut active: DisjointSlice<u64>,
         mut lane_masks: DisjointSlice<u64>,
+        mut wide_shuffle: DisjointSlice<u64>,
     ) {
         let lane = warp::lane_id();
         let value = lane + 1;
@@ -45,6 +46,9 @@ mod kernels {
             ^ warp::lanemask_eq()
             ^ warp::lanemask_ge()
             ^ warp::lanemask_gt();
+        let wide_value = ((lane as u64) << 40) | (lane as u64 + 0x1234);
+        let wide_broadcast = warp::shuffle_u64(wide_value, 7);
+        let double_xor = warp::shuffle_xor_f64(lane as f64 + 0.5, 32);
 
         if let Some(out) = broadcast.get_mut(thread::index_1d()) {
             *out = broadcast_value;
@@ -63,6 +67,9 @@ mod kernels {
         }
         if let Some(out) = lane_masks.get_mut(thread::index_1d()) {
             *out = lane_masks_value;
+        }
+        if let Some(out) = wide_shuffle.get_mut(thread::index_1d()) {
+            *out = wide_broadcast ^ double_xor.to_bits();
         }
     }
 
@@ -107,6 +114,7 @@ fn main() {
     let mut ballot = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
     let mut active = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
     let mut lane_masks = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
+    let mut wide_shuffle = DeviceBuffer::<u64>::zeroed(&stream, WAVE).unwrap();
     let wave_launch = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (WAVE as u32, 1, 1),
@@ -122,6 +130,7 @@ fn main() {
             &mut ballot,
             &mut active,
             &mut lane_masks,
+            &mut wide_shuffle,
         )
     }
     .expect("wave64_primitives launch failed");
@@ -132,6 +141,7 @@ fn main() {
     let ballot = ballot.to_host_vec(&stream).unwrap();
     let active = active.to_host_vec(&stream).unwrap();
     let lane_masks = lane_masks.to_host_vec(&stream).unwrap();
+    let wide_shuffle = wide_shuffle.to_host_vec(&stream).unwrap();
     for lane in 0..WAVE {
         assert_eq!(broadcast[lane], 8, "broadcast lane {lane}");
         assert_eq!(xor32[lane], (lane as u32) ^ 32, "xor lane {lane}");
@@ -146,6 +156,13 @@ fn main() {
             lane_masks[lane],
             lt ^ le ^ eq ^ ge ^ gt,
             "lane masks {lane}"
+        );
+        let wide_from_lane7 = (7u64 << 40) | (7 + 0x1234);
+        let double_from_xor_lane = ((lane ^ 32) as f64 + 0.5).to_bits();
+        assert_eq!(
+            wide_shuffle[lane],
+            wide_from_lane7 ^ double_from_xor_lane,
+            "u64/f64 shuffle lane {lane}"
         );
     }
     assert_eq!(reduction[0], 2080, "Wave64 reduction");
