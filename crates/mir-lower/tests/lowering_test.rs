@@ -3617,7 +3617,7 @@ fn maca_mma_f16_fails_instead_of_returning_accumulator() -> Result<(), anyhow::E
 }
 
 #[test]
-fn maca_native_m16n16k16_f16_lowers_to_mxc_intrinsic() -> Result<(), anyhow::Error> {
+fn maca_native_m16n16k16_variants_lower_to_mxc_intrinsics() -> Result<(), anyhow::Error> {
     use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 
     let mut ctx = make_test_ctx();
@@ -3625,7 +3625,7 @@ fn maca_native_m16n16k16_f16_lowers_to_mxc_intrinsic() -> Result<(), anyhow::Err
     let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
     let argument_types = (0..4)
         .map(|_| f32_ty.into())
-        .chain((0..4).map(|_| i32_ty.into()))
+        .chain((0..6).map(|_| i32_ty.into()))
         .collect();
     let (module_ptr, entry) = build_test_kernel(&mut ctx, argument_types);
     let operands = (0..8)
@@ -3640,6 +3640,30 @@ fn maca_native_m16n16k16_f16_lowers_to_mxc_intrinsic() -> Result<(), anyhow::Err
         0,
     );
     op.insert_at_back(entry, &ctx);
+    let operands = (0..8)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect();
+    let bf16 = Operation::new(
+        &mut ctx,
+        nvvm::MmaM16N16K16F32Bf16Op::get_concrete_op_info(),
+        vec![f32_ty.into(); 4],
+        operands,
+        vec![],
+        0,
+    );
+    bf16.insert_at_back(entry, &ctx);
+    let i8_operands = (4..10)
+        .map(|index| entry.deref(&ctx).get_argument(index))
+        .collect();
+    let i8 = Operation::new(
+        &mut ctx,
+        nvvm::MmaM16N16K16I32I8Op::get_concrete_op_info(),
+        vec![i32_ty.into(); 4],
+        i8_operands,
+        vec![],
+        0,
+    );
+    i8.insert_at_back(entry, &ctx);
     append_return(&mut ctx, entry);
 
     mir_lower::lower_mir_to_llvm_with_options(
@@ -3659,6 +3683,8 @@ fn maca_native_m16n16k16_f16_lowers_to_mxc_intrinsic() -> Result<(), anyhow::Err
     )
     .map_err(anyhow::Error::msg)?;
     assert!(ir.contains("@llvm.mxc.mma.f32.16x16x16f16(<4 x half>"));
+    assert!(ir.contains("@llvm.mxc.mma.f32.16x16x2bf16(<4 x half>"));
+    assert!(ir.contains("@llvm.mxc.mma.i32.16x16x16i8(i32"));
     assert!(ir.contains("<4 x float>"));
     assert!(!ir.contains("llvm.nvvm"));
     assert!(!ir.contains("asm "));

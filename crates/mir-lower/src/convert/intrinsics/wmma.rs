@@ -42,9 +42,27 @@ pub(crate) fn convert_mma_m16n16k16_f32_f16(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    convert_mma_m16n16k16_f32_16bit(ctx, rewriter, op, "llvm_mxc_mma_f32_16x16x16f16")
+}
+
+pub(crate) fn convert_mma_m16n16k16_f32_bf16(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    convert_mma_m16n16k16_f32_16bit(ctx, rewriter, op, "llvm_mxc_mma_f32_16x16x2bf16")
+}
+
+fn convert_mma_m16n16k16_f32_16bit(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    intrinsic_name: &str,
+) -> Result<()> {
     if lowering_options(ctx).backend != BackendTarget::Maca {
         return pliron::input_err_noloc!(
-            "mma_m16n16k16_f32_f16 is only supported by the MACA backend"
+            "native m16n16k16 MMA is only supported by the MACA backend"
         );
     }
     let operands: Vec<_> = op.deref(ctx).operands().collect();
@@ -121,14 +139,7 @@ pub(crate) fn convert_mma_m16n16k16_f32_f16(
         vec![half4_ty.into(), half4_ty.into(), f32x4_ty.into()],
         false,
     );
-    let call = call_intrinsic(
-        ctx,
-        rewriter,
-        op,
-        "llvm_mxc_mma_f32_16x16x16f16",
-        func_ty,
-        vec![a, b, c],
-    )?;
+    let call = call_intrinsic(ctx, rewriter, op, intrinsic_name, func_ty, vec![a, b, c])?;
     let result = call.deref(ctx).get_result(0);
     let packed = llvm::BitcastOp::new(ctx, result, i128_ty.into());
     rewriter.insert_operation(ctx, packed.get_operation());
@@ -148,6 +159,82 @@ pub(crate) fn convert_mma_m16n16k16_f32_f16(
         let value = llvm::BitcastOp::new(ctx, bits, f32_ty.into());
         rewriter.insert_operation(ctx, value.get_operation());
         results.push(value.get_operation().deref(ctx).get_result(0));
+    }
+    rewriter.replace_operation_with_values(ctx, op, results);
+    Ok(())
+}
+
+pub(crate) fn convert_mma_m16n16k16_i32_i8(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    if lowering_options(ctx).backend != BackendTarget::Maca {
+        return pliron::input_err_noloc!(
+            "mma_m16n16k16_i32_i8 is only supported by the MACA backend"
+        );
+    }
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 6 {
+        return pliron::input_err_noloc!(
+            "mma_m16n16k16_i32_i8 requires 6 register operands, got {}",
+            operands.len()
+        );
+    }
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i128_ty = IntegerType::get(ctx, 128, Signedness::Signless);
+    let i32x4_ty =
+        llvm_types::VectorType::get(ctx, i32_ty.into(), 4, llvm_types::VectorTypeKind::Fixed);
+    let overflow = IntegerOverflowFlagsAttr::default();
+    let mut packed_c = create_i128_const(ctx, rewriter, 0);
+    for (index, accumulator) in operands.iter().take(4).enumerate() {
+        let bits = llvm::ZExtOp::new_with_nneg(ctx, *accumulator, i128_ty.into(), false);
+        rewriter.insert_operation(ctx, bits.get_operation());
+        let mut bits = bits.get_operation().deref(ctx).get_result(0);
+        if index != 0 {
+            let shift = create_i128_const(ctx, rewriter, (index * 32) as i128);
+            let shifted = llvm::ShlOp::new_with_overflow_flag(ctx, bits, shift, overflow.clone());
+            rewriter.insert_operation(ctx, shifted.get_operation());
+            bits = shifted.get_operation().deref(ctx).get_result(0);
+        }
+        let next = llvm::OrOp::new(ctx, packed_c, bits);
+        rewriter.insert_operation(ctx, next.get_operation());
+        packed_c = next.get_operation().deref(ctx).get_result(0);
+    }
+    let c = llvm::BitcastOp::new(ctx, packed_c, i32x4_ty.into());
+    rewriter.insert_operation(ctx, c.get_operation());
+    let c = c.get_operation().deref(ctx).get_result(0);
+    let func_ty = llvm_types::FuncType::get(
+        ctx,
+        i32x4_ty.into(),
+        vec![i32_ty.into(), i32_ty.into(), i32x4_ty.into()],
+        false,
+    );
+    let call = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        "llvm_mxc_mma_i32_16x16x16i8",
+        func_ty,
+        vec![operands[4], operands[5], c],
+    )?;
+    let result = call.deref(ctx).get_result(0);
+    let packed = llvm::BitcastOp::new(ctx, result, i128_ty.into());
+    rewriter.insert_operation(ctx, packed.get_operation());
+    let packed = packed.get_operation().deref(ctx).get_result(0);
+    let mut results = Vec::with_capacity(4);
+    for index in 0..4 {
+        let mut bits = packed;
+        if index != 0 {
+            let shift = create_i128_const(ctx, rewriter, (index * 32) as i128);
+            let shifted = llvm::LShrOp::new(ctx, bits, shift);
+            rewriter.insert_operation(ctx, shifted.get_operation());
+            bits = shifted.get_operation().deref(ctx).get_result(0);
+        }
+        let bits = llvm::TruncOp::new(ctx, bits, i32_ty.into());
+        rewriter.insert_operation(ctx, bits.get_operation());
+        results.push(bits.get_operation().deref(ctx).get_result(0));
     }
     rewriter.replace_operation_with_values(ctx, op, results);
     Ok(())

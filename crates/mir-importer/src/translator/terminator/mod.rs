@@ -3706,6 +3706,34 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
+        "cuda_device::wmma::mma_m16n16k16_f32_bf16" => {
+            Ok(Some(intrinsics::wmma::emit_mma_m16n16k16_f32_bf16(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "cuda_device::wmma::mma_m16n16k16_i32_i8" => {
+            Ok(Some(intrinsics::wmma::emit_mma_m16n16k16_i32_i8(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
         "cuda_device::wmma::mma_m16n8k16_f32_bf16" => {
             Ok(Some(intrinsics::wmma::emit_mma_m16n8k16_f32_bf16(
                 ctx,

@@ -16,7 +16,8 @@ use dialect_mir::{
 };
 use dialect_nvvm::ops::{
     MmaM8N8K4F64Op, MmaM16N8K8F32Tf32Op, MmaM16N8K16F32Bf16Op, MmaM16N8K16F32F16Op,
-    MmaM16N8K32S32S8Op, MmaM16N16K16F32F16Op, MovmatrixTransB16Op,
+    MmaM16N8K32S32S8Op, MmaM16N16K16F32Bf16Op, MmaM16N16K16F32F16Op, MmaM16N16K16I32I8Op,
+    MovmatrixTransB16Op,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
@@ -111,11 +112,66 @@ pub fn emit_mma_m16n16k16_f32_f16(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
+    emit_mma_m16n16k16_f32_16bit(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        false,
+    )
+}
+
+pub fn emit_mma_m16n16k16_f32_bf16(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_mma_m16n16k16_f32_16bit(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        true,
+    )
+}
+
+fn emit_mma_m16n16k16_f32_16bit(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    bf16: bool,
+) -> TranslationResult<Ptr<Operation>> {
     if args.len() != 3 {
         return input_err!(
             loc.clone(),
             TranslationErr::unsupported(format!(
-                "mma_m16n16k16_f32_f16 expects 3 arguments (c, a, b), got {}",
+                "m16n16k16 f32 MMA expects 3 arguments (c, a, b), got {}",
                 args.len()
             ))
         );
@@ -184,14 +240,12 @@ pub fn emit_mma_m16n16k16_f32_f16(
     let mut operands = c_registers;
     operands.extend(a_registers);
     operands.extend(b_registers);
-    let mma_op = Operation::new(
-        ctx,
-        MmaM16N16K16F32F16Op::get_concrete_op_info(),
-        vec![f32_ty.into(); 4],
-        operands,
-        vec![],
-        0,
-    );
+    let op_info = if bf16 {
+        MmaM16N16K16F32Bf16Op::get_concrete_op_info()
+    } else {
+        MmaM16N16K16F32F16Op::get_concrete_op_info()
+    };
+    let mma_op = Operation::new(ctx, op_info, vec![f32_ty.into(); 4], operands, vec![], 0);
     mma_op.deref_mut(ctx).set_loc(loc.clone());
     mma_op.insert_after(ctx, last_op);
 
@@ -220,7 +274,109 @@ pub fn emit_mma_m16n16k16_f32_f16(
         value_map,
         block_map,
         loc,
-        "mma_m16n16k16_f32_f16 call without target block",
+        "m16n16k16 f32 MMA call without target block",
+    )
+}
+
+pub fn emit_mma_m16n16k16_i32_i8(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 3 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "mma_m16n16k16_i32_i8 expects 3 arguments (c, a, b), got {}",
+                args.len()
+            ))
+        );
+    }
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signed);
+    let (c_array, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (mut operands, last_op) = extract_array_registers(
+        ctx,
+        c_array,
+        i32_ty.into(),
+        4,
+        block_ptr,
+        last_op,
+        loc.clone(),
+        "C",
+    )?;
+    let (a, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        Some(last_op),
+        loc.clone(),
+    )?;
+    operands.push(a);
+    let last_op = last_op.expect("translated A operand must produce an operation");
+    let (b, last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[2],
+        value_map,
+        block_ptr,
+        Some(last_op),
+        loc.clone(),
+    )?;
+    operands.push(b);
+    let last_op = last_op.expect("translated B operand must produce an operation");
+    let mma_op = Operation::new(
+        ctx,
+        MmaM16N16K16I32I8Op::get_concrete_op_info(),
+        vec![i32_ty.into(); 4],
+        operands,
+        vec![],
+        0,
+    );
+    mma_op.deref_mut(ctx).set_loc(loc.clone());
+    mma_op.insert_after(ctx, last_op);
+    let results = (0..4)
+        .map(|index| mma_op.deref(ctx).get_result(index))
+        .collect();
+    let array_ty = MirArrayType::get(ctx, i32_ty.into(), 4);
+    let array = Operation::new(
+        ctx,
+        MirConstructArrayOp::get_concrete_op_info(),
+        vec![array_ty.into()],
+        results,
+        vec![],
+        0,
+    );
+    array.deref_mut(ctx).set_loc(loc.clone());
+    array.insert_after(ctx, mma_op);
+    let result = array.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        array,
+        value_map,
+        block_map,
+        loc,
+        "mma_m16n16k16_i32_i8 call without target block",
     )
 }
 

@@ -48,6 +48,24 @@ pub unsafe fn mma_m16n16k16_f32_f16(c: [f32; 4], a: [u32; 2], b: [u32; 2]) -> [f
     unreachable!("mma_m16n16k16_f32_f16 called outside MACA kernel context")
 }
 
+/// C500 Wave64 16x16x16 BF16 MMA with four f32 accumulators per lane.
+/// Each `u32` packs two BF16 bit patterns, low half first.
+#[inline(never)]
+#[must_use]
+pub unsafe fn mma_m16n16k16_f32_bf16(c: [f32; 4], a: [u32; 2], b: [u32; 2]) -> [f32; 4] {
+    let _ = (c, a, b);
+    unreachable!("mma_m16n16k16_f32_bf16 called outside MACA kernel context")
+}
+
+/// C500 Wave64 16x16x16 signed INT8 MMA with i32 accumulators.
+/// Each multiplicand register packs four two's-complement i8 values.
+#[inline(never)]
+#[must_use]
+pub unsafe fn mma_m16n16k16_i32_i8(c: [i32; 4], a: u32, b: u32) -> [i32; 4] {
+    let _ = (c, a, b);
+    unreachable!("mma_m16n16k16_i32_i8 called outside MACA kernel context")
+}
+
 /// Transpose an 8×8 matrix of b16 elements in-register across the warp.
 ///
 /// Each lane provides one `u32` that packs two b16 elements of the source

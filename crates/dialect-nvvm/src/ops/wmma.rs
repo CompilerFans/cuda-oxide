@@ -267,6 +267,34 @@ impl MmaM16N16K16F32F16Op {
     }
 }
 
+#[pliron_op(
+    name = "nvvm.mma_m16n16k16_f32_bf16",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<8>, NResultsInterface<4>],
+)]
+pub struct MmaM16N16K16F32Bf16Op;
+
+impl MmaM16N16K16F32Bf16Op {
+    pub fn new(op: Ptr<Operation>) -> Self {
+        Self { op }
+    }
+}
+
+#[pliron_op(
+    name = "nvvm.mma_m16n16k16_i32_i8",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<6>, NResultsInterface<4>],
+)]
+pub struct MmaM16N16K16I32I8Op;
+
+impl MmaM16N16K16I32I8Op {
+    pub fn new(op: Ptr<Operation>) -> Self {
+        Self { op }
+    }
+}
+
 /// Register-only warp MMA: m16n8k8 with f32 accumulator and tf32 inputs.
 ///
 /// # Operands
@@ -507,6 +535,8 @@ pub(super) fn register(ctx: &mut Context) {
     MmaM16N8K16F32Bf16Op::register(ctx);
     MmaM16N8K16F32F16Op::register(ctx);
     MmaM16N16K16F32F16Op::register(ctx);
+    MmaM16N16K16F32Bf16Op::register(ctx);
+    MmaM16N16K16I32I8Op::register(ctx);
     MmaM16N8K8F32Tf32Op::register(ctx);
     MmaM16N8K32S32S8Op::register(ctx);
     MmaM8N8K4F64Op::register(ctx);
