@@ -72,6 +72,7 @@ cuda-oxide 是一个 Rust GPU 编译器，将 `#[kernel]` 标注的 Rust 函数�
 | GPU | MetaX C500 × 4 |
 | GPU 内存 | 65536 MiB |
 | 实测带宽 | 1454.4 GB/s（Oxide FP32 VecAdd 有效带宽） |
+| Oxide FP16 GEMM 基线 | 3.460 TFLOP/s（1024³，2x2 tiles/wave，无 shared-memory pipeline） |
 
 ### 2.2 软件
 
@@ -219,7 +220,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 | 任务 | 说明 | 阻塞因素 |
 |---|---|---|
-| GEMM 示例 | 基于原生 m16n16k16 MMA 形成多 tile 端到端矩阵乘 | 需要确定装载、分块和性能基线 |
+| GEMM 性能优化 | 当前 2x2 tiles/wave、1024³ 为 3.460 TFLOP/s | 待增加 shared-memory pipeline 并对比 mcBLAS |
 
 已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin`
 产物闭环、Inline PTX/MMA fail-closed、Wave64 shuffle/vote/match/redux 与 C500 primitives smoke。
@@ -323,6 +324,9 @@ cargo oxide run maca_primitives_smoke --target maca
 
 # 运行 C500 Wave64 原生 m16n16k16 FP16/BF16/INT8 MMA 真机 smoke
 cargo oxide run maca_mma_smoke --target maca
+
+# 运行 1024^3 FP16 tiled GEMM 正确性与性能基线
+cargo oxide run maca_gemm --target maca
 ```
 
 ### 6.2 测试命令
@@ -426,13 +430,14 @@ cargo oxide doctor
 | `feat(maca): support Wave64 match and redux collectives` | C500 match any/all 与全部整数 redux，含稀疏 mask |
 | `feat(maca): add native Wave64 FP16 MMA` | C500 m16n16k16 f32/f16 intrinsic 与 16x16 数值 smoke |
 | `feat(maca): complete native Wave64 MMA variants` | C500 m16n16k16 BF16/INT8 intrinsic 与数值 smoke |
+| `feat(examples): add C500 native MMA GEMM baseline` | 2x2 tiles/wave FP16 GEMM，identity/checkerboard 正确性与性能 |
 
 ---
 
 ## 9. 下一步建议
 
-1. **GEMM 示例** — 基于已验证的 Wave64 MMA 进入端到端矩阵乘
-2. **性能基线** — 与 MXMACA C++/库实现同口径比较
+1. **GEMM pipeline** — 用 shared memory 复用跨 wave 的 A/B tile，并增加双缓冲
+2. **性能对比** — 与 mcBLAS/MXMACA C++ 实现同口径比较
 
 ---
 
