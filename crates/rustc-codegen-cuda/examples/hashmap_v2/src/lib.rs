@@ -769,10 +769,14 @@ pub mod kernels {
     ) {
         let lane = warp::lane_id();
         let global_tid = thread::index_1d().get();
-        let warp_idx = global_tid / PROBE_TILE;
+        let wave_size = cuda_device::WAVE_SIZE as usize;
+        let warp_idx = global_tid / wave_size;
         if warp_idx >= keys.len() {
             return;
         }
+        // On MXMACA (WAVE_SIZE=64), only lanes 0-31 participate in the ballot.
+        // Lanes >= PROBE_TILE must not contribute to the ballot mask.
+        let lane_active = lane < PROBE_TILE as u32;
 
         let key = keys[warp_idx];
         let hash = hash_u32(key);
@@ -783,18 +787,27 @@ pub mod kernels {
 
         loop {
             // Each lane owns exactly one tag byte at (probe_base + lane).
-            let tag_pos = probe_base + (lane as usize);
+            // On MXMACA (WAVE_SIZE=64), lanes >= PROBE_TILE read out of bounds;
+            // clamp them to lane 0 so they don't affect the ballot.
+            let effective_lane = if lane_active { lane } else { 0 };
+            let tag_pos = probe_base + (effective_lane as usize);
             let ctrl_word_idx = tag_pos / GROUP;
             let byte_in_word = tag_pos % GROUP;
             let word = ctrl[ctrl_word_idx].load(AtomicOrdering::Acquire);
             let tag: u8 = ((word >> (8 * byte_in_word)) & 0xFF) as u8;
 
-            let mut m_h2 = warp::ballot(tag == h2);
-            let m_empty = warp::ballot(tag == EMPTY_TAG);
+            // Mask out inactive lanes from the ballot
+            let tag_for_ballot = if lane_active { tag } else { EMPTY_TAG };
+            let mut m_h2 = warp::ballot(tag_for_ballot == h2);
+            let m_empty = warp::ballot(tag_for_ballot == EMPTY_TAG);
 
             // Walk h2 candidates lowest-bit-first.
+            // Only consider candidates within PROBE_TILE range.
             while m_h2 != 0 {
                 let cand = m_h2.trailing_zeros();
+                if cand >= PROBE_TILE as u32 {
+                    break;
+                }
                 // Only the candidate lane materializes the slot; others feed
                 // a dummy value into shuffle. The shuffle's source is `cand`
                 // so all lanes converge on the candidate's slot value.
@@ -824,7 +837,7 @@ pub mod kernels {
                 m_h2 &= m_h2 - 1;
             }
 
-            if m_empty != 0 {
+            if m_empty != 0 && (m_empty & ((1u64 << PROBE_TILE) - 1)) != 0 {
                 if lane == 0 {
                     // SAFETY: same uniqueness argument as above.
                     unsafe {
@@ -1365,6 +1378,11 @@ impl GpuSwissMap {
     ///
     /// Requires `capacity >= PROBE_TILE = 32`, which holds for any
     /// power-of-two capacity at or above 32.
+    ///
+    /// On MXMACA, the launch uses `WAVE_SIZE` (64) threads per key so
+    /// each key is handled by exactly one wave. The probe logic still uses
+    /// 32 tag bytes per probe step (PROBE_TILE), but the kernel masks out
+    /// lanes >= PROBE_TILE in the ballot.
     pub fn find_bulk_warp(
         &self,
         keys: &[u32],
@@ -1382,9 +1400,12 @@ impl GpuSwissMap {
         let keys_dev = DeviceBuffer::from_host(stream, keys)?;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(stream, keys.len())?;
 
-        // One warp per key: launch (keys.len() * 32) threads, block size
-        // 256 means 8 warps per block, 8 keys per block.
-        let total_threads = (keys.len() as u32).saturating_mul(PROBE_TILE as u32);
+        // One warp per key: launch (keys.len() * WAVE_SIZE) threads.
+        // On CUDA (WAVE_SIZE=32) this matches the 32-lane probe tile.
+        // On MXMACA (WAVE_SIZE=64) each key is handled by one wave,
+        // with lanes 0-31 participating in the ballot.
+        let wave_size = cuda_device::WAVE_SIZE;
+        let total_threads = (keys.len() as u32).saturating_mul(wave_size);
         let cfg = LaunchConfig::for_num_elems(total_threads);
         // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
         unsafe {
