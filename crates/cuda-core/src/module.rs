@@ -122,7 +122,11 @@ impl CudaContext {
     /// Loads a module from a cubin or PTX file on disk.
     ///
     /// `filename` is the filesystem path. The driver selects the loader based
-    /// on file contents (PTX text or cubin ELF).
+    /// on file contents (PTX text or cubin ELF). On MXMACA, `.devbin` files
+    /// are also accepted.
+    ///
+    /// If the file has a `.ptx` extension and the MXMACA backend is active,
+    /// the loader also tries the corresponding `.devbin` file.
     ///
     /// # Panics
     ///
@@ -132,7 +136,22 @@ impl CudaContext {
         filename: &str,
     ) -> Result<Arc<CudaModule>, DriverError> {
         self.bind_to_thread()?;
-        let c_str = CString::new(filename).unwrap();
+
+        // On MXMACA, try .devbin if .ptx is requested
+        let actual_filename = if filename.ends_with(".ptx")
+            && cuda_bindings::CUDA_DRIVER_BACKEND == cuda_bindings::CudaDriverBackend::MacaCuBridge
+        {
+            let devbin = filename.replace(".ptx", ".devbin");
+            if std::path::Path::new(&devbin).exists() {
+                devbin
+            } else {
+                filename.to_string()
+            }
+        } else {
+            filename.to_string()
+        };
+
+        let c_str = CString::new(actual_filename).unwrap();
         let mut cu_module = MaybeUninit::uninit();
         let cu_module = unsafe {
             cuda_bindings::cuModuleLoad(cu_module.as_mut_ptr(), c_str.as_ptr()).result()?;
