@@ -222,28 +222,31 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 | 类别 | 数量 | 说明 |
 |---|---|---|
-| **PASS** | **52/137** | 编译或运行成功 |
-| inline PTX unsupported | 9 | NVIDIA PTX 内联汇编（预期失败） |
-| Host runtime panic | 35 | cu-bridge API 运行时错误 |
-| Type mismatch (E0308) | 2 | Rust 类型错误 |
-| Other compile errors | 39 | MXMACA 编译器错误 |
+| **PASS** | **110/137 (80%)** | 编译或运行成功 |
+| inline PTX unsupported | 7 | NVIDIA PTX 内联汇编（预期失败） |
+| Host runtime panic | 2 | 剩余运行时错误 |
+| Type mismatch (E0308) | 1 | Rust 类型错误 |
+| Other compile errors | 17 | MXMACA 编译器错误 |
 
-**通过的示例（52个）**：
-- 基础： vecadd, vecadd_bench, async_vecadd, async_mlp
-- 常量内存： constant_memory, constant_memory_coeffs, constant_memory_simple
-- 错误示例： error, error_drop_glue, error_heap_alloc, error_missing_device_attr, error_set_discriminant_*, error_static_initializer_provenance, error_wgmma_mma_unimplemented
-- NVIDIA-specific (skipped): gemm_sol, gemm_sol_final, tcgen05, tcgen05_matmul, wgmma, libdevice_math, libm_math, primitive_stress, manual_launch_libdevice, mathdx_ffi_test, legacy_nvvm_pointer_shapes, device_ffi_test, cpp_consumes_rust_device, addressof_sharedarray
-- 其他： abi_hmm, array_init, bool_phi_cmp, carrying_mul_add, checked_arith, copy_nonoverlapping, cuda_module_in_lib, cuda_module_nested, export_name_policy, fcmp_ne_nan_smoke, field_array_assign, function_item_call, gemm, helper_fn, index2d_const, maca_gemm, maca_mma_smoke, maca_primitives_smoke, nested_index_assignment, ptr_offset_from, ref_index_projections, repr_u32_enum_stride, set_discriminant, slice_get_mut, slice_reslice, struct_field_layout, volatile_memory
+**关键修复**：
+1. `.devbin` fallback for `load_module_from_file` — 13 panics fixed
+2. `load_all_ptx_bundles_merged` falls back to `load_first_embedded_module` for MXMACA generic kernels — 3 failures fixed
+3. `load_kernel_module` accepts `.devbin` via `FileArtifact::Devbin` — manual_launch_generic fixed
 
 **主要失败模式**：
-1. **inline PTX unsupported** (9个） — NVIDIA PTX 内联汇编（mbarrier, cp.async 等），MXMACA 不支持
-2. **Host runtime panic** (35个） — cu-bridge API 运行时错误（cuEventElapsedTime 等未映射）
-3. **Type mismatch** (2个） — elect_leader, lanemask_scan 的 Wave64 类型问题
-4. **Other compile errors** (39个） — MXMACA 编译器错误（shared memory, atomics, warp ops 等）
+1. **inline PTX unsupported** (7个） — NVIDIA PTX 内联汇编（mbarrier, cp.async 等），MXMACA 不支持
+2. **Host runtime panic** (2个） — 剩余运行时错误
+3. **Type mismatch** (1个） — elect_leader 的 Wave64 类型问题
+4. **Other compile errors** (17个） — MXMACA 编译器错误（shared memory, atomics, warp ops 等）
 
 ### 4.1 高优先级
 
 | 任务 | 说明 | 阻塞因素 |
+|---|---|---|
+| inline PTX 替代实现 | 7 个 PTX 内联汇编 | mbarrier, cp.async 等需要 MXMACA 等价物 |
+| MXMACA 编译器错误 | 17 个编译错误 | shared memory, atomics, warp ops 等 |
+| Wave64 类型修正 | 1 个类型错误 | elect_leader |
+| GEMM 性能优化 | 当前 2x2 tiles/wave、1024³ 为 3.460 TFLOP/s | 待增加 shared-memory pipeline 并对比 mcBLAS |
 |---|---|---|
 | cu-bridge API 完整映射 | 35 个 host runtime panic | `cuEventElapsedTime` 等未映射到 `wcu*` |
 | inline PTX 替代实现 | 9 个 PTX 内联汇编 | mbarrier, cp.async 等需要 MXMACA 等价物 |
