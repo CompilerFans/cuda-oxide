@@ -1,0 +1,426 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1784434200865,
+  "projectRoot": "/home/compiler_gfx/project/cuda-oxide",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu\nexport CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge\nexport BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\"\ncargo build -p cuda-host 2>&1 | tail -10",
+    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu\nexport CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge\nexport BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\"\ncargo test -p cuda-host --lib 2>&1 | tail -15",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "assets",
+      "docs",
+      "examples",
+      "scripts"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "assets": {
+      "path": "assets",
+      "purpose": "Static assets",
+      "fileCount": 1,
+      "lastAccessed": 1784434200862,
+      "keyFiles": [
+        "logo.png"
+      ]
+    },
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1784434200862,
+      "keyFiles": []
+    },
+    "cuda-oxide-book": {
+      "path": "cuda-oxide-book",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1784434200862,
+      "keyFiles": [
+        "Makefile",
+        "README.md",
+        "conf.py",
+        "index.md",
+        "requirements.txt"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 2,
+      "lastAccessed": 1784434200863,
+      "keyFiles": [
+        "maca-migration-handoff.md",
+        "maca-migration-tracker.md"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 0,
+      "lastAccessed": 1784434200863,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 3,
+      "lastAccessed": 1784434200863,
+      "keyFiles": [
+        "check-error-example-status.sh",
+        "debug-smoketest.sh",
+        "smoketest.sh"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1784434200863,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    },
+    "target/tests": {
+      "path": "target/tests",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1784434200865,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "crates/cuda-oxide-codegen/src/pipeline.rs",
+      "accessCount": 15,
+      "lastAccessed": 1784218580256,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-macros/src/lib.rs",
+      "accessCount": 9,
+      "lastAccessed": 1784441213406,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-host/src/ltoir.rs",
+      "accessCount": 9,
+      "lastAccessed": 1784441832742,
+      "type": "file"
+    },
+    {
+      "path": "crates/llvm-export/src/export/config.rs",
+      "accessCount": 8,
+      "lastAccessed": 1784217487238,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-bindings/src/lib.rs",
+      "accessCount": 8,
+      "lastAccessed": 1784436869225,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-bindings/Cargo.toml",
+      "accessCount": 7,
+      "lastAccessed": 1784256208106,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-host/src/embedded.rs",
+      "accessCount": 6,
+      "lastAccessed": 1784441250427,
+      "type": "file"
+    },
+    {
+      "path": "crates/llvm-export/src/export/module.rs",
+      "accessCount": 5,
+      "lastAccessed": 1784217495622,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/lib.rs",
+      "accessCount": 4,
+      "lastAccessed": 1784218990490,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/warp.rs",
+      "accessCount": 4,
+      "lastAccessed": 1784218999232,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/module.rs",
+      "accessCount": 4,
+      "lastAccessed": 1784437592760,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/cooperative_groups.rs",
+      "accessCount": 3,
+      "lastAccessed": 1784219014556,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-host/src/launch.rs",
+      "accessCount": 3,
+      "lastAccessed": 1784222863465,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 2,
+      "lastAccessed": 1784216377239,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216380334,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/shared.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216391015,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/thread.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216391185,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-oxide-codegen/src/target.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216402002,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/ptx.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216419846,
+      "type": "file"
+    },
+    {
+      "path": "crates/reserved-oxide-symbols/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784216426745,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1784222871910,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/embedded.rs",
+      "accessCount": 2,
+      "lastAccessed": 1784437201976,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/barrier.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216161195,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/cluster.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216161234,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/tma.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216161285,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-host/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1784216162972,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-bindings/wrapper.h",
+      "accessCount": 1,
+      "lastAccessed": 1784216162976,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1784216162981,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-host/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216162999,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216163028,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/context.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168899,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/memory.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168914,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/vmm.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168921,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/event.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168926,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/error.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168930,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/stream.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216168978,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/device_buffer.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216169031,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/tcgen05.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216174624,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-oxide-codegen/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216174998,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-oxide-codegen/src/ptx.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216175020,
+      "type": "file"
+    },
+    {
+      "path": "crates/nvjitlink-sys/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216175071,
+      "type": "file"
+    },
+    {
+      "path": "crates/libnvvm-sys/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216175077,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/device_context.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179472,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/peer.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179478,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/device_future.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179491,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/launch.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179525,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/pinned_host_buffer.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179579,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-core/src/launch.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216179596,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/device_box.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216190330,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-async/src/reclaim.rs",
+      "accessCount": 1,
+      "lastAccessed": 1784216190333,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
