@@ -916,6 +916,7 @@ pub fn load_kernel_module(
     let ptx = dir.join(format!("{name}.ptx"));
     let ll = dir.join(format!("{name}.ll"));
     let ltoir = dir.join(format!("{name}.ltoir"));
+    let devbin = dir.join(format!("{name}.devbin"));
 
     let has_recorded_nvvm_target =
         emitted_target_path(&ll)
@@ -930,6 +931,7 @@ pub fn load_kernel_module(
         ltoir.exists(),
         cubin.exists(),
         has_recorded_nvvm_target,
+        devbin.exists(),
     )
     .ok_or_else(|| LtoirError::NoArtifact {
         name: name.to_string(),
@@ -937,6 +939,10 @@ pub fn load_kernel_module(
     })?;
 
     match selected {
+        FileArtifact::Devbin => Ok(ctx.load_module_from_file(
+            devbin.to_str()
+                .expect("kernel artifact path is not valid UTF-8"),
+        )?),
         FileArtifact::Ptx => Ok(ctx.load_module_from_file(
             ptx.to_str()
                 .expect("kernel artifact path is not valid UTF-8"),
@@ -1001,17 +1007,24 @@ enum FileArtifact {
     NvvmIr,
     Ltoir,
     Cubin,
+    Devbin,
 }
 
 /// Select one file artifact. A `.target` file identifies NVVM IR/LTOIR as the
-/// current output; without one, PTX takes precedence.
+/// current output; without one, PTX takes precedence. On MXMACA, `.devbin`
+/// takes precedence over all other artifacts.
 fn select_file_artifact(
     has_ptx: bool,
     has_nvvm_ir: bool,
     has_ltoir: bool,
     has_cubin: bool,
     has_recorded_nvvm_target: bool,
+    has_devbin: bool,
 ) -> Option<FileArtifact> {
+    // MXMACA: prefer .devbin
+    if has_devbin {
+        return Some(FileArtifact::Devbin);
+    }
     if has_recorded_nvvm_target {
         if has_nvvm_ir {
             return Some(FileArtifact::NvvmIr);
@@ -1407,15 +1420,15 @@ mod tests {
     #[test]
     fn recorded_nvvm_output_takes_precedence_over_stale_ptx() {
         assert_eq!(
-            select_file_artifact(true, true, false, true, true),
+            select_file_artifact(true, true, false, true, true, false),
             Some(FileArtifact::NvvmIr)
         );
         assert_eq!(
-            select_file_artifact(true, false, true, true, true),
+            select_file_artifact(true, false, true, true, true, false),
             Some(FileArtifact::Ltoir)
         );
         assert_eq!(
-            select_file_artifact(true, false, false, true, true),
+            select_file_artifact(true, false, false, true, true, false),
             None,
             "a missing NVVM artifact must not fall back to older output"
         );
@@ -1423,7 +1436,7 @@ mod tests {
         // In an ordinary PTX build there is also an LLVM `.ll`, but no NVVM
         // target sidecar. PTX is therefore the current loadable artifact.
         assert_eq!(
-            select_file_artifact(true, true, false, true, false),
+            select_file_artifact(true, true, false, true, false, false),
             Some(FileArtifact::Ptx)
         );
     }
@@ -1431,20 +1444,32 @@ mod tests {
     #[test]
     fn file_artifact_selection_accepts_older_unrecorded_nvvm_output() {
         assert_eq!(
-            select_file_artifact(false, true, false, true, false),
+            select_file_artifact(false, true, false, true, false, false),
             Some(FileArtifact::NvvmIr)
         );
         assert_eq!(
-            select_file_artifact(false, false, true, true, false),
+            select_file_artifact(false, false, true, true, false, false),
             Some(FileArtifact::Ltoir)
         );
         assert_eq!(
-            select_file_artifact(false, false, false, true, false),
+            select_file_artifact(false, false, false, true, false, false),
             Some(FileArtifact::Cubin)
         );
         assert_eq!(
-            select_file_artifact(false, false, false, false, false),
+            select_file_artifact(false, false, false, false, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn devbin_takes_precedence_on_maca() {
+        assert_eq!(
+            select_file_artifact(true, true, false, true, false, true),
+            Some(FileArtifact::Devbin)
+        );
+        assert_eq!(
+            select_file_artifact(false, false, false, false, false, true),
+            Some(FileArtifact::Devbin)
         );
     }
 

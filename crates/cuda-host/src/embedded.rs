@@ -76,9 +76,16 @@ pub fn load_embedded_module(
 ///
 /// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin, or MXMACA device
 /// binaries) are skipped; use `load_embedded_module` for those.
+///
+/// For MXMACA backend, this falls back to `load_embedded_module` since
+/// generic kernels also use `MacaDeviceBinary` payloads.
 pub fn load_all_ptx_bundles_merged(
     ctx: &Arc<CudaContext>,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+    if CUDA_DRIVER_BACKEND == CudaDriverBackend::MacaCuBridge {
+        // MXMACA: use load_embedded_module for generic kernels
+        return load_first_embedded_module(ctx);
+    }
     if CUDA_DRIVER_BACKEND != CudaDriverBackend::NativeCuda {
         return Err(EmbeddedModuleError::NoModules);
     }
