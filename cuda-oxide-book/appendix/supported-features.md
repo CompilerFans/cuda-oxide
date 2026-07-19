@@ -92,11 +92,37 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | PTX Output | **Full** | Default output: Rust MIR → `dialect-mir` → `mem2reg` → annotated loop unroll → LLVM dialect → LLVM IR → `llc` → PTX. Targets sm_80 through sm_100a. |
 | NVVM IR Output | **Full** | Selects LLVM 7 typed-pointer syntax for pre-Blackwell GPUs and opaque-pointer syntax for Blackwell and newer GPUs. The generated module is verified by libNVVM, and unsupported legacy operations produce a compile error. |
 | LTOIR Linking | **Full** | Device-side LTO via libNVVM and nvJitLink. |
+| MXMACA LLVM IR Output | **Partial** | MXMACA backend: Rust MIR → `dialect-mir` → LLVM dialect → LLVM IR (target `mxc-metax-macahca`) → `mxcc` → `.devbin`. Core intrinsics (threadIdx, blockIdx, barrier, fence, shuffle, ballot, lane_id) implemented. Inline PTX not supported. |
 | Float Math Intrinsics (libdevice) | **Full** | Rust `f32`/`f64` math methods (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...) lower to CUDA libdevice (`__nv_*`) on pre-Blackwell and Blackwell GPUs. cuda-oxide selects the matching NVVM IR syntax automatically. On Blackwell, the runtime can also JIT PTX produced from a standard pre-Blackwell target such as `sm_86`. |
+| MXMACA Math Intrinsics | **Partial** | Rust `f32`/`f64` math methods lower to MXMACA `mc_math_func_*` on MXMACA backend. f32: sin, cos, exp, pow, floor, abs, rint, min, max, sincos. f64: sin, cos, exp, pow, atan2, rint, min, max. sqrt inline-asm path not covered. |
 | Pipeline Inspection | **Full** | `cargo oxide pipeline <example>` shows imported and post-`mem2reg` MIR, LLVM dialect, exported LLVM IR, and PTX. |
 | Compute Sanitizer Wrapper | **Full** | `cargo oxide sanitize <example>` builds the example and runs the host binary under NVIDIA Compute Sanitizer (`memcheck`, `racecheck`, `initcheck`, or `synccheck`). |
 | cuda-gdb Source Debugging | **Full** | `cargo oxide debug` builds device debug information on the PTX path and launches `cuda-gdb`. Legacy NVVM IR does not yet support debug metadata. |
 | cuda-gdb Local / Argument Inspection | **Partial** | `CUDA_OXIDE_DEBUG=full` is a `-G`-style build (optimization off, locals kept in memory) so `info args`/`info locals` show real values for scalars, pointers/references, and structs/tuples/arrays with their fields. Enums, ABI-split bare slices, closures, and projections (`x.0`) are not yet described. |
+
+## Compiler: Backend Selection
+
+| Feature | Status | Description |
+|:--------|:-------|:------------|
+| `--target cuda` (default) | **Full** | Standard NVIDIA CUDA backend. Produces PTX via `llc`. |
+| `--target maca` | **Partial** | MetaX MXMACA backend. Produces MXMACA LLVM IR via `mxcc`. Core intrinsics implemented; some features not yet available (see below). |
+| `CUDA_OXIDE_BACKEND` env var | **Full** | Alternative to `--target` flag. Set to `maca` or `cuda`. |
+
+## MXMACA Backend Status
+
+| Feature | Status | Description |
+|:--------|:-------|:------------|
+| Thread indexing | **Full** | `threadIdx.x/y/z`, `blockIdx.x/y/z` via `llvm.mxc.thread.id.*`, `llvm.mxc.block.id.*` |
+| Block/Grid dimensions | **Full** | `blockDim`, `gridDim` via `llvm.mxc.dispatch.ptr()` indirect access |
+| Barrier | **Full** | `sync_threads()` via `llvm.mxc.barrier` |
+| Memory fence | **Full** | `threadfence_block`, `threadfence`, `threadfence_system` via LLVM fence instructions |
+| Lane ID | **Full** | `lane_id()` via `llvm.mxc.mbcnt.lo` + `llvm.mxc.mbcnt.hi` (64-bit wave) |
+| Shuffle | **Full** | `shuffle_sync` via `llvm.mxc.bsm.bpermute` |
+| Ballot | **Full** | `ballot_sync` via `llvm.mxc.fcmp.i64.f32` (64-bit mask) |
+| Inline PTX | **N/A** | MXMACA does not support inline PTX assembly |
+| MMA (Tensor Cores) | **Partial** | Backend check added; full mapping of `__builtin_mxc_mma_16x16x16f16/bf16/i8` not yet implemented |
+| Host runtime (cu-bridge) | **Partial** | `cu-bridge` provides `wcu*` wrappers for CUDA Driver API. Some functions (event elapsed time, etc.) not yet mapped. |
+| Wave=64 collectives | **Partial** | `WAVE_SIZE=64` constant added. Mask type still `u32` (needs `u64` for full Wave64 support). |
 
 ## Compiler: Inline PTX
 

@@ -57,6 +57,23 @@ classify() {
     echo standard
 }
 
+# When targeting MACA, NVIDIA-specific categories (tcgen05, wgmma, ltoir,
+# auto-nvvm) are hardware-gated away from the start: those features test
+# NVIDIA sm_90/sm_100 hardware or the libNVVM toolchain. Remap them to
+# `maca-skip` so the runner prints a clear skip verdict instead of a
+# misleading failure.
+maca_remap_category() {
+    local cat="$1"
+    if [[ "${TARGET_BACKEND}" == "maca" ]]; then
+        case "${cat}" in
+            tcgen05|wgmma|ltoir|auto-nvvm) echo "maca-skip" ;;
+            *) echo "${cat}" ;;
+        esac
+    else
+        echo "${cat}"
+    fi
+}
+
 verify_nvvm_in_compile_only() {
     local ex="$1" candidate
     for candidate in "${NVVM_VERIFY_EXAMPLES[@]}"; do
@@ -83,6 +100,8 @@ OPTIONS
                        `emit-ltoir` to include real libNVVM verification.
                        Non-error categories must leave a fresh artifact;
                        error examples must still fail. Works on GPU-less CI.
+  -t, --target BACKEND Target GPU backend: cuda (default) or maca. Passed to
+                       `cargo oxide run/build --target BACKEND`.
   -x, --fail-fast      Stop at the first failure.
   -v, --verbose        Stream cargo output live (instead of capturing to
                        a per-example log file). Verdict is printed at the
@@ -105,6 +124,7 @@ EXAMPLES
   scripts/smoketest.sh -s 'wgmma|tma'  # skip wgmma and tma examples
   scripts/smoketest.sh -x -v vecadd    # stop on first fail, stream output
   scripts/smoketest.sh --compile-only  # GPU-less compile gate (used by CI)
+  scripts/smoketest.sh -t maca vecadd  # run vecadd on MXMACA backend
 
 Per-example logs live under .smoketest-logs/ by default. Set
 SMOKETEST_LOG_DIR to override this path.
@@ -113,6 +133,7 @@ EOF
 
 ONLY=""
 SKIP=""
+TARGET_BACKEND=""
 FAIL_FAST=0
 VERBOSE=0
 KEEP_LOGS=0
@@ -125,6 +146,7 @@ while [[ $# -gt 0 ]]; do
         -o|--only)      [[ $# -lt 2 ]] && { echo "error: $1 requires a pattern" >&2; exit 2; }; ONLY="$2"; shift 2;;
         -s|--skip)      [[ $# -lt 2 ]] && { echo "error: $1 requires a pattern" >&2; exit 2; }; SKIP="$2"; shift 2;;
         -c|--compile-only) COMPILE_ONLY=1; shift;;
+        -t|--target)    [[ $# -lt 2 ]] && { echo "error: $1 requires a backend" >&2; exit 2; }; TARGET_BACKEND="$2"; shift 2;;
         -x|--fail-fast) FAIL_FAST=1; shift;;
         -v|--verbose)   VERBOSE=1; shift;;
         --keep-logs)    KEEP_LOGS=1; shift;;
@@ -135,6 +157,12 @@ while [[ $# -gt 0 ]]; do
         *)              POSITIONAL+=("$1"); shift;;
     esac
 done
+
+# Validate the target backend.
+case "${TARGET_BACKEND}" in
+    ""|cuda|maca) ;;
+    *) echo "error: unknown --target backend: ${TARGET_BACKEND} (expected cuda or maca)" >&2; exit 2;;
+esac
 
 # Bare positionals act as additive --only patterns joined with `|`.
 # Combine them with any explicit --only (OR, not replace) so that
@@ -468,6 +496,9 @@ run_cargo() {
     # use `build`.
     if [[ ${COMPILE_ONLY} -eq 1 ]] && verify_nvvm_in_compile_only "${ex}"; then
         local -a args=("emit-ltoir" "${ex}" "--arch=${LTOIR_ARCH}")
+        if [[ -n "${TARGET_BACKEND}" ]]; then
+            args+=("--target=${TARGET_BACKEND}")
+        fi
         if [[ ${VERBOSE} -eq 1 ]]; then
             cargo oxide "${args[@]}" 2>&1 | tee "${log}"
             CARGO_EC=${PIPESTATUS[0]}
@@ -483,6 +514,9 @@ run_cargo() {
     local -a args=("${verb}" "${ex}")
     if [[ "${cat}" == "ltoir" || ( "${cat}" == "auto-nvvm" && ${COMPILE_ONLY} -eq 1 ) ]]; then
         args+=("--emit-nvvm-ir" "--arch=${LTOIR_ARCH}")
+    fi
+    if [[ -n "${TARGET_BACKEND}" ]]; then
+        args+=("--target=${TARGET_BACKEND}")
     fi
     if [[ ${VERBOSE} -eq 1 ]]; then
         cargo oxide "${args[@]}" 2>&1 | tee "${log}"
@@ -534,7 +568,7 @@ i=0
 
 for ex in "${selected[@]}"; do
     i=$((i + 1))
-    cat="$(classify "${ex}")"
+    cat="$(maca_remap_category "$(classify "${ex}")")"
     log="${log_dir}/${ex}.log"
     : > "${log}"
 
@@ -545,11 +579,19 @@ for ex in "${selected[@]}"; do
     fi
 
     t0=${SECONDS}
-    run_cargo "${ex}" "${log}" "${cat}"
-    ec=${CARGO_EC}
+    if [[ "${cat}" == "maca-skip" ]]; then
+        verdict="PASS (skipped, NVIDIA-specific)"
+        status=0
+        ec=0
+    else
+        run_cargo "${ex}" "${log}" "${cat}"
+        ec=${CARGO_EC}
+    fi
     dt=$((SECONDS - t0))
 
-    if [[ ! -f "${log}" ]]; then
+    if [[ "${cat}" == "maca-skip" ]]; then
+        : # verdict already set above
+    elif [[ ! -f "${log}" ]]; then
         verdict="FAIL (log missing: ${log})"
         status=1
     elif [[ ${COMPILE_ONLY} -eq 1 && "${cat}" != "error" ]]; then

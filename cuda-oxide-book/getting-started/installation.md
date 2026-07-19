@@ -21,6 +21,62 @@ cuda-oxide currently targets **Linux only**. Windows is not supported.
 
 ---
 
+## MetaX GPU (MXMACA) Support
+
+cuda-oxide includes experimental support for MetaX GPUs via the MXMACA
+software stack. This backend compiles Rust kernels to MXMACA LLVM IR and
+links them with `mxcc`.
+
+### Prerequisites
+
+| Requirement      | Version             | Notes                                                         |
+|------------------|---------------------|---------------------------------------------------------------|
+| **MetaX GPU**    | C500 or later       | MetaX C500 series tested                                      |
+| **MXMACA SDK**   | 3.7.0+              | `mxcc` and `mc_runtime.h` must be available                   |
+| **cu-bridge**    | Included in SDK     | CUDA Driver API compatibility layer                           |
+| **libclang**     | 14+                 | Needed by `bindgen` for host bindings                         |
+| **Rust**         | Nightly (pinned)    | Pinned in `rust-toolchain.toml`                               |
+
+### Environment Setup
+
+```bash
+export MACA_PATH=/opt/maca
+export CUCC_PATH=$MACA_PATH/tools/cu-bridge
+export CUDA_PATH=$CUCC_PATH
+export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
+export CUDA_TOOLKIT_PATH=$CUCC_PATH
+export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include \
+    -I/opt/maca/include/mcr -I/opt/maca/include"
+```
+
+### Running Examples
+
+```bash
+# Build and run with MXMACA backend
+cargo oxide run vecadd --target maca
+
+# Run the full test suite
+scripts/smoketest.sh -t maca
+```
+
+### Key Differences from CUDA Backend
+
+| Feature | CUDA | MXMACA |
+|---------|------|--------|
+| Wave size | 32 threads | 64 threads |
+| Inline PTX | Supported | Not supported |
+| MMA shape | 16x8x16 | 16x16x16 |
+| Compiler | `llc` (NVPTX) | `mxcc` |
+| Target triple | `nvptx64-nvidia-cuda` | `mxc-metax-macahca` |
+
+### Current Limitations
+
+- Inline PTX assembly is not supported (use MXMACA builtins instead)
+- Some host runtime APIs (event elapsed time, etc.) are not yet mapped
+- MMA tensor core operations use different shapes (16x16x16 vs 16x8x16)
+
+---
+
 ## Dev Container
 
 The repository includes a standard devcontainer setup in `.devcontainer/`.
