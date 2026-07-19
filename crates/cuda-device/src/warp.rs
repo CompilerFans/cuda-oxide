@@ -904,7 +904,7 @@ pub fn redux_sync_xor(mask: WaveMask, value: u32) -> u32 {
 /// let base = warp::shuffle_sync(u32::MAX, base, leader);
 /// ```
 #[inline(never)]
-pub fn elect_sync(mask: u32) -> (u32, bool) {
+pub fn elect_sync(mask: crate::WaveMask) -> (u32, bool) {
     let _ = mask;
     unreachable!("elect_sync called outside CUDA kernel context")
 }
@@ -917,6 +917,8 @@ pub fn elect_sync(mask: u32) -> (u32, bool) {
 /// contract.
 ///
 /// # Example
+/// Convenience wrapper over [`elect_sync`] for the common "do this once per
+/// warp" pattern.
 ///
 /// ```rust,ignore
 /// if warp::is_elected_sync(u32::MAX) {
@@ -924,6 +926,6 @@ pub fn elect_sync(mask: u32) -> (u32, bool) {
 /// }
 /// ```
 #[inline(always)]
-pub fn is_elected_sync(mask: u32) -> bool {
+pub fn is_elected_sync(mask: crate::WaveMask) -> bool {
     elect_sync(mask).1
 }

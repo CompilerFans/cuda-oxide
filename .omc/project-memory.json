@@ -18,7 +18,7 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu\nexport CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge\nexport BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\"\ncargo build -p cuda-host 2>&1 | tail -10",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p mir-lower 2>&1 | tail -5",
     "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu\nexport CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge\nexport BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\"\ncargo test -p cuda-host --lib 2>&1 | tail -15",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
@@ -152,6 +152,12 @@
       "type": "file"
     },
     {
+      "path": "crates/cuda-device/src/warp.rs",
+      "accessCount": 8,
+      "lastAccessed": 1784449770414,
+      "type": "file"
+    },
+    {
       "path": "crates/cuda-bindings/Cargo.toml",
       "accessCount": 7,
       "lastAccessed": 1784256208106,
@@ -173,12 +179,6 @@
       "path": "crates/cuda-device/src/lib.rs",
       "accessCount": 4,
       "lastAccessed": 1784218990490,
-      "type": "file"
-    },
-    {
-      "path": "crates/cuda-device/src/warp.rs",
-      "accessCount": 4,
-      "lastAccessed": 1784218999232,
       "type": "file"
     },
     {

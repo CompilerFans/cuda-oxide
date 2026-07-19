@@ -988,6 +988,11 @@ pub(crate) fn convert_elect_sync(
     op: Ptr<Operation>,
     _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    let opts = lowering_options(ctx);
+    if opts.backend == crate::BackendTarget::Maca {
+        return convert_elect_sync_maca(ctx, rewriter, op);
+    }
+
     use llvm_export::ops::ExtractValueOp;
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
@@ -1027,6 +1032,48 @@ pub(crate) fn convert_elect_sync(
         extract_op.get_operation().deref(ctx).get_result(0)
     };
     let is_elected = trunc_to_i1(ctx, rewriter, elected_i32);
+
+    rewriter.replace_operation_with_values(ctx, op, vec![leader, is_elected]);
+    Ok(())
+}
+
+/// Convert `elect.sync` for MXMACA using find-first-set on the mask.
+///
+/// MXMACA has no native `elect.sync` instruction, so we compute the
+/// elected leader as the lowest-numbered lane in the participant mask:
+/// `leader = cttz(mask)`. A lane is elected iff its lane id equals the
+/// leader. This matches `elect.sync` semantics for both full-wave and
+/// subset (partial mask) elections.
+fn convert_elect_sync_maca(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+) -> Result<()> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 1 {
+        return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
+    }
+    let mask = operands[0];
+
+    // Leader = index of the lowest set bit in the mask: cttz(mask).
+    let zero_undef = create_i1_const(ctx, rewriter, false);
+    let cttz_ty =
+        llvm_types::FuncType::get(ctx, i64_ty.into(), vec![i64_ty.into(), i1_ty.into()], false);
+    let leader_i64 = call_intrinsic(ctx, rewriter, op, "llvm_cttz_i64", cttz_ty, vec![mask, zero_undef])?;
+    let leader_i64 = leader_i64.deref(ctx).get_result(0);
+    let leader = llvm::TruncOp::new(ctx, leader_i64, i32_ty.into());
+    rewriter.insert_operation(ctx, leader.get_operation());
+    let leader = leader.get_operation().deref(ctx).get_result(0);
+
+    // is_elected = (lane_id == leader)
+    let lane_id = crate::convert::intrinsics::basic::emit_maca_lane_id(ctx, rewriter, op)?;
+    let is_elected = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::EQ, lane_id, leader);
+    rewriter.insert_operation(ctx, is_elected.get_operation());
+    let is_elected = is_elected.get_operation().deref(ctx).get_result(0);
 
     rewriter.replace_operation_with_values(ctx, op, vec![leader, is_elected]);
     Ok(())
