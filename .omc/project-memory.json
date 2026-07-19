@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p mir-lower 2>&1 | tail -5",
-    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu\nexport CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge\nexport BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\"\ncargo test -p cuda-host --lib 2>&1 | tail -15",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p mir-lower 2>&1 | grep -E \"^error\" -A6 | head -30; echo \"BUILD: ${PIPESTATUS[0]}\"",
+    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p mir-lower -p llvm-export -p cuda-oxide-codegen --lib 2>&1 | grep -E \"test result|passed|FAILED\" | head -6; rtk cargo clippy -p mir-lower -p llvm-export -p cuda-oxide-codegen 2>&1 | grep -cE \"^error\"",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
@@ -128,6 +128,18 @@
       "type": "file"
     },
     {
+      "path": "crates/llvm-export/src/export/config.rs",
+      "accessCount": 13,
+      "lastAccessed": 1784473843255,
+      "type": "file"
+    },
+    {
+      "path": "crates/llvm-export/src/export/module.rs",
+      "accessCount": 10,
+      "lastAccessed": 1784474049154,
+      "type": "file"
+    },
+    {
       "path": "crates/cuda-macros/src/lib.rs",
       "accessCount": 9,
       "lastAccessed": 1784441213406,
@@ -137,12 +149,6 @@
       "path": "crates/cuda-host/src/ltoir.rs",
       "accessCount": 9,
       "lastAccessed": 1784441832742,
-      "type": "file"
-    },
-    {
-      "path": "crates/llvm-export/src/export/config.rs",
-      "accessCount": 8,
-      "lastAccessed": 1784217487238,
       "type": "file"
     },
     {
@@ -167,12 +173,6 @@
       "path": "crates/cuda-host/src/embedded.rs",
       "accessCount": 6,
       "lastAccessed": 1784441250427,
-      "type": "file"
-    },
-    {
-      "path": "crates/llvm-export/src/export/module.rs",
-      "accessCount": 5,
-      "lastAccessed": 1784217495622,
       "type": "file"
     },
     {

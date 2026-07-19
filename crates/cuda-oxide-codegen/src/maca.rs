@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_MACA_TARGET: &str = "xcore1000";
+const MACA_TARGET_TRIPLE: &str = "mxc-metax-macahca";
 const ELF64_HEADER_SIZE: usize = 64;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
@@ -40,6 +41,38 @@ pub(crate) fn generate_maca_device_binary(
     }
     let target = resolve_maca_target(options.target_arch.as_deref())?;
     let mxcc = resolve_mxcc(options);
+
+    // The exported IR keeps every MIR local in an alloca. Without a
+    // middle-end run the frame easily exceeds the C500 4 KiB/thread private
+    // memory limit, so optimize first (mxcc's own clang at -O3). The
+    // `-forward-unknown-to-compiler --target=` pair keeps clang from
+    // overriding the module triple with the host triple.
+    let optimized_ir = llvm_ir_path.with_extension("opt.ll");
+    let mut opt_command = std::process::Command::new(&mxcc);
+    opt_command
+        .arg("-x")
+        .arg("ir")
+        .arg("-O3")
+        .arg("-S")
+        .arg("-emit-llvm")
+        .arg("-forward-unknown-to-compiler")
+        .arg(format!("--target={}", MACA_TARGET_TRIPLE))
+        .arg(llvm_ir_path)
+        .arg("-o")
+        .arg(&optimized_ir);
+    let opt_result = run_mxcc(&mut opt_command).map_err(|error| {
+        PipelineError::MacaGeneration(format!(
+            "failed to run {} optimizer for {}: {error}",
+            mxcc.display(),
+            llvm_ir_path.display()
+        ))
+    })?;
+    let effective_ir = if opt_result.status.success() && optimized_ir.exists() {
+        optimized_ir.as_path()
+    } else {
+        llvm_ir_path
+    };
+
     let mut command = std::process::Command::new(&mxcc);
     command
         .arg("-x")
@@ -47,7 +80,7 @@ pub(crate) fn generate_maca_device_binary(
         .arg("-input-is-device")
         .arg(format!("-offload-arch={target}"))
         .arg("-device-bin")
-        .arg(llvm_ir_path)
+        .arg(effective_ir)
         .arg("-o")
         .arg(output_path)
         .arg(if options.no_fma {

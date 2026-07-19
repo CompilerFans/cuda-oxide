@@ -371,6 +371,7 @@ pub(super) fn export_module_with_externs_impl(
         kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
+        config.alloca_address_space(),
     );
     index_module_symbols(&mut state, module)?;
     index_device_externs(&mut state, device_externs)?;
@@ -548,6 +549,7 @@ pub(super) fn export_module_to_string_with_config(
         kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
+        config.alloca_address_space(),
     );
     index_module_symbols(&mut state, module)?;
 

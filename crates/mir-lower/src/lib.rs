@@ -361,9 +361,100 @@ pub fn lower_mir_to_llvm_with_options(
     // lowering only cares about success, so discard it.
     apply_dialect_conversion(ctx, &mut conversion, module_op)?;
     if options.backend == BackendTarget::Maca {
+        hoist_allocas_to_entry_blocks(ctx, module_op);
         reject_maca_unsupported_ir(ctx, module_op)?;
     }
     Ok(())
+}
+
+/// Hoist static allocas into each function's entry block.
+///
+/// The C500 backend only promotes entry-block allocas to registers; an
+/// alloca left in a conditional branch becomes a fixed 4 KiB private-memory
+/// frame per thread, which exceeds the hardware's 4 KiB/thread limit
+/// (see `enum_array_match`, `union_aggregate`, `place_read_fallbacks`).
+/// Hoisting every alloca into the entry block is always dominance-safe
+/// (the entry block dominates the whole function) and matches the
+/// "one alloca per local in the entry block" model the exporter assumes.
+fn hoist_allocas_to_entry_blocks(ctx: &mut Context, module_op: Ptr<Operation>) {
+    // Collect function ops first; the hoist mutates block contents.
+    let mut funcs = Vec::new();
+    for region in module_op.deref(ctx).regions() {
+        for block in region.deref(ctx).iter(ctx) {
+            for op in block.deref(ctx).iter(ctx) {
+                if Operation::get_op::<llvm_export::ops::FuncOp>(op, ctx).is_some() {
+                    funcs.push(op);
+                }
+            }
+        }
+    }
+    for func in funcs {
+        hoist_allocas_in_func(ctx, func);
+    }
+}
+
+fn hoist_allocas_in_func(ctx: &mut Context, func_op: Ptr<Operation>) {
+    let Some(entry) = func_op
+        .deref(ctx)
+        .regions()
+        .next()
+        .and_then(|region| region.deref(ctx).iter(ctx).next())
+    else {
+        return;
+    };
+    let mut allocas = Vec::new();
+    for region in func_op.deref(ctx).regions() {
+        for block in region.deref(ctx).iter(ctx) {
+            if block == entry {
+                continue;
+            }
+            for op in block.deref(ctx).iter(ctx) {
+                if Operation::get_op::<llvm_export::ops::AllocaOp>(op, ctx).is_some() {
+                    allocas.push(op);
+                }
+            }
+        }
+    }
+    if allocas.is_empty() {
+        return;
+    }
+    let first = entry
+        .deref(ctx)
+        .iter(ctx)
+        .next()
+        .expect("entry block always has a terminator");
+    for alloca in allocas {
+        // Only hoist when every operand dominates the entry-block insertion
+        // point: block arguments, values defined in the entry block, or
+        // constants (which we hoist first). Anything else is a dynamic
+        // alloca over branch-computed sizes and stays where it is.
+        let operands: Vec<_> = alloca.deref(ctx).operands().collect();
+        let mut hoistable = true;
+        for opd in &operands {
+            if let Some(def) = opd.defining_op() {
+                let def_block = def.deref(ctx).get_parent_block();
+                if def_block != Some(entry)
+                    && Operation::get_op::<llvm_export::ops::ConstantOp>(def, ctx).is_none()
+                {
+                    hoistable = false;
+                    break;
+                }
+            }
+        }
+        if !hoistable {
+            continue;
+        }
+        for opd in &operands {
+            if let Some(def) = opd.defining_op()
+                && def.deref(ctx).get_parent_block() != Some(entry)
+            {
+                def.unlink(ctx);
+                def.insert_before(ctx, first);
+            }
+        }
+        alloca.unlink(ctx);
+        alloca.insert_before(ctx, first);
+    }
 }
 
 fn reject_maca_unsupported_ir(ctx: &Context, op: Ptr<Operation>) -> Result<()> {

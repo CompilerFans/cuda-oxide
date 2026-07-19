@@ -89,6 +89,10 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_kind: DebugKind,
     /// NVVM textual dialect, or `None` for the ordinary PTX/llc path.
     pub(super) nvvm_ir_dialect: Option<NvvmIrDialect>,
+    /// Address space in which `alloca` results are materialized (0 = generic).
+    /// Non-zero targets (MXMACA) emit `alloca ..., addrspace(N)` plus an
+    /// `addrspacecast` back to a generic pointer.
+    pub(super) alloca_address_space: u32,
     /// The single compile unit used for Stage 2 line-table debug info.
     pub(super) debug_compile_unit: Option<usize>,
     /// `DIFile` nodes keyed by the source path they describe.
@@ -137,6 +141,7 @@ impl<'a> ModuleExportState<'a> {
         kernel_calling_convention: KernelCallingConvention,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
+        alloca_address_space: u32,
     ) -> Self {
         Self {
             ctx,
@@ -155,6 +160,7 @@ impl<'a> ModuleExportState<'a> {
             next_metadata_id: 0,
             debug_kind,
             nvvm_ir_dialect,
+            alloca_address_space,
             debug_compile_unit: None,
             debug_files: FxHashMap::default(),
             debug_subroutine_type: None,

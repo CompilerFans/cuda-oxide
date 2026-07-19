@@ -59,7 +59,9 @@ use crate::helpers;
 use dialect_mir::attributes::MirCastKindAttr;
 use dialect_mir::ops::MirCastOp;
 use dialect_mir::types::{MirArrayType, MirPtrType};
-use llvm_export::op_interfaces::CastOpInterface;
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
 use llvm_export::ops as llvm;
 use llvm_export::types::FuncType;
 use pliron::builtin::op_interfaces::CallOpCallable;
@@ -860,6 +862,16 @@ fn emit_transmute_via_memory(
         );
     }
 
+    // C500 cannot promote a byte-punned alloca (stored as i8s, loaded as a
+    // wider type) back to registers; the frame becomes a 4 KiB private-memory
+    // allocation per thread, over the hardware limit. Assemble the transmute
+    // with shifts in registers instead.
+    if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca
+        && let Some(reg_op) = emit_transmute_via_registers(ctx, rewriter, val, val_ty, llvm_ty)?
+    {
+        return Ok(reg_op);
+    }
+
     // The slot must satisfy whichever side needs the stricter alignment.
     let align = abi_alignment_bytes(ctx, val_ty).max(abi_alignment_bytes(ctx, llvm_ty));
 
@@ -876,6 +888,191 @@ fn emit_transmute_via_memory(
     let load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
     llvm_export::ops::set_op_alignment(ctx, load.get_operation(), align);
     Ok(load.get_operation())
+}
+
+/// Register-only Transmute for byte arrays (`[u8; N]` ↔ scalar), used on
+/// the MXMACA backend where a byte-punned stack slot cannot be promoted.
+///
+/// - `[u8; N]` → `uN`/`iN`/`fN`: extractvalue each byte, zext, shift into
+///   place, `or` the lanes together, then `bitcast` for float destinations.
+/// - scalar → `[u8; N]`: `bitcast` float sources to the same-width integer,
+///   then lshr/trunc each byte out and `insertvalue` it.
+///
+/// Returns `None` when either side is not a byte array / same-width scalar
+/// pair, so the caller can fall back to the memory round-trip.
+fn emit_transmute_via_registers(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    val: pliron::value::Value,
+    val_ty: pliron::r#type::TypeHandle,
+    llvm_ty: pliron::r#type::TypeHandle,
+) -> Result<Option<Ptr<Operation>>> {
+    let is_i8 = |ty: pliron::r#type::TypeHandle| {
+        ty.deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|i| i.width() == 8)
+    };
+    let scalar_bits = |ty: pliron::r#type::TypeHandle| {
+        let r = ty.deref(ctx);
+        if let Some(i) = r.downcast_ref::<IntegerType>() {
+            return Some(i.width());
+        }
+        if let Some(f) = type_cast::<dyn FloatTypeInterface>(&*r) {
+            return Some(f.get_semantics().bits as u32);
+        }
+        None
+    };
+    let byte_array_len = |ty: pliron::r#type::TypeHandle| {
+        let r = ty.deref(ctx);
+        let a = r.downcast_ref::<llvm_export::types::ArrayType>()?;
+        if is_i8(a.elem_type()) {
+            Some(a.size())
+        } else {
+            None
+        }
+    };
+
+    let src_arr = byte_array_len(val_ty);
+    let dst_arr = byte_array_len(llvm_ty);
+    let src_scalar = scalar_bits(val_ty);
+    let dst_scalar = scalar_bits(llvm_ty);
+
+    match (src_arr, dst_scalar, dst_arr, src_scalar) {
+        // [u8; N] -> scalar of N*8 bits
+        (Some(n), Some(bits), _, _) if bits as u64 == n * 8 => {
+            let int_ty = IntegerType::get(ctx, bits, Signedness::Signless);
+            let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+            let _ = i8_ty;
+            let zero = {
+                let apint = pliron::utils::apint::APInt::from_i64(
+                    0,
+                    std::num::NonZeroUsize::new(bits as usize).unwrap(),
+                );
+                let attr = pliron::builtin::attributes::IntegerAttr::new(int_ty, apint);
+                let c = llvm::ConstantOp::new(ctx, attr.into());
+                rewriter.insert_operation(ctx, c.get_operation());
+                c.get_operation().deref(ctx).get_result(0)
+            };
+            let mut acc = zero;
+            let mut pending: Option<Ptr<Operation>> = None;
+            for i in 0..n {
+                let byte = llvm::ExtractValueOp::new(ctx, val, vec![i as u32])
+                    .map_err(|e| pliron::input_error_noloc!("transmute extractvalue: {e}"))?;
+                rewriter.insert_operation(ctx, byte.get_operation());
+                let byte = byte.get_operation().deref(ctx).get_result(0);
+                let wide = llvm::ZExtOp::new_with_nneg(ctx, byte, int_ty.into(), false);
+                let is_final_int_step = i == n - 1
+                    && n == 1
+                    && type_cast::<dyn FloatTypeInterface>(&*llvm_ty.deref(ctx)).is_none();
+                if is_final_int_step {
+                    // n == 1 integer destination: the zext is the final op;
+                    // returned un-inserted for the caller to insert.
+                    pending = Some(wide.get_operation());
+                    acc = wide.get_operation().deref(ctx).get_result(0);
+                    continue;
+                }
+                rewriter.insert_operation(ctx, wide.get_operation());
+                let wide = wide.get_operation().deref(ctx).get_result(0);
+                let mut shifted = wide;
+                if i > 0 {
+                    let amt = {
+                        let apint = pliron::utils::apint::APInt::from_i64(
+                            (i * 8) as i64,
+                            std::num::NonZeroUsize::new(bits as usize).unwrap(),
+                        );
+                        let attr = pliron::builtin::attributes::IntegerAttr::new(int_ty, apint);
+                        let c = llvm::ConstantOp::new(ctx, attr.into());
+                        rewriter.insert_operation(ctx, c.get_operation());
+                        c.get_operation().deref(ctx).get_result(0)
+                    };
+                    let shl = llvm::ShlOp::new_with_overflow_flag(
+                        ctx,
+                        wide,
+                        amt,
+                        llvm_export::attributes::IntegerOverflowFlagsAttr::default(),
+                    );
+                    rewriter.insert_operation(ctx, shl.get_operation());
+                    shifted = shl.get_operation().deref(ctx).get_result(0);
+                }
+                if i == 0 {
+                    acc = shifted;
+                } else {
+                    let or = llvm::OrOp::new(ctx, acc, shifted);
+                    if i == n - 1
+                        && type_cast::<dyn FloatTypeInterface>(&*llvm_ty.deref(ctx)).is_none()
+                    {
+                        // Last op of the chain: returned un-inserted; the
+                        // caller inserts it and rewires the cast's uses.
+                        pending = Some(or.get_operation());
+                        acc = or.get_operation().deref(ctx).get_result(0);
+                    } else {
+                        rewriter.insert_operation(ctx, or.get_operation());
+                        acc = or.get_operation().deref(ctx).get_result(0);
+                    }
+                }
+            }
+            // For float destinations, bitcast the assembled integer (also
+            // returned un-inserted).
+            if type_cast::<dyn FloatTypeInterface>(&*llvm_ty.deref(ctx)).is_some() {
+                let bc = llvm::BitcastOp::new(ctx, acc, llvm_ty);
+                return Ok(Some(bc.get_operation()));
+            }
+            Ok(Some(pending.expect("byte-array transmute always sets pending")))
+        }
+        // scalar of N*8 bits -> [u8; N]
+        (_, _, Some(n), Some(bits)) if bits as u64 == n * 8 => {
+            let int_ty = IntegerType::get(ctx, bits, Signedness::Signless);
+            let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+            // Float sources are bitcast to the same-width integer first.
+            let int_val = if type_cast::<dyn FloatTypeInterface>(&*val_ty.deref(ctx)).is_some() {
+                let bc = llvm::BitcastOp::new(ctx, val, int_ty.into());
+                rewriter.insert_operation(ctx, bc.get_operation());
+                bc.get_operation().deref(ctx).get_result(0)
+            } else {
+                val
+            };
+            let undef = llvm::UndefOp::new(ctx, llvm_ty);
+            rewriter.insert_operation(ctx, undef.get_operation());
+            let mut arr = undef.get_operation().deref(ctx).get_result(0);
+            let mut pending: Option<Ptr<Operation>> = None;
+            for i in 0..n {
+                let byte = if i == 0 {
+                    let tr = llvm::TruncOp::new(ctx, int_val, i8_ty.into());
+                    rewriter.insert_operation(ctx, tr.get_operation());
+                    tr.get_operation().deref(ctx).get_result(0)
+                } else {
+                    let amt = {
+                        let apint = pliron::utils::apint::APInt::from_i64(
+                            (i * 8) as i64,
+                            std::num::NonZeroUsize::new(bits as usize).unwrap(),
+                        );
+                        let attr = pliron::builtin::attributes::IntegerAttr::new(int_ty, apint);
+                        let c = llvm::ConstantOp::new(ctx, attr.into());
+                        rewriter.insert_operation(ctx, c.get_operation());
+                        c.get_operation().deref(ctx).get_result(0)
+                    };
+                    let shr = llvm::LShrOp::new(ctx, int_val, amt);
+                    rewriter.insert_operation(ctx, shr.get_operation());
+                    let shr = shr.get_operation().deref(ctx).get_result(0);
+                    let tr = llvm::TruncOp::new(ctx, shr, i8_ty.into());
+                    rewriter.insert_operation(ctx, tr.get_operation());
+                    tr.get_operation().deref(ctx).get_result(0)
+                };
+                let ins = llvm::InsertValueOp::new(ctx, arr, byte, vec![i as u32]);
+                if i == n - 1 {
+                    // Last op of the chain: returned un-inserted; the caller
+                    // inserts it and rewires the cast's uses.
+                    pending = Some(ins.get_operation());
+                    arr = ins.get_operation().deref(ctx).get_result(0);
+                } else {
+                    rewriter.insert_operation(ctx, ins.get_operation());
+                    arr = ins.get_operation().deref(ctx).get_result(0);
+                }
+            }
+            Ok(Some(pending.expect("byte-array transmute always sets pending")))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Total size in bytes of an LLVM-dialect type, for transmute size

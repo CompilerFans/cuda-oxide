@@ -792,6 +792,7 @@ mod tests {
             super::super::config::KernelCallingConvention::PtxKernel,
             super::super::config::DebugKind::LineTables,
             None,
+            0,
         );
 
         let (path, pos) = state

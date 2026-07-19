@@ -329,6 +329,10 @@ impl<C: ExportBackendConfig> ExportBackendConfig for PipelineExportConfig<C> {
         self.inner.nvvm_ir_dialect()
     }
 
+    fn alloca_address_space(&self) -> u32 {
+        self.inner.alloca_address_space()
+    }
+
     fn debug_kind(&self) -> DebugKind {
         self.debug_kind
     }

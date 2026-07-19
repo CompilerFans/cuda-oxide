@@ -719,7 +719,8 @@ impl<'a> ModuleExportState<'a> {
             ));
         }
         let needs_normalization = self.legacy_typed_pointers() && !self.is_i8_type(elem_llvm_ty);
-        let alloca_name = if needs_normalization {
+        let alloca_as = self.alloca_address_space;
+        let alloca_name = if needs_normalization || alloca_as != 0 {
             Self::fresh_value_name(next_value_id)
         } else {
             res_name.clone()
@@ -736,9 +737,26 @@ impl<'a> ModuleExportState<'a> {
         }
         let align = crate::ops::op_alignment(self.ctx, op.get_operation())
             .unwrap_or_else(|| self.natural_alignment(elem_llvm_ty));
-        writeln!(output, ", align {align}").unwrap();
+        write!(output, ", align {align}").unwrap();
+        if alloca_as != 0 {
+            // MXMACA-style targets: the frame lives in a private address
+            // space; the generic-pointer result is recovered with an
+            // addrspacecast (mirrors the target's own clang output).
+            write!(output, ", addrspace({alloca_as})").unwrap();
+        }
+        writeln!(output).unwrap();
 
-        if needs_normalization {
+        if alloca_as != 0 {
+            write!(output, "  {res_name} = addrspacecast ").unwrap();
+            if self.legacy_typed_pointers() {
+                self.export_pointer_to(elem_llvm_ty, alloca_as, output)?;
+                write!(output, " {alloca_name} to ").unwrap();
+                self.export_canonical_pointer_type(0, output);
+            } else {
+                write!(output, "ptr addrspace({alloca_as}) {alloca_name} to ptr").unwrap();
+            }
+            writeln!(output).unwrap();
+        } else if needs_normalization {
             write!(output, "  {res_name} = bitcast ").unwrap();
             self.export_pointer_to(elem_llvm_ty, 0, output)?;
             write!(output, " {alloca_name} to ").unwrap();

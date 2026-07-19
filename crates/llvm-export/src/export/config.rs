@@ -122,6 +122,17 @@ pub trait ExportBackendConfig {
         None
     }
 
+    /// Address space in which `alloca` results are materialized.
+    ///
+    /// Most targets use the generic address space (0) directly. Targets whose
+    /// backend cannot select a frame index in the generic space (e.g. MXMACA,
+    /// where local memory lives in address space 5) place allocas in a
+    /// private space and `addrspacecast` the result back to a generic pointer,
+    /// mirroring what the target's own clang emits.
+    fn alloca_address_space(&self) -> u32 {
+        0
+    }
+
     /// Which device debug metadata tier to emit.
     fn debug_kind(&self) -> DebugKind {
         DebugKind::Off
@@ -288,5 +299,12 @@ impl ExportBackendConfig for MacaExportConfig {
 
     fn kernel_calling_convention(&self) -> KernelCallingConvention {
         KernelCallingConvention::MetaxGpuKernel
+    }
+
+    /// MXMACA local memory lives in address space 5; the backend cannot
+    /// select a frame index in the generic address space (matches the
+    /// `alloca ..., addrspace(5)` emitted by MetaX clang).
+    fn alloca_address_space(&self) -> u32 {
+        5
     }
 }
