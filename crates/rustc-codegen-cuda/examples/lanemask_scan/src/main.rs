@@ -5,9 +5,10 @@
 
 //! Lane-position masks (`%lanemask_lt`/`le`/`eq`/`ge`/`gt`) and warp prefix sums.
 //!
-//! These five read-only special registers return a 32-bit mask describing the
-//! calling lane's position within its warp. Their headline use is the warp-level
-//! exclusive prefix sum that powers stream compaction:
+//! These five read-only special registers return a mask describing the calling
+//! lane's position within its warp (32 lanes on NVIDIA, 64 on MetaX C500 —
+//! the mask type is [`cuda_device::WaveMask`]). Their headline use is the
+//! warp-level exclusive prefix sum that powers stream compaction:
 //!
 //! ```text
 //!   ballot = ballot_sync(mask, keep)      // bit k = lane k's predicate
@@ -21,10 +22,10 @@
 //! Build and run with:
 //!   cargo oxide run lanemask_scan
 
-use cuda_device::{DisjointSlice, kernel, thread, warp};
+use cuda_device::{DisjointSlice, WAVE_SIZE, WaveMask, kernel, thread, warp};
 use cuda_host::cuda_module;
 
-const FULL_MASK: u32 = 0xffff_ffff;
+const FULL_MASK: WaveMask = WaveMask::MAX;
 
 // =============================================================================
 // KERNELS
@@ -37,7 +38,7 @@ mod kernels {
     /// `(1 << i) - 1` — the set of lanes strictly before it. A direct, per-lane
     /// readout of the special register with no collective involved.
     #[kernel]
-    pub fn lanemask_lt_values(mut out: DisjointSlice<u32>) {
+    pub fn lanemask_lt_values(mut out: DisjointSlice<WaveMask>) {
         let gid = thread::index_1d();
         if gid.in_bounds(out.len()) {
             unsafe {
@@ -47,12 +48,12 @@ mod kernels {
     }
 
     /// Each lane writes all five lanemask register values into a flat buffer
-    /// laid out as [lt, le, eq, ge, gt] per lane (5 * 32 = 160 u32s per warp).
+    /// laid out as [lt, le, eq, ge, gt] per lane (5 * WAVE_SIZE masks per warp).
     ///
     /// Used to verify that each of the five registers reads correctly for every
     /// lane position, not just `lt`.
     #[kernel]
-    pub fn all_lanemasks(mut out: DisjointSlice<u32>) {
+    pub fn all_lanemasks(mut out: DisjointSlice<WaveMask>) {
         let gid = thread::index_1d();
         let n_lanes = out.len() / 5;
         if gid.in_bounds(n_lanes) {
@@ -78,8 +79,8 @@ mod kernels {
         let gid = thread::index_1d();
         let n = ranks.len();
 
-        // Launched with exactly `n` threads (a multiple of 32), so every lane is
-        // in bounds and joins the full-warp ballot.
+        // Launched with exactly `n` threads (a multiple of WAVE_SIZE), so every
+        // lane is in bounds and joins the full-warp ballot.
         let keep = gid.in_bounds(n) && data[gid.get()] != 0;
         let ballot = warp::ballot_sync(FULL_MASK, keep);
         let rank = (ballot & warp::lanemask_lt()).count_ones();
@@ -107,8 +108,9 @@ fn main() {
     let (major, minor) = ctx.compute_capability().expect("compute capability");
     println!("GPU Compute Capability: sm_{}{}", major, minor);
 
-    const N: usize = 256;
-    const WARPS: usize = N / 32;
+    let wave = WAVE_SIZE as usize;
+    const N_WAVES: usize = 8;
+    let n: usize = wave * N_WAVES;
 
     let module = ctx
         .load_module_from_file("lanemask_scan.ptx")
@@ -116,29 +118,34 @@ fn main() {
     let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
 
     let cfg = LaunchConfig {
-        block_dim: (32, 1, 1),
-        grid_dim: (WARPS as u32, 1, 1),
+        block_dim: (WAVE_SIZE, 1, 1),
+        grid_dim: (N_WAVES as u32, 1, 1),
         shared_mem_bytes: 0,
     };
 
     // ===== Test 1: raw lanemask_lt readout =====
     println!("\n--- Test 1: lanemask_lt() per lane ---");
-    let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut out_dev = DeviceBuffer::<WaveMask>::zeroed(&stream, n).unwrap();
 
     // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
     unsafe { module.lanemask_lt_values((stream).as_ref(), cfg, &mut out_dev) }
         .expect("Kernel launch failed");
 
     let out = out_dev.to_host_vec(&stream).unwrap();
-    // For lane i: lanemask_lt == (1 << i) - 1  (lane 0 -> 0, lane 31 -> 0x7fffffff).
+    // For lane i: lanemask_lt == (1 << i) - 1  (lane 0 -> 0).
     let lt_ok = out.iter().enumerate().all(|(i, &v)| {
-        let lane = (i % 32) as u32;
-        v == ((1u32 << lane) - 1)
+        let lane = (i % wave) as WaveMask;
+        v == ((1 as WaveMask) << lane).wrapping_sub(1)
     });
     println!("lane 0..4   : {:08x?}", &out[..4]);
-    println!("lane 30,31  : {:08x?}", &out[30..32]);
+    println!(
+        "lane {}..{}  : {:08x?}",
+        wave - 2,
+        wave - 1,
+        &out[wave - 2..wave]
+    );
     if lt_ok {
-        println!("✓ lanemask_lt matches (1 << lane) - 1 for all {} lanes", N);
+        println!("✓ lanemask_lt matches (1 << lane) - 1 for all {} lanes", n);
     } else {
         println!("✗ lanemask_lt mismatch!");
         std::process::exit(1);
@@ -147,9 +154,9 @@ fn main() {
     // ===== Test 2: warp prefix sum / compaction rank =====
     println!("\n--- Test 2: warp_compact_rank over a keep-mask ---");
     // Keep every 3rd element (arbitrary, just needs a mix of 0/non-0).
-    let data_host: Vec<u32> = (0..N).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
+    let data_host: Vec<u32> = (0..n).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
     let data_dev = DeviceBuffer::from_host(&stream, &data_host).unwrap();
-    let mut ranks_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    let mut ranks_dev = DeviceBuffer::<u32>::zeroed(&stream, n).unwrap();
 
     // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
     unsafe { module.warp_compact_rank((stream).as_ref(), cfg, &data_dev, &mut ranks_dev) }
@@ -158,11 +165,11 @@ fn main() {
     let ranks = ranks_dev.to_host_vec(&stream).unwrap();
 
     // CPU reference: exclusive prefix count of kept lanes, reset at each warp.
-    let mut expected = vec![0u32; N];
-    for w in 0..WARPS {
+    let mut expected = vec![0u32; n];
+    for w in 0..N_WAVES {
         let mut acc = 0u32;
-        for lane in 0..32 {
-            let idx = w * 32 + lane;
+        for lane in 0..wave {
+            let idx = w * wave + lane;
             expected[idx] = acc;
             if data_host[idx] != 0 {
                 acc += 1;
@@ -182,11 +189,11 @@ fn main() {
 
     // ===== Test 3: all five lanemask registers =====
     println!("\n--- Test 3: all five lanemask registers (lt/le/eq/ge/gt) ---");
-    // 5 values per lane, one warp (32 lanes).
-    let n_lanes: usize = 32;
-    let mut all_dev = DeviceBuffer::<u32>::zeroed(&stream, n_lanes * 5).unwrap();
+    // 5 values per lane, one warp.
+    let n_lanes: usize = wave;
+    let mut all_dev = DeviceBuffer::<WaveMask>::zeroed(&stream, n_lanes * 5).unwrap();
     let cfg1 = LaunchConfig {
-        block_dim: (32, 1, 1),
+        block_dim: (WAVE_SIZE, 1, 1),
         grid_dim: (1, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -198,7 +205,7 @@ fn main() {
     let all = all_dev.to_host_vec(&stream).unwrap();
 
     let mut masks_ok = true;
-    for lane in 0u32..32 {
+    for lane in 0..(wave as WaveMask) {
         let base = (lane as usize) * 5;
         let lt = all[base];
         let le = all[base + 1];
@@ -208,13 +215,13 @@ fn main() {
 
         // Mathematical invariants for lane i:
         //   lt = bits 0..(i-1)  = (1 << i) - 1
-        //   le = bits 0..i      = (2 << i) - 1  [lane 31 wraps to 0xFFFF_FFFF]
+        //   le = bits 0..i      = (2 << i) - 1  [last lane wraps to all-ones]
         //   eq = bit i only     = 1 << i
-        //   ge = bits i..31     = !(lt)
-        //   gt = bits (i+1)..31 = !(le)
-        let exp_lt = (1u32 << lane).wrapping_sub(1);
-        let exp_le = (2u32 << lane).wrapping_sub(1);
-        let exp_eq = 1u32 << lane;
+        //   ge = bits i..N      = !(lt)
+        //   gt = bits (i+1)..N  = !(le)
+        let exp_lt = (1 as WaveMask).checked_shl(lane as u32).unwrap_or(0).wrapping_sub(1);
+        let exp_le = (2 as WaveMask).checked_shl(lane as u32).unwrap_or(0).wrapping_sub(1);
+        let exp_eq = (1 as WaveMask) << lane;
         let exp_ge = !exp_lt;
         let exp_gt = !exp_le;
 
@@ -244,11 +251,11 @@ fn main() {
     };
     println!("{}", sample(0));
     println!("{}", sample(1));
-    println!("{}", sample(16));
-    println!("{}", sample(31));
+    println!("{}", sample(wave / 2));
+    println!("{}", sample(wave - 1));
 
     if masks_ok {
-        println!("✓ all five lanemask registers correct for all 32 lanes");
+        println!("✓ all five lanemask registers correct for all {} lanes", wave);
     } else {
         std::process::exit(1);
     }

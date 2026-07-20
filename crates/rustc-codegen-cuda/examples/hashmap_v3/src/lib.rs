@@ -763,6 +763,13 @@ fn try_reclaim_deleted(
     let slot_idx = del_word_idx * GROUP + del_j;
     let slot_atomic = &slots[slot_idx];
 
+    // Bounded spin while a concurrent reclaim holds RESERVED. An unbounded
+    // spin can deadlock on SIMT hardware that does not fairly interleave
+    // divergent lanes of a wave (the lane holding RESERVED may never be
+    // scheduled while its wave-mates spin). On timeout we fall back to the
+    // caller's EMPTY-claim path; the reclaimer's publish is re-observed on
+    // the next probe round.
+    let mut reserved_spins: u32 = 0;
     loop {
         let cur = ctrl_atomic.load(AtomicOrdering::Acquire);
         let cur_tag = get_tag(cur, del_j);
@@ -784,7 +791,11 @@ fn try_reclaim_deleted(
             }
             // Else: a sibling byte changed; retry.
         } else if cur_tag == RESERVED_TAG {
-            // A concurrent reclaim is publishing here; spin.
+            // A concurrent reclaim is publishing here; spin briefly.
+            reserved_spins += 1;
+            if reserved_spins >= 4096 {
+                return ReclaimOutcome::Lost;
+            }
             continue;
         } else if cur_tag <= 0x7F {
             // Reclaim landed before us. If their key matches ours,

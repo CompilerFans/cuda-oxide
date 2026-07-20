@@ -44,6 +44,9 @@ TCGEN05_EXAMPLES=(gemm_sol gemm_sol_final tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
 LTOIR_EXAMPLES=(addressof_sharedarray cpp_consumes_rust_device device_ffi_test legacy_nvvm_pointer_shapes manual_launch_libdevice mathdx_ffi_test primitive_stress)
 AUTO_NVVM_EXAMPLES=(libdevice_math)
+# Examples that inspect PTX text (vector load shapes, mangled symbol names)
+# or need CUDA-only host metadata interop. Meaningless on a non-PTX target.
+PTX_INSPECT_EXAMPLES=(vectorization const_generic cross_crate_kernel cutile_inter_kernel)
 NVVM_VERIFY_EXAMPLES=(device_global libdevice_math legacy_nvvm_pointer_shapes primitive_stress)
 ERROR_EXAMPLES=(error error_wgmma_mma_unimplemented error_set_discriminant_niche error_set_discriminant_uninhabited error_static_initializer_provenance error_drop_glue error_heap_alloc error_missing_device_attr)
 
@@ -53,6 +56,7 @@ classify() {
     for cat in "${WGMMA_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo wgmma;       return; }; done
     for cat in "${LTOIR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo ltoir;       return; }; done
     for cat in "${AUTO_NVVM_EXAMPLES[@]}";   do [[ "$ex" == "$cat" ]] && { echo auto-nvvm;   return; }; done
+    for cat in "${PTX_INSPECT_EXAMPLES[@]}"; do [[ "$ex" == "$cat" ]] && { echo ptx-inspect; return; }; done
     for cat in "${ERROR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo error;       return; }; done
     echo standard
 }
@@ -66,7 +70,7 @@ maca_remap_category() {
     local cat="$1"
     if [[ "${TARGET_BACKEND}" == "maca" ]]; then
         case "${cat}" in
-            tcgen05|wgmma|ltoir|auto-nvvm) echo "maca-skip" ;;
+            tcgen05|wgmma|ltoir|auto-nvvm|ptx-inspect) echo "maca-skip" ;;
             *) echo "${cat}" ;;
         esac
     else

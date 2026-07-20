@@ -12,11 +12,22 @@
 /// - MetaX MXMACA: 64 threads per wave
 ///
 /// This constant is used by `warp::warp_id()` and cooperative groups to
-/// compute wave-level indices. The compiler backend selects the correct
-/// hardware intrinsics based on the target platform.
+/// compute wave-level indices. `cargo oxide` defines the
+/// `cuda_oxide_target_maca` cfg when building device code for the MetaX
+/// backend, selecting the hardware-correct value at compile time.
+#[cfg(cuda_oxide_target_maca)]
 pub const WAVE_SIZE: u32 = 64;
 
-/// Participation mask for one MetaX hardware wave.
+/// Wave size (threads per wave/warp); see the MACA variant above.
+#[cfg(not(cuda_oxide_target_maca))]
+pub const WAVE_SIZE: u32 = 32;
+
+/// Participation mask for one hardware wave.
+///
+/// 64 bits wide on every target so kernel source is portable: on NVIDIA
+/// (wave = 32) only the low 32 bits are meaningful and the lowering
+/// truncates to the hardware's 32-bit mask registers; on MetaX C500 all
+/// 64 bits are used.
 pub type WaveMask = u64;
 
 pub use cuda_macros::{

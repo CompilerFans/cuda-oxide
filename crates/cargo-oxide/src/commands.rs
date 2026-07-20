@@ -1908,6 +1908,11 @@ fn cargo_passthrough_command(
         &target_backend,
     );
     fingerprinted_device_cfgs.push(format!("cuda_oxide_internal_codegen_env=\"{fingerprint}\""));
+    // Device crates (cuda-device) gate hardware-dependent constants such as
+    // WAVE_SIZE on this cfg; it must appear on every MACA device build.
+    if target_backend == "maca" {
+        fingerprinted_device_cfgs.push("cuda_oxide_target_maca".to_string());
+    }
     let mut cmd = Command::new("cargo");
     cmd.arg(cargo_subcommand);
     if let Some(features) = opts.features {

@@ -18,7 +18,7 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p mir-lower 2>&1 | grep -E \"^error\" -A6 | head -30; echo \"BUILD: ${PIPESTATUS[0]}\"",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p cuda-device -p cargo-oxide 2>&1 | grep -E \"^error\" -A5 | head -15; echo \"BUILD: ${PIPESTATUS[0]}\"",
     "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p mir-lower -p llvm-export -p cuda-oxide-codegen --lib 2>&1 | grep -E \"test result|passed|FAILED\" | head -6; rtk cargo clippy -p mir-lower -p llvm-export -p cuda-oxide-codegen 2>&1 | grep -cE \"^error\"",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
@@ -177,20 +177,20 @@
     },
     {
       "path": "crates/cuda-device/src/lib.rs",
-      "accessCount": 4,
-      "lastAccessed": 1784218990490,
+      "accessCount": 5,
+      "lastAccessed": 1784501731679,
+      "type": "file"
+    },
+    {
+      "path": "crates/cuda-device/src/cooperative_groups.rs",
+      "accessCount": 5,
+      "lastAccessed": 1784501837596,
       "type": "file"
     },
     {
       "path": "crates/cuda-core/src/module.rs",
       "accessCount": 4,
       "lastAccessed": 1784437592760,
-      "type": "file"
-    },
-    {
-      "path": "crates/cuda-device/src/cooperative_groups.rs",
-      "accessCount": 3,
-      "lastAccessed": 1784219014556,
       "type": "file"
     },
     {

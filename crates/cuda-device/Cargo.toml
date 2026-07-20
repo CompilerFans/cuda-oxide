@@ -10,5 +10,10 @@ description = "Device-side intrinsics and types for CUDA kernels in Rust"
 [dependencies]
 cuda-macros = { workspace = true }
 
+[lints.rust]
+# `cuda_oxide_target_maca` is defined by `cargo oxide` when building device
+# code for the MetaX (MXMACA) backend; it gates WAVE_SIZE.
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(cuda_oxide_target_maca)"] }
+
 [dev-dependencies]
 trybuild = "1"
