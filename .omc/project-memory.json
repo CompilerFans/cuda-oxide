@@ -18,7 +18,7 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p cuda-device -p cargo-oxide 2>&1 | grep -E \"^error\" -A5 | head -15; echo \"BUILD: ${PIPESTATUS[0]}\"",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p cargo-oxide 2>&1 | grep -E \"^error|Compiling cargo-oxide|Finished\" | head -3 && CARGO_TARGET_DIR=/home/compiler_gfx/project/cuda-oxide/target/oxide-examples target/debug/cargo-oxide run shuffle_64 --target=maca 2>&1 | grep -E \"dbg|✓|✗|SUCCESS\" | head -10",
     "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p mir-lower -p llvm-export -p cuda-oxide-codegen --lib 2>&1 | grep -E \"test result|passed|FAILED\" | head -6; rtk cargo clippy -p mir-lower -p llvm-export -p cuda-oxide-codegen 2>&1 | grep -cE \"^error\"",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",

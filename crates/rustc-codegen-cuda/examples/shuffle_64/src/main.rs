@@ -22,7 +22,7 @@
 //! Build and run with:
 //!   cargo oxide run shuffle_64
 
-use cuda_device::{DisjointSlice, kernel, warp};
+use cuda_device::{DisjointSlice, WAVE_SIZE, kernel, warp};
 use cuda_host::cuda_module;
 
 /// Lane whose value is broadcast in kernel 1.
@@ -58,17 +58,17 @@ mod kernels {
     }
 
     /// `bfly` mode on `f64`: a classic butterfly reduction. Each lane seeds
-    /// `lane + 1` and XOR-shuffles with strides 16,8,4,2,1, so every lane ends
-    /// with the full-warp sum `1 + 2 + ... + 32 = 528`.
+    /// `lane + 1` and XOR-shuffles with strides `WAVE_SIZE/2 .. 1`, so every
+    /// lane ends with the full-warp sum `1 + 2 + ... + WAVE_SIZE`.
     #[kernel]
     pub fn shuffle_f64_butterfly_sum(mut out: DisjointSlice<f64>) {
         let lane = warp::lane_id();
         let mut v = (lane as f64) + 1.0;
-        v += warp::shuffle_xor_f64(v, 16);
-        v += warp::shuffle_xor_f64(v, 8);
-        v += warp::shuffle_xor_f64(v, 4);
-        v += warp::shuffle_xor_f64(v, 2);
-        v += warp::shuffle_xor_f64(v, 1);
+        let mut stride = WAVE_SIZE / 2;
+        while stride >= 1 {
+            v += warp::shuffle_xor_f64(v, stride);
+            stride >>= 1;
+        }
         unsafe {
             *out.get_unchecked_mut(lane as usize) = v;
         }
@@ -90,26 +90,28 @@ mod kernels {
         }
     }
 
-    /// Masked `idx`: the warp splits into two 16-lane halves that each shuffle
+    /// Masked `idx`: the warp splits into two halves that each shuffle
     /// *independently*. In each divergent branch `active_mask()` yields just that
     /// half's membermask, and every member broadcasts its leader's value — lane 0
-    /// for the lower half, lane 16 for the upper half (src_lane is absolute, not
-    /// relative to the mask). If the membermask operand were mis-wired, the two
-    /// halves would bleed into each other.
+    /// for the lower half, lane `WAVE_SIZE/2` for the upper half (src_lane is
+    /// absolute, not relative to the mask). If the membermask operand were
+    /// mis-wired, the two halves would bleed into each other.
     ///
-    /// Expected: `out[0..16] == HALF_HI | 0` and `out[16..32] == HALF_HI | 16`.
+    /// Expected: `out[0..H] == HALF_HI | 0` and `out[H..WAVE_SIZE] == HALF_HI | H`
+    /// where `H = WAVE_SIZE / 2`.
     #[kernel]
     pub fn shuffle_u64_halfwarp(mut out: DisjointSlice<u64>) {
         let lane = warp::lane_id();
         let val: u64 = HALF_HI | (lane as u64);
-        let got = if lane < 16 {
-            // Lower half (lanes 0..=15): broadcast lane 0 within this subset.
+        let half = WAVE_SIZE / 2;
+        let got = if lane < half {
+            // Lower half: broadcast lane 0 within this subset.
             let mask = warp::active_mask();
             warp::shuffle_u64_sync(mask, val, 0)
         } else {
-            // Upper half (lanes 16..=31): broadcast lane 16 within this subset.
+            // Upper half: broadcast the half's leader within this subset.
             let mask = warp::active_mask();
-            warp::shuffle_u64_sync(mask, val, 16)
+            warp::shuffle_u64_sync(mask, val, half)
         };
         unsafe {
             *out.get_unchecked_mut(lane as usize) = got;
@@ -121,7 +123,7 @@ mod kernels {
 // HOST CODE
 // =============================================================================
 
-const WARP: usize = 32;
+const WARP: usize = WAVE_SIZE as usize;
 
 fn main() {
     use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
@@ -158,7 +160,7 @@ fn main() {
 
     let want = ((SRC_LANE as u64) << 32) | (TAG + SRC_LANE as u64);
     println!("out[0]   = {:#018x} (expected {:#018x})", out[0], want);
-    println!("out[31]  = {:#018x}", out[31]);
+    println!("out[{}]  = {:#018x}", WARP - 1, out[WARP - 1]);
     if out.iter().all(|&v| v == want) {
         println!("✓ every lane received lane {SRC_LANE}'s full 64-bit value");
     } else {
@@ -174,7 +176,7 @@ fn main() {
         .expect("Kernel launch failed");
     let sums = sum_dev.to_host_vec(&stream).unwrap();
 
-    let want_sum = (1..=WARP).sum::<usize>() as f64; // 528.0
+    let want_sum = (1..=WARP).sum::<usize>() as f64;
     println!("sum[0]   = {} (expected {})", sums[0], want_sum);
     if sums.iter().all(|&v| (v - want_sum).abs() < 1e-9) {
         println!("✓ every lane holds the full-warp f64 sum");
@@ -207,16 +209,20 @@ fn main() {
         down[0], want_down[0]
     );
     println!(
-        "down[31] = {:#018x} (expected {:#018x}, edge keeps own)",
-        down[31], want_down[31]
+        "down[{}] = {:#018x} (expected {:#018x}, edge keeps own)",
+        WARP - 1,
+        down[WARP - 1],
+        want_down[WARP - 1]
     );
     println!(
         "up[0]    = {:#018x} (expected {:#018x}, edge keeps own)",
         up[0], want_up[0]
     );
     println!(
-        "up[31]   = {:#018x} (expected {:#018x})",
-        up[31], want_up[31]
+        "up[{}]   = {:#018x} (expected {:#018x})",
+        WARP - 1,
+        up[WARP - 1],
+        want_up[WARP - 1]
     );
     if down == want_down && up == want_up {
         println!("✓ neighbor exchange shifted 64-bit values correctly");
@@ -226,24 +232,25 @@ fn main() {
     }
 
     // ===== Test 4: masked half-warp broadcast (subset membermask) =====
-    println!("\n--- Test 4: shuffle_u64_sync (two independent 16-lane halves) ---");
+    let h = WARP / 2;
+    println!("\n--- Test 4: shuffle_u64_sync (two independent {h}-lane halves) ---");
     let mut half_dev = DeviceBuffer::<u64>::zeroed(&stream, WARP).unwrap();
     // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
     unsafe { module.shuffle_u64_halfwarp((stream).as_ref(), cfg, &mut half_dev) }
         .expect("Kernel launch failed");
     let half = half_dev.to_host_vec(&stream).unwrap();
 
-    // Each half broadcasts its leader: lanes 0..16 -> lane 0, lanes 16..32 -> lane 16.
+    // Each half broadcasts its leader: lanes 0..h -> lane 0, lanes h..WARP -> lane h.
     let want_half: Vec<u64> = (0..WARP)
-        .map(|l| HALF_HI | (if l < 16 { 0 } else { 16 }) as u64)
+        .map(|l| HALF_HI | (if l < h { 0 } else { h }) as u64)
         .collect();
     println!(
         "half[0]  = {:#018x} (expected {:#018x})",
         half[0], want_half[0]
     );
     println!(
-        "half[16] = {:#018x} (expected {:#018x})",
-        half[16], want_half[16]
+        "half[{h}] = {:#018x} (expected {:#018x})",
+        half[h], want_half[h]
     );
     if half == want_half {
         println!("✓ each half shuffled within its own membermask (no cross-talk)");

@@ -253,7 +253,14 @@ pub fn codegen_run(
     }
 
     apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
-    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
+    // Device crates (cuda-device) gate hardware-dependent constants such as
+    // WAVE_SIZE on this cfg; it must appear on every MACA device build.
+    let target_cfgs = if target_backend == "maca" {
+        vec!["cuda_oxide_target_maca".to_string()]
+    } else {
+        Vec::new()
+    };
+    apply_codegen_rustflags(&mut cmd, ctx, false, &target_cfgs);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
     apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
     apply_target_backend(&mut cmd, &target_backend);
@@ -1313,7 +1320,12 @@ pub fn codegen_build(
     }
 
     apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
-    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
+    let target_cfgs = if target_backend == "maca" {
+        vec!["cuda_oxide_target_maca".to_string()]
+    } else {
+        Vec::new()
+    };
+    apply_codegen_rustflags(&mut cmd, ctx, false, &target_cfgs);
     apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
     apply_target_backend(&mut cmd, &target_backend);
 
