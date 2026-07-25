@@ -443,6 +443,59 @@ impl RustFloatMathIntrinsic {
         }
     }
 
+    /// Return the LLVM intrinsic name for rounding operations, which can bypass
+    /// libdevice.
+    ///
+    /// The NVPTX backend selects these without a libdevice call. Measured with
+    /// LLVM 21.1 `llc -march=nvptx64 -mcpu=sm_80`, counting only the body:
+    ///
+    /// | Intrinsic | PTX | Instructions |
+    /// |-----------|-----|--------------|
+    /// | `floor` | `cvt.rmi` | 1 |
+    /// | `ceil` | `cvt.rpi` | 1 |
+    /// | `trunc` | `cvt.rzi` | 1 |
+    /// | `roundeven` | `cvt.rni` | 1 |
+    /// | `round` | expanded sequence | 11 (f32), 8 (f64) |
+    ///
+    /// `round` is the one exception, and deliberately so. It rounds halfway
+    /// cases away from zero, which is not one of the four hardware `cvt` modes
+    /// (`rni` is ties-to-even), so no single instruction can express it. LLVM
+    /// expands it inline into compare/select over `cvt.rzi` rather than
+    /// emitting a `roundf` libcall, so routing it here still removes the
+    /// libdevice call without introducing an unresolved symbol.
+    ///
+    /// Using LLVM intrinsics avoids a libdevice function call and removes the
+    /// libNVVM dependency for kernels that only use these operations.
+    ///
+    /// Scope: this covers rounding only. `fabs` and `copysign` take the same
+    /// route but are left to #391, which moves them off libdevice as part of a
+    /// broader change that also handles `max`/`min`. `max`/`min` cannot use
+    /// `llvm.maxnum`/`llvm.minnum` at all, because under LLVM 21 those
+    /// propagate signaling NaNs and so contradict Rust's contract; #391 lowers
+    /// them as an ordered compare/select instead (see #390).
+    ///
+    /// Naming: pliron identifiers cannot contain dots, so intrinsic symbols
+    /// use the underscore encoding (`llvm_floor_f32`) that the textual `.ll`
+    /// exporter decodes back to the dotted LLVM name (`llvm.floor.f32`),
+    /// exactly like the `llvm_ctpop_i*` bit-intrinsic family above.
+    fn llvm_intrinsic_name(self) -> Option<&'static str> {
+        match self {
+            // Rounding: each maps to a single PTX `cvt` instruction, except
+            // `round`; see the note above.
+            Self::FloorF32 => Some("llvm_floor_f32"),
+            Self::FloorF64 => Some("llvm_floor_f64"),
+            Self::CeilF32 => Some("llvm_ceil_f32"),
+            Self::CeilF64 => Some("llvm_ceil_f64"),
+            Self::TruncF32 => Some("llvm_trunc_f32"),
+            Self::TruncF64 => Some("llvm_trunc_f64"),
+            Self::RoundF32 => Some("llvm_round_f32"),
+            Self::RoundF64 => Some("llvm_round_f64"),
+            Self::RoundevenF32 => Some("llvm_roundeven_f32"),
+            Self::RoundevenF64 => Some("llvm_roundeven_f64"),
+            _ => None,
+        }
+    }
+
     /// Return the equivalent fast-math binop kind, if this intrinsic is one.
     fn fast_binop(self) -> Option<FastFloatBinop> {
         match self {
@@ -1052,7 +1105,14 @@ fn convert_rust_float_math_intrinsic(
 
     let result_mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
     let result_ty = convert_type(ctx, result_mir_ty).map_err(anyhow_to_pliron)?;
-    let intrinsic_name = intrinsic.libdevice_name(ctx, result_ty, loc.clone())?;
+
+    // The rounding intrinsics have direct LLVM equivalents that the NVPTX
+    // backend selects without a libdevice call; everything else (and every op
+    // under the libNVVM backend) stays on libdevice. See
+    // `float_math_intrinsic_symbol` for the dispatch and
+    // `llvm_intrinsic_name` for the per-op PTX mapping and instruction counts.
+    let intrinsic_name = float_math_intrinsic_symbol(ctx, intrinsic, result_ty, loc.clone())?;
+
     let arg_types = args.iter().map(|arg| arg.get_type(ctx)).collect::<Vec<_>>();
     let func_ty = llvm_types::FuncType::get(ctx, result_ty, arg_types, false);
     let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
@@ -1072,6 +1132,39 @@ fn convert_rust_float_math_intrinsic(
     rewriter.replace_operation(ctx, op, llvm_call.get_operation());
 
     Ok(())
+}
+
+/// Resolve the callee symbol a float-math intrinsic lowers to under the
+/// active intrinsic backend.
+///
+/// * [`IntrinsicBackend::LlvmNvptx`](crate::IntrinsicBackend::LlvmNvptx):
+///   rounding ops use the native LLVM intrinsics (see
+///   [`RustFloatMathIntrinsic::llvm_intrinsic_name`]); everything else uses
+///   libdevice.
+/// * [`IntrinsicBackend::LibNvvm`](crate::IntrinsicBackend::LibNvvm): every
+///   op stays on libdevice. The legacy LLVM 7-based NVVM IR dialect predates
+///   `llvm.roundeven.*` (added in LLVM 11) and admits only a small intrinsic
+///   allow-list, so `__nv_*` calls are the only spelling that is portable
+///   across every libNVVM input dialect.
+///
+/// This dispatch mirrors the pre-lowering libdevice prediction in the
+/// pipeline (`is_libdevice_backed_placeholder` vs
+/// `is_backend_dependent_libdevice_placeholder` in
+/// `dialect_mir::rust_intrinsics`): a rounding op emits a `__nv_*` symbol
+/// precisely when the LibNvvm backend was selected.
+fn float_math_intrinsic_symbol(
+    ctx: &Context,
+    intrinsic: RustFloatMathIntrinsic,
+    result_ty: TypeHandle,
+    loc: pliron::location::Location,
+) -> Result<&'static str> {
+    match crate::context::lowering_options(ctx).intrinsic_backend {
+        crate::IntrinsicBackend::LlvmNvptx => match intrinsic.llvm_intrinsic_name() {
+            Some(llvm_name) => Ok(llvm_name),
+            None => intrinsic.libdevice_name(ctx, result_ty, loc),
+        },
+        crate::IntrinsicBackend::LibNvvm => intrinsic.libdevice_name(ctx, result_ty, loc),
+    }
 }
 
 /// Lower a `core::intrinsics::f*_fast` placeholder call to the matching
@@ -1759,5 +1852,154 @@ mod tests {
             "__nv_fabs"
         );
         assert!(fabs_libdevice_name(&ctx, i32_ty, loc).is_err());
+    }
+
+    /// `llvm_intrinsic_name` returns direct LLVM intrinsic names for the
+    /// rounding operations, which bypass libdevice. Everything else, including
+    /// the transcendentals, still returns `None`.
+    #[test]
+    fn test_llvm_intrinsic_name_routing() {
+        // fabs and copysign stay on the libdevice path here; #391 moves them
+        // off it as part of a broader change that also covers max/min.
+        assert_eq!(RustFloatMathIntrinsic::Fabs.llvm_intrinsic_name(), None);
+        assert_eq!(
+            RustFloatMathIntrinsic::CopysignF32.llvm_intrinsic_name(),
+            None
+        );
+
+        // Rounding -> llvm.floor/ceil/trunc/round/roundeven.* in pliron's
+        // underscore encoding (the exporter prints the dotted LLVM name).
+        assert_eq!(
+            RustFloatMathIntrinsic::FloorF32.llvm_intrinsic_name(),
+            Some("llvm_floor_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::FloorF64.llvm_intrinsic_name(),
+            Some("llvm_floor_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CeilF32.llvm_intrinsic_name(),
+            Some("llvm_ceil_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::CeilF64.llvm_intrinsic_name(),
+            Some("llvm_ceil_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::TruncF32.llvm_intrinsic_name(),
+            Some("llvm_trunc_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::TruncF64.llvm_intrinsic_name(),
+            Some("llvm_trunc_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundF32.llvm_intrinsic_name(),
+            Some("llvm_round_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundF64.llvm_intrinsic_name(),
+            Some("llvm_round_f64")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundevenF32.llvm_intrinsic_name(),
+            Some("llvm_roundeven_f32")
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::RoundevenF64.llvm_intrinsic_name(),
+            Some("llvm_roundeven_f64")
+        );
+
+        // max/min return None: LLVM 21's maxnum/minnum propagate signaling
+        // NaNs, which contradicts Rust's contract. These need compare/select
+        // lowering instead (see #390).
+        assert_eq!(
+            RustFloatMathIntrinsic::MaxNumNszF32.llvm_intrinsic_name(),
+            None
+        );
+        assert_eq!(
+            RustFloatMathIntrinsic::MinNumNszF64.llvm_intrinsic_name(),
+            None
+        );
+
+        // Transcendentals still return None (they need libdevice).
+        assert_eq!(RustFloatMathIntrinsic::SinF32.llvm_intrinsic_name(), None);
+        assert_eq!(RustFloatMathIntrinsic::SqrtF64.llvm_intrinsic_name(), None);
+    }
+
+    /// The resolved callee symbol follows the active intrinsic backend:
+    /// rounding uses the native LLVM intrinsics under `LlvmNvptx` but stays
+    /// on libdevice under `LibNvvm` (whose legacy LLVM 7 dialect predates
+    /// `llvm.roundeven.*`); transcendentals use libdevice under both.
+    #[test]
+    fn float_math_symbol_dispatches_on_intrinsic_backend() {
+        let mut ctx = Context::new();
+        let f32_ty = FP32Type::get(&ctx).into();
+        let loc = pliron::location::Location::Unknown;
+
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: true,
+                intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
+            },
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::FloorF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "llvm_floor_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::RoundevenF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "llvm_roundeven_f32"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::SinF32, f32_ty, loc.clone())
+                .unwrap(),
+            "__nv_sinf"
+        );
+
+        crate::context::set_lowering_options(
+            &mut ctx,
+            crate::LoweringOptions {
+                allow_fma_contraction: true,
+                intrinsic_backend: crate::IntrinsicBackend::LibNvvm,
+            },
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::FloorF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "__nv_floorf"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(
+                &ctx,
+                RustFloatMathIntrinsic::RoundevenF32,
+                f32_ty,
+                loc.clone()
+            )
+            .unwrap(),
+            "__nv_rintf"
+        );
+        assert_eq!(
+            float_math_intrinsic_symbol(&ctx, RustFloatMathIntrinsic::SinF32, f32_ty, loc).unwrap(),
+            "__nv_sinf"
+        );
     }
 }
