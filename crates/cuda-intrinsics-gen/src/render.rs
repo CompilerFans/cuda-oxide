@@ -13888,11 +13888,13 @@ fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
         "};\nuse llvm_export::{ops::AsmKind, types as llvm_types};\nuse pliron::{\n    builtin::types::{IntegerType, Signedness},\n    context::{Context, Ptr},\n    derive::op_interface_impl,\n    irbuild::{\n        dialect_conversion::{DialectConversionRewriter, OperandsInfo},\n        rewriter::Rewriter,\n    },\n    op::Op,\n    operation::Operation,\n    result::Result,\n};\n\n",
     );
     if cluster_memory(catalog).next().is_some() {
-        output = output
-            .replace(
+        if !output.contains("cast_to_shared_addrspace") {
+            output = output.replace(
                 "common::{call_intrinsic, ",
                 "common::{call_intrinsic, cast_to_shared_addrspace, ",
-            )
+            );
+        }
+        output = output
             .replace(
                 "use llvm_export::{ops::AsmKind, types as llvm_types};",
                 "use llvm_export::{op_interfaces::CastOpInterface, ops as llvm_ops, ops::AsmKind, types as llvm_types};",
@@ -21783,6 +21785,55 @@ mod tests {
             source_record: "invented".into(),
         };
         assert!(validate_renderable(&wrong_source).is_err());
+    }
+
+    #[test]
+    fn lowering_imports_cast_to_shared_addrspace_exactly_once_across_families() {
+        // The stmatrix, cluster_memory, and mbarrier_extended families all
+        // insert the `cast_to_shared_addrspace` helper into the same
+        // `common::{call_intrinsic, ...}` use group. An unguarded second
+        // insert duplicates the name inside one use group, which is a hard
+        // rustc error (E0252) in the raw generator output. The rustfmt pass
+        // run over generated files silently dedupes the duplicate, so assert
+        // on the raw (pre-rustfmt) output to catch a regressed guard loudly.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog = crate::resolve::resolve(&repo_root).unwrap();
+        assert!(stmatrices(&catalog).next().is_some());
+        assert!(cluster_memory(&catalog).next().is_some());
+        assert!(mbarrier_extended(&catalog).next().is_some());
+
+        let import_count = |lowering: &str| {
+            // Everything before the first rendered helper function is the
+            // module header plus the use block; helper call sites in the
+            // function bodies below must not count.
+            let bodies_start = lowering
+                .find("fn convert_zero_operand_scalar_direct")
+                .expect("lowering output must contain the first helper function");
+            lowering[..bodies_start]
+                .matches("cast_to_shared_addrspace")
+                .count()
+        };
+
+        assert_eq!(
+            import_count(&render_lowering(&catalog, "test-hash")),
+            1,
+            "cast_to_shared_addrspace must be imported exactly once in the \
+             raw lowering output when multiple families need it"
+        );
+
+        // The guard must not suppress the import either: with stmatrix
+        // absent, cluster_memory still needs the helper and must insert it.
+        let mut without_stmatrix = catalog;
+        without_stmatrix
+            .intrinsics
+            .retain(|record| record.family != "stmatrix");
+        assert!(stmatrices(&without_stmatrix).next().is_none());
+        assert_eq!(
+            import_count(&render_lowering(&without_stmatrix, "test-hash")),
+            1,
+            "cast_to_shared_addrspace must still be imported when only \
+             cluster_memory and mbarrier_extended need it"
+        );
     }
 
     #[test]
