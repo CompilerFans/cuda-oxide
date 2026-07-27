@@ -121,6 +121,7 @@ gpu-programming/kernels-and-device-functions
 gpu-programming/memory-and-data-movement
 gpu-programming/virtual-memory-and-peer-access
 gpu-programming/launching-kernels
+gpu-programming/kernel-families
 gpu-programming/closures-and-generics
 gpu-programming/error-handling-and-debugging
 ```
