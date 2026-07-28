@@ -274,6 +274,21 @@ cargo oxide list --json
 The command reports each example's purpose and any documented GPU, architecture,
 CUDA Toolkit, or external SDK requirements.
 
+Useful day-to-day helpers once you are building kernels:
+
+```bash
+# Print generated PTX without the full MIR/LLVM pipeline dump
+cargo oxide inspect vecadd
+
+# Remove local target/ dirs and generated device artifacts (PTX, LLVM IR,
+# LTOIR, cubin, and their sidecar metadata)
+cargo oxide clean
+```
+
+`inspect` is the lightweight counterpart to `cargo oxide pipeline`. `clean`
+only touches project-local outputs; it leaves the shared backend cache at
+`~/.cargo/cuda-oxide/` alone.
+
 ---
 
 ## Verifying your installation
