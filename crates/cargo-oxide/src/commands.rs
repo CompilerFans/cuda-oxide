@@ -9,12 +9,12 @@
 //! - Backend path resolved via discovery chain instead of hardcoded relative path
 //! - Workspace root resolved by walking up from CWD instead of assuming CWD
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use crate::backend;
 use sha2::Digest as _;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
 const EXPECTED_PROVENANCE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV;
@@ -325,6 +325,617 @@ pub fn resolve_doctor_context() -> Context {
     eprintln!("Run from inside the cuda-oxide repository, or from a project created");
     eprintln!("with `cargo oxide new <name>`.");
     std::process::exit(1);
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ExampleInfo {
+    name: String,
+    title: String,
+    description: String,
+    requirements: Vec<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ParsedReadme {
+    title: Option<String>,
+    description: Option<String>,
+    requirements: Vec<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ManifestInfo {
+    description: Option<String>,
+}
+
+pub fn list_examples(ctx: &Context, json: bool) {
+    if !ctx.is_workspace {
+        eprintln!("Error: `cargo oxide list` must be run from inside a cuda-oxide checkout.");
+        eprintln!();
+        eprintln!("The command lists examples under crates/rustc-codegen-cuda/examples/.");
+        std::process::exit(1);
+    }
+
+    let examples = discover_examples(&ctx.examples_dir).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+
+    let output = if json {
+        format_examples_json(&examples).unwrap_or_else(|error| {
+            eprintln!("Error: could not serialize example list: {error}");
+            std::process::exit(1);
+        })
+    } else {
+        format_examples_human(&examples)
+    };
+
+    print!("{output}");
+}
+
+fn discover_examples(examples_dir: &Path) -> Result<Vec<ExampleInfo>, String> {
+    let entries = fs::read_dir(examples_dir).map_err(|error| {
+        format!(
+            "could not read examples directory {}: {error}",
+            examples_dir.display()
+        )
+    })?;
+
+    let mut examples = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not read an entry under {}: {error}",
+                examples_dir.display()
+            )
+        })?;
+
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", entry.path().display()))?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let example_dir = entry.path();
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "example directory name is not valid UTF-8: {}",
+                name.to_string_lossy()
+            )
+        })?;
+
+        // A directory without a manifest is not an example (scratch dirs,
+        // checked-out tooling, ...). Skip it instead of failing the listing.
+        let manifest_path = example_dir.join("Cargo.toml");
+        if !manifest_path.is_file() {
+            eprintln!(
+                "Warning: skipping {}: no top-level Cargo.toml",
+                example_dir.display()
+            );
+            continue;
+        }
+
+        let manifest = parse_example_manifest(&manifest_path)?;
+
+        let readme_path = example_dir.join("README.md");
+        let parsed_readme = if readme_path.is_file() {
+            let contents = fs::read_to_string(&readme_path)
+                .map_err(|error| format!("could not read {}: {error}", readme_path.display()))?;
+            parse_example_readme(&name, &contents)
+        } else {
+            ParsedReadme::default()
+        };
+
+        let ParsedReadme {
+            title,
+            description,
+            requirements,
+        } = parsed_readme;
+
+        let title = title.unwrap_or_else(|| name.clone());
+
+        let description = description.or(manifest.description).unwrap_or_else(|| {
+            if title != name {
+                title.clone()
+            } else {
+                "No description documented.".to_string()
+            }
+        });
+
+        examples.push(ExampleInfo {
+            name,
+            title,
+            description,
+            requirements,
+        });
+    }
+
+    examples.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if examples.is_empty() {
+        return Err(format!(
+            "no examples found under {}",
+            examples_dir.display()
+        ));
+    }
+
+    Ok(examples)
+}
+
+fn parse_example_manifest(path: &Path) -> Result<ManifestInfo, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+
+    let manifest: toml::Value = toml::from_str(&contents)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format!("{} has no [package] table", path.display()))?;
+
+    let description = package
+        .get("description")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_owned);
+
+    Ok(ManifestInfo { description })
+}
+
+fn parse_example_readme(crate_name: &str, contents: &str) -> ParsedReadme {
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut headings = Vec::new();
+    let mut in_code_fence = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        if is_code_fence(line) {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some((level, title)) = parse_markdown_heading(line) {
+            headings.push((index, level, title));
+        }
+    }
+
+    let crate_heading = normalize_heading(crate_name);
+
+    let selected_heading = match headings.first() {
+        Some(first) if normalize_heading(&first.2) == crate_heading => headings
+            .get(1)
+            .filter(|heading| {
+                heading.1 == 2
+                    && first_prose_paragraph_in_range(&lines, first.0 + 1, heading.0).is_none()
+                    && !is_generic_section_heading(&normalize_heading(&heading.2))
+            })
+            .or(Some(first)),
+        Some(first) => Some(first),
+        None => None,
+    };
+
+    let title = selected_heading
+        .map(|(_, _, title)| strip_inline_markdown(title))
+        .filter(|title| !title.is_empty());
+
+    let description_start = selected_heading.map(|(index, _, _)| index + 1).unwrap_or(0);
+
+    let description_end = headings
+        .iter()
+        .find(|(index, _, _)| *index >= description_start)
+        .map(|(index, _, _)| *index)
+        .unwrap_or(lines.len());
+
+    let description = first_prose_paragraph_in_range(&lines, description_start, description_end);
+    let requirements = extract_requirements(&lines);
+
+    ParsedReadme {
+        title,
+        description,
+        requirements,
+    }
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+
+    let remainder = &trimmed[level..];
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let title = remainder.trim().trim_end_matches('#').trim();
+
+    if title.is_empty() {
+        None
+    } else {
+        Some((level, title.to_string()))
+    }
+}
+
+fn is_code_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn strip_inline_markdown(value: &str) -> String {
+    value
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
+}
+
+fn normalize_heading(value: &str) -> String {
+    strip_inline_markdown(value)
+        .trim_matches(|character: char| {
+            character == ':' || character == '-' || character.is_whitespace()
+        })
+        .to_ascii_lowercase()
+}
+
+fn is_generic_section_heading(heading: &str) -> bool {
+    matches!(
+        heading,
+        "overview"
+            | "what this example does"
+            | "key concepts"
+            | "key concepts demonstrated"
+            | "build"
+            | "build and run"
+            | "usage"
+            | "expected output"
+            | "requirements"
+            | "hardware requirements"
+            | "prerequisites"
+            | "potential errors"
+            | "how it works"
+            | "how it works under the hood"
+            | "generated ptx"
+            | "run"
+            | "test"
+            | "tests"
+            | "correctness"
+            | "trigger"
+            | "kernels"
+            | "features tested"
+            | "what this tests"
+            | "what it tests"
+            | "what this demonstrates"
+            | "why this exists"
+            | "the bug"
+            | "final design"
+    )
+}
+
+fn first_prose_paragraph_in_range(lines: &[&str], start: usize, end: usize) -> Option<String> {
+    let end = end.min(lines.len());
+    let start = start.min(end);
+    let mut paragraph = Vec::new();
+    let mut in_code_fence = false;
+
+    for line in &lines[start..end] {
+        if is_code_fence(line) {
+            if !paragraph.is_empty() {
+                break;
+            }
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        if parse_markdown_heading(trimmed).is_some() {
+            break;
+        }
+
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        if is_non_prose_markdown(trimmed) {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        paragraph.push(trimmed);
+    }
+
+    if paragraph.is_empty() {
+        None
+    } else {
+        Some(paragraph.join(" "))
+    }
+}
+
+fn is_non_prose_markdown(line: &str) -> bool {
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("+ ")
+        || line.starts_with('>')
+        || line.starts_with('|')
+        || line.starts_with("![")
+        || line.starts_with("<!--")
+        || is_ordered_list_item(line)
+}
+
+fn is_ordered_list_item(line: &str) -> bool {
+    strip_ordered_list_marker(line).is_some()
+}
+
+/// Strip a `1. ` / `42. ` ordered-list marker, returning the item text.
+fn strip_ordered_list_marker(line: &str) -> Option<&str> {
+    let (marker, item) = line.split_once(". ")?;
+    if !marker.is_empty() && marker.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(item.trim_start())
+    } else {
+        None
+    }
+}
+
+/// Collect the requirement entries documented under a requirements-style
+/// heading ([`is_requirements_heading`]).
+///
+/// Recognized forms:
+/// - unordered list items (`- ` / `* ` / `+ `), with indented
+///   wrap-continuation lines joined onto the item;
+/// - ordered list items (`1. `), same continuation rule;
+/// - two-column markdown tables, emitted as `name: value` per data row.
+///
+/// Tables with any other column count are skipped whole: without knowing
+/// which columns carry the requirement, half-parsing them would produce
+/// garbage entries.
+fn extract_requirements(lines: &[&str]) -> Vec<String> {
+    let mut requirements = Vec::new();
+    let mut current_requirement: Option<String> = None;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut requirement_level = None;
+    let mut in_code_fence = false;
+
+    for line in lines {
+        if is_code_fence(line) {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_markdown_heading(line) {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+
+            let normalized = normalize_heading(&heading);
+
+            if is_requirements_heading(&normalized) {
+                requirement_level = Some(level);
+            } else if requirement_level.is_some_and(|active| level <= active) {
+                requirement_level = None;
+            }
+
+            continue;
+        }
+
+        if requirement_level.is_none() {
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        // A blank line terminates the current list item or table. Whatever
+        // follows is a new paragraph (prose, a code fence, ...), not a
+        // wrapped continuation of the bullet above it.
+        if trimmed.is_empty() {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+            continue;
+        }
+
+        if trimmed.starts_with('|') {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            table_rows.push(split_table_row(trimmed));
+            continue;
+        }
+        flush_requirement_table(&mut table_rows, &mut requirements);
+
+        let item = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+            .or_else(|| strip_ordered_list_marker(trimmed));
+
+        if let Some(item) = item {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+
+            let item = strip_inline_markdown(item);
+            if !item.is_empty() {
+                current_requirement = Some(item);
+            }
+        } else if let Some(requirement) = &mut current_requirement {
+            requirement.push(' ');
+            requirement.push_str(&strip_inline_markdown(trimmed));
+        }
+    }
+
+    if let Some(requirement) = current_requirement {
+        requirements.push(requirement);
+    }
+    flush_requirement_table(&mut table_rows, &mut requirements);
+
+    requirements.dedup();
+    requirements
+}
+
+/// Split a markdown table row into trimmed cells, honoring `\|` escapes and
+/// dropping the empty leading/trailing cells produced by the outer pipes.
+fn split_table_row(row: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut characters = row.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&'|') => {
+                cell.push('|');
+                characters.next();
+            }
+            '|' => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+            }
+            _ => cell.push(character),
+        }
+    }
+    cells.push(cell.trim().to_string());
+
+    if cells.first().is_some_and(|first| first.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|last| last.is_empty()) {
+        cells.pop();
+    }
+
+    cells
+}
+
+/// The `|---|:---:|` row separating a table header from its data rows.
+fn is_table_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            !cell.is_empty()
+                && cell
+                    .chars()
+                    .all(|character| character == '-' || character == ':')
+        })
+}
+
+/// Convert a buffered `| name | value |` requirements table into one
+/// `name: value` entry per data row. Tables whose header or data rows are
+/// not exactly two columns are dropped whole rather than half-parsed.
+fn flush_requirement_table(table_rows: &mut Vec<Vec<String>>, requirements: &mut Vec<String>) {
+    let rows = std::mem::take(table_rows);
+
+    // Header, separator, and at least one data row.
+    if rows.len() < 3 || !is_table_separator_row(&rows[1]) {
+        return;
+    }
+
+    if !rows.iter().all(|row| row.len() == 2) {
+        return;
+    }
+
+    for row in &rows[2..] {
+        let name = strip_inline_markdown(&row[0]);
+        let value = strip_inline_markdown(&row[1]);
+        if !name.is_empty() && !value.is_empty() {
+            requirements.push(format!("{name}: {value}"));
+        }
+    }
+}
+
+fn is_requirements_heading(heading: &str) -> bool {
+    matches!(
+        heading,
+        "requirements"
+            | "hardware requirements"
+            | "software requirements"
+            | "system requirements"
+            | "toolkit requirements"
+            | "build requirements"
+            | "prerequisites"
+    )
+}
+
+fn format_examples_human(examples: &[ExampleInfo]) -> String {
+    let mut output = String::new();
+
+    for (index, example) in examples.iter().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+
+        output.push_str(&example.name);
+        output.push('\n');
+
+        if example.title != example.name {
+            output.push_str("  ");
+            output.push_str(&example.title);
+            output.push('\n');
+        }
+
+        output.push_str("  ");
+        output.push_str(&example.description);
+        output.push('\n');
+
+        if !example.requirements.is_empty() {
+            output.push_str("  Requirements:\n");
+            for requirement in &example.requirements {
+                output.push_str("    - ");
+                output.push_str(requirement);
+                output.push('\n');
+            }
+        }
+    }
+
+    output
+}
+
+fn format_examples_json(examples: &[ExampleInfo]) -> Result<String, serde_json::Error> {
+    let examples = examples
+        .iter()
+        .map(|example| {
+            serde_json::json!({
+                "name": example.name,
+                "title": example.title,
+                "description": example.description,
+                "requirements": example.requirements,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "examples": examples,
+    });
+
+    let mut output = serde_json::to_string_pretty(&document)?;
+    output.push('\n');
+    Ok(output)
 }
 
 // =============================================================================
@@ -6982,6 +7593,397 @@ clippy-aarch64-apple-darwin
         assert_eq!(result, None);
     }
 
+    fn write_list_example(
+        examples_dir: &Path,
+        name: &str,
+        manifest_description: Option<&str>,
+        readme: Option<&str>,
+    ) {
+        let example_dir = examples_dir.join(name);
+        std::fs::create_dir_all(&example_dir).unwrap();
+
+        let description = manifest_description
+            .map(|value| format!("description = {value:?}\n"))
+            .unwrap_or_default();
+
+        std::fs::write(
+            example_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n{description}"
+            ),
+        )
+        .unwrap();
+
+        if let Some(readme) = readme {
+            std::fs::write(example_dir.join("README.md"), readme).unwrap();
+        }
+    }
+
+    #[test]
+    fn readme_parser_extracts_title_description_and_requirements() {
+        let parsed = parse_example_readme(
+            "vecadd",
+            r#"
+# vecadd
+
+## Vector Addition
+
+Adds two vectors using one CUDA thread per element.
+
+## Hardware Requirements
+
+- **Minimum GPU**: sm_70+
+- **CUDA Toolkit**: 12.x+
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Vector Addition"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Adds two vectors using one CUDA thread per element.")
+        );
+        assert_eq!(
+            parsed.requirements,
+            ["Minimum GPU: sm_70+", "CUDA Toolkit: 12.x+"]
+        );
+    }
+
+    #[test]
+    fn readme_parser_does_not_use_run_as_title() {
+        let parsed = parse_example_readme(
+            "cuda_module_nested",
+            r#"
+# cuda_module_nested
+
+## Run
+
+Expected output:
+
+```text
+PASS
+```
+
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("cuda_module_nested"));
+        assert_eq!(parsed.description, None);
+    }
+
+    #[test]
+    fn readme_parser_does_not_scan_later_headings_for_title() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+
+# example
+
+Introductory description.
+
+## Build
+
+Build instructions.
+
+## Advanced Implementation Details
+
+Internal details.
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("example"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Introductory description.")
+        );
+    }
+
+    #[test]
+    fn readme_parser_stops_description_at_next_heading() {
+        let parsed = parse_example_readme(
+            "vecadd",
+            r#"
+
+# vecadd
+
+## Vector Addition
+
+Adds two vectors on the GPU.
+
+## Run
+
+Run the example with cargo oxide.
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Vector Addition"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Adds two vectors on the GPU.")
+        );
+    }
+
+    #[test]
+    fn requirement_parser_joins_wrapped_list_items() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+
+# example
+
+## Requirements
+
+* CUDA Toolkit 13.1+ with nvcc and tileiras available. This example
+  also requires the CUDA development libraries.
+* Blackwell GPU with sm_100+ support.
+  "#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit 13.1+ with nvcc and tileiras available. This example also requires the CUDA development libraries.",
+                "Blackwell GPU with sm_100+ support.",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_does_not_absorb_paragraph_after_blank_line() {
+        // Modeled on the cpp_consumes_rust_device README: a bullet list under
+        // the requirements heading, then a blank line, then a follow-up
+        // paragraph and a code fence. The paragraph is a new paragraph, not a
+        // wrapped continuation of the last bullet.
+        let parsed = parse_example_readme(
+            "cpp_consumes_rust_device",
+            r#"
+# cpp_consumes_rust_device
+
+## Prerequisites
+
+- CUDA Toolkit (nvcc, libNVVM, nvJitLink)
+- Blackwell+ GPU (sm_100+) — LTOIR requires NVVM 20 dialect
+
+If your default host compiler is newer than the CUDA Toolkit supports, set
+`NVCC_CCBIN` or `CUDAHOSTCXX` before running the example:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-15 cargo oxide run cpp_consumes_rust_device
+```
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit (nvcc, libNVVM, nvJitLink)",
+                "Blackwell+ GPU (sm_100+) — LTOIR requires NVVM 20 dialect",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_joins_wrapped_items_but_not_following_paragraphs() {
+        // Modeled on the cutile_inter_kernel README: the last bullet wraps
+        // across indented lines (joined), and the paragraph after the blank
+        // line must not be glued onto it.
+        let parsed = parse_example_readme(
+            "cutile_inter_kernel",
+            r#"
+# cutile_inter_kernel
+
+## Requirements
+
+- cuda-oxide from this repository.
+- CUDA Toolkit 13.1+ with `nvcc` and `tileiras` available. This example
+  defaults `CUDA_TOOLKIT_PATH` to `/usr/local/cuda` through its local Cargo
+  config; set `CUDA_TOOLKIT_PATH` yourself if your toolkit lives elsewhere.
+
+`cargo oxide run` targets explicit `--arch` first, then `CUDA_OXIDE_TARGET`,
+then auto-detects the local GPU.
+
+## Run
+
+Run instructions.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "cuda-oxide from this repository.",
+                "CUDA Toolkit 13.1+ with nvcc and tileiras available. This example \
+                 defaults CUDA_TOOLKIT_PATH to /usr/local/cuda through its local Cargo \
+                 config; set CUDA_TOOLKIT_PATH yourself if your toolkit lives elsewhere.",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_captures_ordered_list_items() {
+        // Modeled on the mathdx_ffi_test README: prerequisites written as an
+        // ordered list, followed by a paragraph that is not part of the list.
+        let parsed = parse_example_readme(
+            "mathdx_ffi_test",
+            r#"
+# mathdx_ffi_test
+
+## Prerequisites
+
+1. **CUDA Toolkit 12.x+** with nvcc
+2. **MathDx Library** - Download from: https://developer.nvidia.com/cublasdx-downloads
+3. **cuda-oxide compiler** toolchain
+
+If your default host compiler is newer than the CUDA Toolkit supports, set
+`NVCC_CCBIN` or `CUDAHOSTCXX` before running the example.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit 12.x+ with nvcc",
+                "MathDx Library - Download from: https://developer.nvidia.com/cublasdx-downloads",
+                "cuda-oxide compiler toolchain",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_recognizes_build_requirements_heading() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+# example
+
+## Build Requirements
+
+- nvcc with `--expt-relaxed-constexpr`
+"#,
+        );
+
+        assert_eq!(parsed.requirements, ["nvcc with --expt-relaxed-constexpr"]);
+    }
+
+    #[test]
+    fn requirement_parser_parses_two_column_requirement_tables() {
+        // Modeled on the abi_hmm README: requirements in a two-column table,
+        // including an escaped pipe inside a cell.
+        let parsed = parse_example_readme(
+            "abi_hmm",
+            r#"
+# abi_hmm
+
+## Requirements
+
+| Requirement   | Minimum                                           |
+|---------------|---------------------------------------------------|
+| GPU           | Turing or newer (RTX 20xx+)                       |
+| Linux Kernel  | 6.1.24+                                           |
+| HMM Support   | `nvidia-smi -q \| grep Addressing` shows "HMM"    |
+
+## Build and Run
+
+Instructions.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "GPU: Turing or newer (RTX 20xx+)",
+                "Linux Kernel: 6.1.24+",
+                "HMM Support: nvidia-smi -q | grep Addressing shows \"HMM\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_skips_tables_that_are_not_two_columns() {
+        // A three-column table has no unambiguous name/value mapping, so it
+        // must be skipped whole instead of half-parsed.
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+# example
+
+## Requirements
+
+| Test  | Status | Description |
+|-------|--------|-------------|
+| alpha | Pass   | First test  |
+| beta  | Pass   | Second test |
+"#,
+        );
+
+        assert_eq!(parsed.requirements, Vec::<String>::new());
+    }
+
+    #[test]
+    fn example_discovery_is_sorted_and_uses_manifest_fallback() {
+        let root = unique_temp_dir("cargo_oxide_list_examples");
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_list_example(&root, "zeta", Some("Manifest fallback description"), None);
+
+        write_list_example(
+            &root,
+            "alpha",
+            None,
+            Some("# alpha\n\n## Alpha Example\n\nREADME description.\n"),
+        );
+
+        let examples = discover_examples(&root).unwrap();
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(examples[0].description, "README description.");
+        assert_eq!(examples[1].description, "Manifest fallback description");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn example_discovery_keeps_examples_without_readmes() {
+        let root = unique_temp_dir("cargo_oxide_list_missing_readme");
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_list_example(&root, "minimal", None, None);
+
+        let examples = discover_examples(&root).unwrap();
+
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].name, "minimal");
+        assert_eq!(examples[0].description, "No description documented.");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn example_discovery_skips_directory_without_manifest() {
+        let root = unique_temp_dir("cargo_oxide_list_missing_manifest");
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+
+        write_list_example(&root, "real", Some("A real example"), None);
+
+        let examples =
+            discover_examples(&root).expect("manifest-less directories must not abort listing");
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.name.as_str())
+                .collect::<Vec<_>>(),
+            ["real"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn ptx_artifact_paths_normalize_hyphenated_example_names() {
         let root = unique_temp_dir("cargo_oxide_inspect_regular");
@@ -7061,6 +8063,27 @@ edition = "2024"
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_json_has_versioned_stable_shape() {
+        let examples = vec![ExampleInfo {
+            name: "vecadd".to_string(),
+            title: "Vector Addition".to_string(),
+            description: "Adds two vectors.".to_string(),
+            requirements: vec!["Minimum GPU: sm_70+".to_string()],
+        }];
+
+        let output = format_examples_json(&examples).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["examples"][0]["name"], "vecadd");
+        assert_eq!(
+            value["examples"][0]["requirements"][0],
+            "Minimum GPU: sm_70+"
+        );
+        assert!(output.ends_with('\n'));
     }
 
     #[test]
