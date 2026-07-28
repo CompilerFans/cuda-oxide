@@ -2660,6 +2660,229 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 // Doctor command
 // =============================================================================
 
+/// Parsed contents of a `rust-toolchain.toml` pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustToolchainPin {
+    channel: String,
+    components: Vec<String>,
+}
+
+/// Components that doctor treats as hard requirements for the cuda-oxide
+/// pipeline even if `rust-toolchain.toml` stops listing them: `rust-src`
+/// (device-side core sources), `rustc-dev` (rustc_private, required to build
+/// the codegen backend), and `llvm-tools`.
+const DOCTOR_REQUIRED_COMPONENTS: &[&str] = &["rust-src", "rustc-dev", "llvm-tools"];
+
+/// The components doctor verifies for a pin: everything the pin itself lists,
+/// plus the [`DOCTOR_REQUIRED_COMPONENTS`] floor.
+///
+/// rustup auto-installs every component named in `rust-toolchain.toml` when it
+/// installs the pinned toolchain, so a pinned component that is absent from
+/// `rustup component list --installed` means a broken or manually trimmed
+/// install and is worth failing doctor over. The floor guards against a future
+/// edit of the pin file dropping a component the pipeline genuinely needs.
+fn doctor_verified_components(pin: &RustToolchainPin) -> Vec<String> {
+    let mut required: Vec<String> = pin.components.clone();
+    for component in DOCTOR_REQUIRED_COMPONENTS {
+        if !required.iter().any(|existing| existing == component) {
+            required.push((*component).to_string());
+        }
+    }
+    required
+}
+
+/// Parse a `rust-toolchain.toml` document for channel and components.
+fn parse_rust_toolchain_toml(contents: &str) -> Result<RustToolchainPin, String> {
+    let value: toml::Value =
+        toml::from_str(contents).map_err(|error| format!("invalid TOML: {error}"))?;
+    let toolchain = value
+        .get("toolchain")
+        .ok_or_else(|| "missing [toolchain] table".to_string())?;
+    let channel = toolchain
+        .get("channel")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
+        .ok_or_else(|| "missing toolchain.channel".to_string())?
+        .to_string();
+    let components = match toolchain.get("components") {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        "toolchain.components entries must be non-empty strings".to_string()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err("toolchain.components must be an array of strings".to_string());
+        }
+    };
+    Ok(RustToolchainPin {
+        channel,
+        components,
+    })
+}
+
+/// True when `rustup show active-toolchain` output matches the pinned channel.
+///
+/// The toolchain name is the first whitespace-delimited token of the first
+/// line in every rustup output format seen so far:
+///
+/// - pre-1.28 and 1.29+: `nightly-2026-04-03-<triple> (default)` or
+///   `nightly-2026-04-03-<triple> (overridden by '<path>')` on one line
+///   (verified against rustup 1.29.0);
+/// - 1.28.x: the bare name on the first line with the reason on a second
+///   `active because: ...` line.
+fn active_toolchain_matches_channel(active_toolchain: &str, channel: &str) -> bool {
+    let active = active_toolchain
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if active.is_empty() || channel.is_empty() {
+        return false;
+    }
+    active == channel || active.starts_with(&format!("{channel}-"))
+}
+
+/// Return required components that are absent from `rustup component list --installed`.
+fn missing_rustup_components<S: AsRef<str>>(installed_list: &str, required: &[S]) -> Vec<String> {
+    required
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|component| !rustup_component_installed(installed_list, component))
+        .map(str::to_string)
+        .collect()
+}
+
+fn rustup_component_installed(installed_list: &str, component: &str) -> bool {
+    installed_list.lines().any(|line| {
+        let name = line.split_whitespace().next().unwrap_or("");
+        name == component || name.starts_with(&format!("{component}-"))
+    })
+}
+
+fn doctor_report_toolchain_pin(ctx: &Context, ok: &mut bool) {
+    let toolchain_file = ctx.workspace_root.join("rust-toolchain.toml");
+    print!("rust-toolchain.toml... ");
+    if !toolchain_file.exists() {
+        println!("✗ not found at {}", toolchain_file.display());
+        *ok = false;
+        return;
+    }
+
+    let contents = match std::fs::read_to_string(&toolchain_file) {
+        Ok(contents) => contents,
+        Err(error) => {
+            println!("✗ present but unreadable ({error})");
+            *ok = false;
+            return;
+        }
+    };
+
+    let pin = match parse_rust_toolchain_toml(&contents) {
+        Ok(pin) => pin,
+        Err(error) => {
+            println!("✗ present but invalid ({error})");
+            *ok = false;
+            return;
+        }
+    };
+    println!("✓ channel {}", pin.channel);
+
+    print!("Pinned toolchain active... ");
+    match Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let active = String::from_utf8_lossy(&output.stdout);
+            let active = active.trim();
+            if active_toolchain_matches_channel(active, &pin.channel) {
+                println!("✓ {active}");
+            } else {
+                println!(
+                    "✗ active `{active}`, expected `{pin_channel}`",
+                    pin_channel = pin.channel
+                );
+                eprintln!(
+                    "  Install/select the pin with `rustup toolchain install {}` and reopen the shell",
+                    pin.channel
+                );
+                eprintln!("  in this workspace so rust-toolchain.toml can select it.");
+                *ok = false;
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("✗ rustup show active-toolchain failed");
+            if !stderr.trim().is_empty() {
+                eprintln!("  {}", stderr.trim());
+            }
+            *ok = false;
+        }
+        Err(_) => {
+            println!("✗ rustup not found");
+            eprintln!("  Install rustup from https://rustup.rs/ so doctor can verify the pin.");
+            *ok = false;
+        }
+    }
+
+    let required = doctor_verified_components(&pin);
+
+    print!("Required rustup components... ");
+    match Command::new("rustup")
+        .args([
+            "component",
+            "list",
+            "--installed",
+            "--toolchain",
+            &pin.channel,
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let installed = String::from_utf8_lossy(&output.stdout);
+            let missing = missing_rustup_components(&installed, &required);
+            if missing.is_empty() {
+                println!("✓ {}", required.join(", "));
+            } else {
+                println!("✗ missing {}", missing.join(", "));
+                eprintln!(
+                    "  Install with `rustup component add --toolchain {} {}`",
+                    pin.channel,
+                    missing.join(" ")
+                );
+                *ok = false;
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("✗ could not list components for {}", pin.channel);
+            if !stderr.trim().is_empty() {
+                eprintln!("  {}", stderr.trim());
+            }
+            eprintln!(
+                "  Try `rustup toolchain install {channel} -c {components}`",
+                channel = pin.channel,
+                components = required.join(" -c ")
+            );
+            *ok = false;
+        }
+        Err(_) => {
+            println!("✗ rustup not found");
+            *ok = false;
+        }
+    }
+}
+
 /// Validate the development environment.
 ///
 /// Checks for: Rust nightly toolchain, `rust-toolchain.toml`, the codegen
@@ -2698,15 +2921,8 @@ pub fn doctor(ctx: &Context) {
         }
     }
 
-    // 2. rust-toolchain.toml
-    let toolchain_file = ctx.workspace_root.join("rust-toolchain.toml");
-    print!("rust-toolchain.toml... ");
-    if toolchain_file.exists() {
-        println!("✓ present");
-    } else {
-        println!("✗ not found at {}", toolchain_file.display());
-        ok = false;
-    }
+    // 2. rust-toolchain.toml pin + active channel + required components
+    doctor_report_toolchain_pin(ctx, &mut ok);
 
     // 3. Backend .so. Informational, not fatal: `run`/`build`/`pipeline`
     // build the backend on demand, so "not built yet" is a healthy state
@@ -6381,6 +6597,119 @@ device-owner = { path = "../device-owner" }
             cuda_header_candidates("/opt/ctk", "riscv64"),
             vec![PathBuf::from("/opt/ctk/include/cuda.h")]
         );
+    }
+
+    #[test]
+    fn parse_rust_toolchain_toml_reads_channel_and_components() {
+        let pin = parse_rust_toolchain_toml(
+            r#"[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "llvm-tools"]
+"#,
+        )
+        .expect("pin should parse");
+        assert_eq!(pin.channel, "nightly-2026-04-03");
+        assert_eq!(
+            pin.components,
+            vec![
+                "rust-src".to_string(),
+                "rustc-dev".to_string(),
+                "llvm-tools".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rust_toolchain_toml_rejects_missing_channel() {
+        let error = parse_rust_toolchain_toml("[toolchain]\ncomponents = [\"rust-src\"]\n")
+            .expect_err("channel is required");
+        assert!(error.contains("channel"), "{error}");
+    }
+
+    #[test]
+    fn active_toolchain_matches_channel_accepts_target_triple_suffix() {
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-aarch64-apple-darwin (default)",
+            "nightly-2026-04-03"
+        ));
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03",
+            "nightly-2026-04-03"
+        ));
+        assert!(!active_toolchain_matches_channel(
+            "nightly-2026-01-01-x86_64-unknown-linux-gnu (default)",
+            "nightly-2026-04-03"
+        ));
+    }
+
+    #[test]
+    fn active_toolchain_matches_channel_accepts_rustup_128_and_129_formats() {
+        // rustup 1.29 single-line form with an override annotation, as
+        // observed verbatim on a workspace with rust-toolchain.toml.
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-x86_64-unknown-linux-gnu (overridden by \
+             '/home/user/cuda-oxide/rust-toolchain.toml')",
+            "nightly-2026-04-03"
+        ));
+        // rustup 1.28 two-line form: bare name, then the reason line.
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-x86_64-unknown-linux-gnu\nactive because: \
+             overridden by '/home/user/cuda-oxide/rust-toolchain.toml'",
+            "nightly-2026-04-03"
+        ));
+        // A mismatched pin must not be rescued by later lines.
+        assert!(!active_toolchain_matches_channel(
+            "stable-x86_64-unknown-linux-gnu\nactive because: default",
+            "nightly-2026-04-03"
+        ));
+    }
+
+    #[test]
+    fn doctor_verified_components_unions_pin_list_with_required_floor() {
+        // Pin lists everything: order preserved, no duplicates appended.
+        let pin = RustToolchainPin {
+            channel: "nightly-2026-04-03".to_string(),
+            components: vec![
+                "rust-src".to_string(),
+                "rustc-dev".to_string(),
+                "rust-analyzer".to_string(),
+                "clippy".to_string(),
+                "llvm-tools".to_string(),
+            ],
+        };
+        assert_eq!(
+            doctor_verified_components(&pin),
+            vec![
+                "rust-src",
+                "rustc-dev",
+                "rust-analyzer",
+                "clippy",
+                "llvm-tools"
+            ]
+        );
+
+        // A trimmed pin still gets the hard floor appended.
+        let trimmed = RustToolchainPin {
+            channel: "nightly-2026-04-03".to_string(),
+            components: vec!["clippy".to_string()],
+        };
+        assert_eq!(
+            doctor_verified_components(&trimmed),
+            vec!["clippy", "rust-src", "rustc-dev", "llvm-tools"]
+        );
+    }
+
+    #[test]
+    fn missing_rustup_components_detects_host_triple_suffixes() {
+        let installed = "\
+rust-src-aarch64-apple-darwin
+clippy-aarch64-apple-darwin
+";
+        assert_eq!(
+            missing_rustup_components(installed, &["rust-src", "llvm-tools"]),
+            vec!["llvm-tools".to_string()]
+        );
+        assert!(missing_rustup_components(installed, &["rust-src"]).is_empty());
     }
 
     #[test]
