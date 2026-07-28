@@ -387,18 +387,18 @@ gpu_printf!("thread %d: val = %f\n", tid as i32, val as f64);
 
 ## `ptx_asm!` -- Inline PTX
 
-Supports CUDA inline PTX with `%0` operands, `in` / `out` operands, CUDA
-register constraints `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and `"d"`,
-immediate integer constraint `"n"`, and compile-time string constraint `"C"`.
-The template follows CUDA's `%` convention (`%0` operands, `%%laneid` literal
-registers), and `$` labels can be written normally. For the source syntax, see
-CUDA's
+Supports CUDA inline PTX with `%0` operands, `in`, `out`, and `inout`
+operands, CUDA register constraints `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and
+`"d"`, immediate integer constraint `"n"`, and compile-time string constraint
+`"C"`. The template follows CUDA's `%` convention (`%0` operands, `%%laneid`
+literal registers), and `$` labels can be written normally. For the source
+syntax, see CUDA's
 [Inline PTX Assembly](https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html)
 reference.
 
 By default, snippets are treated as side-effecting and stay inside their current
 control flow. For snippets that only read explicit operands and write the
-explicit output, add `options(register_only)`.
+explicit outputs, add `options(register_only)`.
 
 Use `options(register_only, may_diverge)` only for pure snippets that are safe
 to move across divergent control flow. **Never** use it for `.sync` instructions,
@@ -417,10 +417,16 @@ unsafe {
 }
 ```
 
-The surface supports up to 16 `out` operands, up to 16 `in` operands, and
-`clobber("memory")`. Every `out` constraint must be `=`-prefixed (e.g.
-`"=r"`); with two or more `out` operands the snippet returns a tuple under
-the hood, destructured into the output places in declaration order:
+The surface supports up to 16 output operands across `out` and `inout`, up to
+16 explicit `in` operands, and `clobber("memory")`. Every `out` constraint must
+be `=`-prefixed, such as `"=r"`. Every `inout` constraint must be `+`-prefixed,
+such as `"+r"`; its current value initializes the PTX output register and the
+final register value is written back to the same Rust place. All `out` and
+`inout` operands must appear before explicit `in` operands.
+
+With two or more output operands, including any mixture of `out` and `inout`,
+the marker returns a tuple under the hood and the macro writes its elements
+back to the output places in declaration order:
 
 ```rust
 let sum: u32;
@@ -432,6 +438,20 @@ unsafe {
         out("=r") prod,
         in("r") x,
         in("r") y,
+        options(register_only),
+    );
+}
+```
+
+Read-write operands use `inout`:
+
+```rust
+let mut accumulator = initial;
+unsafe {
+    ptx_asm!(
+        "add.u32 %0, %0, %1;",
+        inout("+r") accumulator,
+        in("r") increment,
         options(register_only),
     );
 }
@@ -460,9 +480,9 @@ become a runtime LLVM inline-assembly operand. One trailing zero byte is
 removed when present. Constraint modifiers such as `"=C"` and `"+C"` are not
 supported. `"C"` operands count toward the 16-input limit.
 
-`options(register_only)` requires an `out` operand and cannot be combined
-with clobbers. `options(may_diverge)` must be paired with `register_only`.
-More than 16 outputs and read-write operands are not implemented yet.
+`options(register_only)` requires an `out` or `inout` operand and cannot be
+combined with clobbers. `options(may_diverge)` must be paired with
+`register_only`. More than 16 output operands are not implemented yet.
 
 ## Source Layout
 
