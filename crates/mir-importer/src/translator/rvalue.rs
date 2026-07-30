@@ -5084,6 +5084,17 @@ fn validate_ptr_to_array_constant_type(
     )
 }
 
+fn constant_allocation(constant: &mir::ConstOperand) -> Option<&rustc_public::ty::Allocation> {
+    match constant.const_.kind() {
+        ConstantKind::Allocated(alloc) => Some(alloc),
+        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+            rustc_public::ty::TyConstKind::Value(_, alloc) => Some(alloc),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn aggregate_allocation_bytes(alloc: &rustc_public::ty::Allocation) -> Vec<u8> {
     alloc.raw_bytes().ok().unwrap_or_else(|| {
         alloc
@@ -5334,6 +5345,12 @@ fn translate_pointer_relocation_from_allocation(
         prev_op,
         loc,
     )
+}
+
+fn constant_pointer_relocation_count(constant: &mir::ConstOperand) -> usize {
+    constant_allocation(constant)
+        .map(|allocation| allocation.provenance.ptrs.len())
+        .unwrap_or(0)
 }
 
 /// Lower a bare `MirArrayType` value constant (e.g. `const TABLE: [f32; N] =
@@ -6166,10 +6183,7 @@ fn translate_struct_constant(
                 let allocation = struct_allocation.expect(
                     "relocation offsets can only be returned for a retained struct allocation",
                 );
-                let static_target = static_target_from_allocation_relocation(
-                    allocation,
-                    byte_offset,
-                )?
+                let static_target = static_target_from_allocation_at(allocation, byte_offset)?
                     .ok_or_else(|| {
                         input_error_noloc!(TranslationErr::unsupported(format!(
                         "Struct constant pointer field {} targets an anonymous allocation; only Rust static targets are currently supported",
@@ -6309,21 +6323,38 @@ fn translate_struct_constant(
     Ok((val, Some(op)))
 }
 
-fn constant_pointer_relocation_count(constant: &mir::ConstOperand) -> usize {
-    match constant.const_.kind() {
-        ConstantKind::Allocated(alloc) => alloc.provenance.ptrs.len(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            rustc_public::ty::TyConstKind::Value(_, alloc) => alloc.provenance.ptrs.len(),
-            _ => 0,
-        },
-        _ => 0,
+/// Byte image for a tuple constant, or `None` when a sized tuple has no
+/// backing allocation.
+///
+/// Undefined bytes in an allocation are padding; they are zeroed
+/// deterministically while the provenance map stays available separately for
+/// pointer-field reconstruction. `ConstantKind::ZeroSized`-style constants
+/// (e.g. `((), ())`) carry no allocation at all; a zero-byte layout is
+/// reproduced exactly by an empty image.
+fn tuple_constant_byte_image(
+    allocation: Option<&rustc_public::ty::Allocation>,
+    layout_size: usize,
+) -> Option<Vec<u8>> {
+    match allocation {
+        Some(allocation) => Some(
+            allocation
+                .bytes
+                .iter()
+                .map(|byte| byte.unwrap_or(0))
+                .collect(),
+        ),
+        None if layout_size == 0 => Some(Vec::new()),
+        None => None,
     }
 }
 
-/// Translate a non-empty direct tuple constant from its raw allocation bytes.
+/// Translate a non-empty tuple constant from its own allocation image.
 ///
-/// Direct tuple constants containing pointer relocations remain unsupported.
-/// Tuple elements nested in arrays use the allocation-aware decoder below.
+/// Unlike `constant_bytes`, this must not follow the first provenance entry:
+/// for a by-value tuple, that entry names one pointer field's target, while the
+/// allocation itself still contains the tuple's scalar fields and padding.
+/// Pointer fields consume their relocation entries through the
+/// allocation-aware decoder below.
 fn translate_tuple_constant(
     ctx: &mut Context,
     constant: &mir::ConstOperand,
@@ -6333,19 +6364,43 @@ fn translate_tuple_constant(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
-    let relocation_count = constant_pointer_relocation_count(constant);
-    if relocation_count != 0 {
-        return input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "Tuple constant contains {relocation_count} pointer relocation(s); \
-                 cuda-oxide cannot yet preserve tuple pointer provenance"
-            ))
-        );
-    }
+    let layout_size = rust_ty
+        .layout()
+        .map_err(|error| {
+            input_error!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "Failed to query layout for tuple constant: {error:?}"
+                ))
+            )
+        })?
+        .shape()
+        .size
+        .bytes();
 
-    let bytes = constant_bytes(constant, "tuple", loc.clone())?;
-    translate_tuple_constant_from_bytes(ctx, rust_ty, const_ty_ptr, &bytes, block_ptr, prev_op, loc)
+    let allocation = constant_allocation(constant);
+    let bytes = tuple_constant_byte_image(allocation, layout_size).ok_or_else(|| {
+        input_error!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "Tuple constant of {layout_size} byte(s) must be backed by an allocation, \
+                 found {:?}",
+                constant.const_.kind()
+            ))
+        )
+    })?;
+
+    translate_tuple_constant_from_allocation(
+        ctx,
+        rust_ty,
+        const_ty_ptr,
+        allocation,
+        &bytes,
+        0,
+        block_ptr,
+        prev_op,
+        loc,
+    )
 }
 
 /// Byte-only compatibility wrapper for aggregate decoders whose source contains
@@ -6944,14 +6999,7 @@ fn translate_enum_constant(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
-    let relocation_count = match constant.const_.kind() {
-        ConstantKind::Allocated(alloc) => alloc.provenance.ptrs.len(),
-        ConstantKind::Ty(ty_const) => match ty_const.kind() {
-            rustc_public::ty::TyConstKind::Value(_, alloc) => alloc.provenance.ptrs.len(),
-            _ => 0,
-        },
-        _ => 0,
-    };
+    let relocation_count = constant_pointer_relocation_count(constant);
     if relocation_count != 0 {
         return input_err!(
             loc,
@@ -8684,28 +8732,68 @@ struct StaticPointerTarget {
     byte_offset: u64,
 }
 
-fn static_target_from_allocation_relocation(
+fn static_target_from_constant(
+    constant: &mir::ConstOperand,
+    loc: Location,
+) -> TranslationResult<Option<StaticPointerTarget>> {
+    let ConstantKind::Allocated(allocation) = constant.const_.kind() else {
+        return Ok(None);
+    };
+
+    if allocation.is_null().unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let Some(&(relocation_offset, _)) = allocation.provenance.ptrs.first() else {
+        return Ok(None);
+    };
+
+    if allocation.provenance.ptrs.len() != 1 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "constant pointer contains {} provenance entries; expected one static target",
+                allocation.provenance.ptrs.len()
+            ))
+        );
+    }
+    static_target_from_allocation_at(allocation, relocation_offset)
+}
+
+/// Resolve the pointer relocation beginning at `relocation_offset` to a static.
+///
+/// Unlike `static_target_from_constant`, this operates on an aggregate's own
+/// allocation and therefore does not require that the allocation contain only
+/// one relocation.
+fn static_target_from_allocation_at(
     allocation: &rustc_public::ty::Allocation,
-    provenance_offset: usize,
+    relocation_offset: usize,
 ) -> TranslationResult<Option<StaticPointerTarget>> {
     use rustc_public::mir::alloc::GlobalAlloc;
 
-    let Some(&(_, provenance)) = allocation
+    let Some(&(provenance_offset, provenance)) = allocation
         .provenance
         .ptrs
         .iter()
-        .find(|entry| entry.0 == provenance_offset)
+        .find(|(offset, _)| *offset == relocation_offset)
     else {
         return Ok(None);
     };
 
     let pointer_width = rustc_public::target::MachineInfo::target_pointer_width().bytes();
+    let pointer_end = provenance_offset
+        .checked_add(pointer_width)
+        .ok_or_else(|| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "constant static-pointer relocation at byte {provenance_offset} overflowed"
+            )))
+        })?;
     let byte_offset = allocation
-        .read_partial_uint(provenance_offset..provenance_offset + pointer_width)
+        .read_partial_uint(provenance_offset..pointer_end)
         .map_err(|error| {
             input_error_noloc!(TranslationErr::unsupported(format!(
-                "Failed to read constant static-pointer addend at byte offset {}: {:?}",
-                provenance_offset, error
+                "Failed to read constant static-pointer addend at byte {provenance_offset}: \
+                 {error:?}"
             )))
         })? as u64;
 
@@ -8716,33 +8804,6 @@ fn static_target_from_allocation_relocation(
         })),
         _ => Ok(None),
     }
-}
-
-fn static_target_from_constant(
-    constant: &mir::ConstOperand,
-    loc: Location,
-) -> TranslationResult<Option<StaticPointerTarget>> {
-    let ConstantKind::Allocated(alloc) = constant.const_.kind() else {
-        return Ok(None);
-    };
-    if alloc.is_null().unwrap_or(false) {
-        return Ok(None);
-    }
-
-    let Some(&(provenance_offset, _)) = alloc.provenance.ptrs.first() else {
-        return Ok(None);
-    };
-    if alloc.provenance.ptrs.len() != 1 {
-        return input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "constant pointer contains {} provenance entries; expected one static target",
-                alloc.provenance.ptrs.len()
-            ))
-        );
-    }
-
-    static_target_from_allocation_relocation(alloc, provenance_offset)
 }
 
 /// The byte image and ABI alignment of a global initializer.
@@ -9694,6 +9755,39 @@ mod enum_niche_decode_tests {
             decode_niche_variant_index(0, u8::MAX.into(), u8::MAX.into(), 3, 4, 1),
             4,
             "u8 carrier value 0 is one step after niche_start 255"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tuple_constant_byte_image_tests {
+    use super::tuple_constant_byte_image;
+    use rustc_public::mir::Mutability;
+    use rustc_public::ty::{Allocation, ProvenanceMap};
+
+    #[test]
+    fn zst_tuple_constant_without_allocation_is_an_empty_image() {
+        // `ConstantKind::ZeroSized`-style tuple constants such as `((), ())`
+        // carry no allocation; a zero-byte layout translates as empty bytes.
+        assert_eq!(tuple_constant_byte_image(None, 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn sized_tuple_constant_without_allocation_is_rejected() {
+        assert_eq!(tuple_constant_byte_image(None, 16), None);
+    }
+
+    #[test]
+    fn allocation_padding_bytes_are_zeroed_deterministically() {
+        let allocation = Allocation {
+            bytes: vec![Some(0xAB), None, None, Some(0xCD)],
+            provenance: ProvenanceMap { ptrs: Vec::new() },
+            align: 4,
+            mutability: Mutability::Not,
+        };
+        assert_eq!(
+            tuple_constant_byte_image(Some(&allocation), 4),
+            Some(vec![0xAB, 0, 0, 0xCD])
         );
     }
 }

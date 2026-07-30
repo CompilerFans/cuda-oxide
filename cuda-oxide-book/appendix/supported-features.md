@@ -33,7 +33,7 @@ roadmap, **N/A** = not applicable or no identified need.
 | ABI Scalarization | **Full** | Slices are scalarized at kernel boundaries (`&[T]` -> `(ptr, len)`, reconstructed inside the function). Structs and closures pass by value as one byval `.param`; field flattening still applies on internal device-to-device calls. |
 
 Array value constants support primitive leaves (integers, `f16`, `f32`,
-`f64`), nested arrays, and tuples recursively composed from supported scalar,
+`f64`), nested arrays, and tuples recursively composed of supported scalar,
 enum, tuple, and zero-sized fields. Tuple element strides and field offsets
 come from rustc layout, including internal and trailing padding; direct tuple
 value constants use the same layout-aware decoder. Struct constants (direct
@@ -42,9 +42,12 @@ so padded, reordered, `#[repr(C)]`, and nested shapes decode correctly, and a
 struct's stored size is its padded size, which fixes the element stride for
 arrays of padded structs inside constants. Arrays whose elements are structs
 or initialized unions are not yet materialized as constants. Tuple array
-constants may contain supported pointers to device statics, including sized
-static subobjects. Pointer-bearing direct tuple, struct, enum, and
-device-global initializers remain unsupported.
+constants and direct tuple value constants preserve pointer provenance for
+thin references targeting device statics, including non-zero byte addends,
+and struct constants materialize thin pointer fields that relocate to
+device statics. Pointer-bearing enum constants, promoted-memory targets,
+fat-pointer fields, and device-global initializers remain unsupported and
+fail with an explicit diagnostic.
 
 ## Compiler: Closures
 
