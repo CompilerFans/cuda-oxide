@@ -30,11 +30,11 @@
 use crate::context::{DynamicSmemAlignmentMap, SharedGlobalsMap};
 use crate::convert::types::{
     StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
-    is_zero_sized_type, mir_type_abi_align,
+    is_zero_sized_type,
 };
 
 use dialect_mir::ops::MirFuncOp;
-use dialect_mir::types::{MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType};
+use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
 use llvm_export::ops as llvm;
 use pliron::{
     basic_block::BasicBlock,
@@ -49,7 +49,7 @@ use pliron::{
     op::Op,
     operation::Operation,
     result::Result,
-    r#type::{TypeHandle, Typed},
+    r#type::TypeHandle,
     value::Value,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -278,11 +278,6 @@ pub fn convert_func(
             (Some(body), Some(contract)) => Some(body.max(contract)),
             (body, contract) => body.or(contract),
         };
-
-        // Stamp ABI alignment onto load/store/alloca/ref ops while types are
-        // still MIR — repr(align(N)) is visible on MirStructType but lost after
-        // type conversion (LLVM struct types carry no over-alignment).
-        stamp_memory_op_alignment(ctx, &mir_blocks);
 
         if let Some(align) = max_align {
             let symbol_name: pliron::identifier::Identifier =
@@ -707,63 +702,6 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
         pliron::result::ErrorKind::VerificationFailed,
         pliron::result::StringError(e.to_string())
     )
-}
-
-// ============================================================================
-// Alignment Pre-Pass
-// ============================================================================
-
-/// Stamp the true ABI alignment onto every `mir.load`, `mir.store`,
-/// `mir.alloca`, and `mir.ref` whose accessed/allocated type carries a
-/// rustc ABI alignment. Arrays inherit it recursively from their element.
-///
-/// Must run BEFORE `inline_region` moves the blocks and BEFORE dialect
-/// conversion replaces MIR types with LLVM types, since the alignment
-/// information lives on the MIR types and is not expressible on LLVM
-/// struct types.
-fn stamp_memory_op_alignment(ctx: &mut Context, mir_blocks: &[Ptr<BasicBlock>]) {
-    let load_id = dialect_mir::ops::MirLoadOp::get_opid_static();
-    let store_id = dialect_mir::ops::MirStoreOp::get_opid_static();
-    let alloca_id = dialect_mir::ops::MirAllocaOp::get_opid_static();
-    let ref_id = dialect_mir::ops::MirRefOp::get_opid_static();
-
-    // Collect (op, align) first (read-only pass), then stamp (write pass).
-    let mut to_stamp: Vec<(Ptr<Operation>, u64)> = Vec::new();
-    for mir_block in mir_blocks {
-        let ops: Vec<_> = mir_block.deref(ctx).iter(ctx).collect();
-        for op in ops {
-            let op_id = Operation::get_opid(op, ctx);
-            let align = if op_id == load_id {
-                // load: result(0) is the loaded value.
-                mir_type_abi_align(ctx, op.deref(ctx).get_result(0).get_type(ctx))
-            } else if op_id == store_id {
-                // store: operand(1) is the stored value.
-                mir_type_abi_align(ctx, op.deref(ctx).get_operand(1).get_type(ctx))
-            } else if op_id == alloca_id {
-                // alloca: pointee type lives inside the MirPtrType result.
-                let res_ty = op.deref(ctx).get_result(0).get_type(ctx);
-                res_ty
-                    .deref(ctx)
-                    .downcast_ref::<MirPtrType>()
-                    .map(|p| p.pointee)
-                    .and_then(|pointee| mir_type_abi_align(ctx, pointee))
-            } else if op_id == ref_id {
-                // ref: operand(0) is the value being referenced (spilled to
-                // stack). The synthesised alloca+store in convert_ref must
-                // honour the value type's recorded alignment.
-                mir_type_abi_align(ctx, op.deref(ctx).get_operand(0).get_type(ctx))
-            } else {
-                None
-            };
-            if let Some(a) = align {
-                to_stamp.push((op, a));
-            }
-        }
-    }
-
-    for (op, align) in to_stamp {
-        llvm_export::ops::set_op_alignment(ctx, op, align as u32);
-    }
 }
 
 // ============================================================================
