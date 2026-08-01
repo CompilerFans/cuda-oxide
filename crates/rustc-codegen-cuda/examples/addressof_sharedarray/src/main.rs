@@ -13,7 +13,18 @@
 //! addressof's block, the GEP referenced a `%vN` no instruction defined and
 //! libNVVM rejected the IR.
 //!
-//! The same kernel also validates `SharedArray::as_raw_mut_ptr`: 32 threads
+//! The same kernel verifies that exposing the address of the first static
+//! shared allocation does not turn its valid shared-space offset zero into a
+//! null Rust address. Named-space pointers must become CUDA generic pointers
+//! before pointer-to-integer conversion, and the exposed integer must cast
+//! back into the shared space through the generic space, so the
+//! expose/recover round trip stores through the recovered pointer.
+//!
+//! It also constructs and matches a direct enum payload containing that shared
+//! pointer. The enum's physical storage must stay 64-bit even when modern NVVM
+//! uses a 32-bit representation for semantic shared-space pointers.
+//!
+//! Finally the kernel validates `SharedArray::as_raw_mut_ptr`: 32 threads
 //! derive pointers from one raw shared-array address, write disjoint elements,
 //! synchronize, and let thread 0 verify the complete allocation.
 //!
@@ -32,11 +43,31 @@ use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, SharedArray, device, kernel, thread};
 use cuda_host::{cuda_module, ltoir};
 
+enum SharedPointerPayload {
+    Empty,
+    Pointer(*mut SharedArray<f32, 1>),
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
 
     const THREADS: usize = 32;
+
+    #[inline(never)]
+    #[device]
+    fn shared_pointer_enum_address(use_pointer: bool, pointer: *mut SharedArray<f32, 1>) -> usize {
+        let payload = if use_pointer {
+            SharedPointerPayload::Pointer(pointer)
+        } else {
+            SharedPointerPayload::Empty
+        };
+
+        match payload {
+            SharedPointerPayload::Empty => 0,
+            SharedPointerPayload::Pointer(extracted) => extracted.addr(),
+        }
+    }
 
     #[kernel]
     pub fn sharedarray_late_use(seed: f32, mut out: DisjointSlice<f32>) {
@@ -50,6 +81,46 @@ mod kernels {
                 // Issue #54 repro shape: load addressof[0], multiply, store.
                 OUTPUT_NORM[0] = OUTPUT_NORM[0] * weight;
                 *out.get_unchecked_mut(0) = OUTPUT_NORM[0];
+
+                // The first static shared allocation has local shared offset
+                // zero, but its CUDA generic address must not be null.
+                let raw = &raw mut OUTPUT_NORM;
+                let raw_address = raw.addr();
+                *out.get_unchecked_mut(1) = if raw.is_null() || raw_address == 0 {
+                    0.0
+                } else {
+                    1.0
+                };
+
+                // A direct enum payload keeps the pointer's shared-space
+                // semantics while using target-stable generic physical
+                // storage. The runtime condition keeps construction,
+                // discriminant inspection, and extraction observable.
+                let enum_address = shared_pointer_enum_address(seed != 0.0, raw);
+                *out.get_unchecked_mut(2) = if enum_address == raw_address {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                // The exposed integer is a generic address, so casting it
+                // back into the shared space must recover the original
+                // pointer (inttoptr to generic, then cvta back to shared).
+                // Write through the recovered pointer and observe the store
+                // through the original allocation.
+                // The recovered pointer must equal the original as a value,
+                // not merely reach the same memory: hardware masks the
+                // shared-window base out of st.shared addresses, so a wrong
+                // pointer value can still store to the right slot.
+                let round_trip = recover_shared_pointer(raw_address);
+                (&mut (*round_trip))[0] = OUTPUT_NORM[0] + 1.0;
+                *out.get_unchecked_mut(3) = if core::ptr::eq(round_trip, raw)
+                    && OUTPUT_NORM[0] == seed * repro_weight() + 1.0
+                {
+                    1.0
+                } else {
+                    0.0
+                };
             }
         }
 
@@ -68,7 +139,7 @@ mod kernels {
             for index in 0..THREADS {
                 sum += unsafe { scratch.add(index).read() };
             }
-            unsafe { *out.get_unchecked_mut(1) = sum as f32 };
+            unsafe { *out.get_unchecked_mut(4) = sum as f32 };
         }
     }
 
@@ -76,6 +147,18 @@ mod kernels {
     #[device]
     fn repro_weight() -> f32 {
         3.0
+    }
+
+    /// Recover a shared pointer from its exposed integer address.
+    ///
+    /// `#[inline(never)]` keeps the `inttoptr` in a function that cannot
+    /// see the matching `ptrtoint`, so LLVM's InferAddressSpaces cannot
+    /// fold the pair away and the lowering's own re-entry rule is what
+    /// executes.
+    #[inline(never)]
+    #[device]
+    fn recover_shared_pointer(address: usize) -> *mut SharedArray<f32, 1> {
+        address as *mut SharedArray<f32, 1>
     }
 }
 
@@ -95,41 +178,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let mut out = DeviceBuffer::<f32>::zeroed(&stream, 2)?;
+    let mut out = DeviceBuffer::<f32>::zeroed(&stream, 5)?;
     let seed: f32 = 7.0;
 
     // SAFETY: one 32-thread block writes 32 distinct shared elements, then
     // thread 0 reads them after a block-wide barrier. Only thread 0 writes the
-    // two output elements.
+    // five output elements.
     unsafe { module.sharedarray_late_use(stream.as_ref(), cfg, seed, &mut out) }?;
 
     let result = out.to_host_vec(&stream)?;
     let expected: f32 = 21.0; // seed * repro_weight() == 7.0 * 3.0
 
-    if (result[0] - expected).abs() < f32::EPSILON {
-        println!(
-            "PASS addressof_sharedarray: seed={seed}, result={}",
-            result[0]
-        );
-    } else {
+    if (result[0] - expected).abs() >= f32::EPSILON {
         eprintln!(
             "FAIL addressof_sharedarray: got {}, expected {expected}",
             result[0]
         );
         std::process::exit(1);
     }
+    if (result[1] - 1.0).abs() >= f32::EPSILON {
+        eprintln!("FAIL addressof_sharedarray: shared offset zero exposed as null");
+        std::process::exit(1);
+    }
+    if (result[2] - 1.0).abs() >= f32::EPSILON {
+        eprintln!("FAIL addressof_sharedarray: shared pointer enum did not round-trip");
+        std::process::exit(1);
+    }
+    if (result[3] - 1.0).abs() >= f32::EPSILON {
+        eprintln!(
+            "FAIL addressof_sharedarray: integer address did not cast back to the shared pointer"
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "PASS addressof_sharedarray: seed={seed}, result={}, shared address is non-null, shared pointer enum round-tripped, integer address cast back to the shared pointer",
+        result[0]
+    );
 
     let raw_expected = (1_u32..=32).sum::<u32>() as f32;
-    if (result[1] - raw_expected).abs() > f32::EPSILON {
+    if (result[4] - raw_expected).abs() > f32::EPSILON {
         eprintln!(
             "FAIL addressof_sharedarray raw receiver: got {}, expected {raw_expected}",
-            result[1]
+            result[4]
         );
         std::process::exit(1);
     }
     println!(
         "PASS addressof_sharedarray raw receiver: result={}",
-        result[1]
+        result[4]
     );
     Ok(())
 }
