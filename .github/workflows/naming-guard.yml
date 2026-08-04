@@ -24,10 +24,29 @@ jobs:
         uses: actions/checkout@v4
 
       # Reject any Rust source line (outside the canonical
-      # `reserved-oxide-symbols` crate) that hardcodes a `cuda_oxide_*`
+      # `reserved-oxide-symbols` crate) that hardcodes a reserved *symbol*
       # prefix as a string literal. The single source of truth for these
       # prefixes is `crates/reserved-oxide-symbols/`; everything else must
       # route through that crate's constants, builders, and predicates.
+      #
+      # The alternation below covers all ten symbol constants that crate
+      # exports: `kernel` covers LEGACY_KERNEL_PREFIX and
+      # KERNEL_SCOPE_LOCAL; `device` covers LEGACY_DEVICE_PREFIX and
+      # DEVICE_EXTERN_PREFIX; `instantiate`, `const`, `artifact_anchor`
+      # and `ptx_merge_required` cover one each; and `codegen_v1` covers
+      # the modern KERNEL_PREFIX and DEVICE_PREFIX. The last one matters
+      # because the pattern is anchored to the opening quote: a hardcoded
+      # full modern prefix starts with `cuda_oxide_codegen_v1_`, so its
+      # embedded `cuda_oxide_kernel_` segment sits mid-string where the
+      # quote-anchored `kernel` family can never match it.
+      #
+      # It deliberately does NOT match bare `cuda_oxide_`. That word-space
+      # also holds things this crate does not own and must not police:
+      # pliron op-attribute keys (`cuda_oxide_asm_kind`,
+      # `cuda_oxide_debug_local_*`), rustc `--cfg` names
+      # (`cuda_oxide_internal_backend_identity`), dlopen probe symbols
+      # (`cuda_oxide_probe`), and unique temp-directory names. Those are
+      # legitimate local constants, not reserved link symbols.
       #
       # The pipeline is three-step:
       #   1. a self-test proves the search still matches a known violation.
@@ -51,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          pattern='"cuda_oxide_(kernel|device|instantiate)_'
+          pattern='"cuda_oxide_(kernel|device|instantiate|const|artifact_anchor|ptx_merge_required|codegen_v1)_'
 
           # Self-test. The failure mode this guard has to survive is
           # "silently stops matching anything", so require it to prove it
