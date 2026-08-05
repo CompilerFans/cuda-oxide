@@ -55,10 +55,10 @@ pub enum LinearTiles<const N: usize> {}
 /// Thread coordinate `(y, x)` owns rows `y * ROWS..(y + 1) * ROWS` and
 /// columns `x * COLS..(x + 1) * COLS`.
 ///
-/// `ROW_STRIDE` is the caller-declared logical pitch: the number of elements
-/// from the start of one row to the start of the next. It must match the
-/// buffer's layout. It is encoded in the type, so two layouts with different
-/// pitches cannot exchange tile proofs. The final row may be partial; each
+/// `ROW_STRIDE` is the caller-declared logical row width: the number of
+/// elements from the start of one row to the start of the next. It must match
+/// the buffer's layout. It is encoded in the type, so two layouts with
+/// different row widths cannot exchange tile proofs. The final row may be partial; each
 /// requested tile is checked against the slice length.
 pub enum RowMajorTiles<const ROWS: usize, const COLS: usize, const ROW_STRIDE: usize> {}
 
@@ -71,10 +71,14 @@ pub enum RowMajorTiles<const ROWS: usize, const COLS: usize, const ROW_STRIDE: u
 /// compile-time constant, while here it is an ordinary runtime value (for
 /// example a GEMM dimension `n`) passed to [`DisjointSlice::tile_2d32_rt`].
 ///
-/// Because the row width is not in the type, the compiler cannot verify that
-/// every thread uses the same one. That "same value in every thread"
-/// requirement moves into the `unsafe` contract of `tile_2d32_rt`, just as
-/// [`crate::thread::index_2d_runtime`] does for `Runtime2DIndex`.
+/// Because the row width is not in the type, it travels as data: the host
+/// writes it into the launch packet beside the slice's pointer and length, and
+/// [`DisjointSlice::row_width`] reads it back. One row width per slice for the
+/// slice's whole lifetime is what tile disjointness needs, and a value the
+/// host wrote is one device code cannot vary between threads, so
+/// [`tile_2d32_rt`](DisjointSlice::tile_2d32_rt) is safe.
+///
+/// [`DisjointSlice::row_width`]: crate::disjoint::DisjointSlice::row_width
 pub enum RuntimeRowMajorTiles<const ROWS: usize, const COLS: usize> {}
 
 /// A checked local index into a static `N`-element view.
@@ -277,8 +281,8 @@ pub struct StaticViewMut32<'a, T, const N: usize> {
 ///
 /// The runtime representation is one pointer. Dimensions and row stride live
 /// in the type, and construction checks the whole rectangle once.
-/// `ROW_STRIDE` is the caller-declared logical pitch and must match the parent
-/// buffer's layout:
+/// `ROW_STRIDE` is the caller-declared logical row width and must match the
+/// parent buffer's layout:
 ///
 /// ```text
 /// base ── row 0: [ COLS elements ] ... stride gap
@@ -1338,9 +1342,9 @@ impl<'a, T, const ROWS: usize, const COLS: usize, const ROW_STRIDE: usize>
 {
     /// Check one complete rectangular tile and return a check-free static view.
     ///
-    /// `ROW_STRIDE` is the caller-declared logical row pitch and must match the
-    /// buffer's layout. The slice length does not have to be a multiple of the
-    /// pitch; a tile is returned only when its complete rectangle fits.
+    /// `ROW_STRIDE` is the caller-declared logical row width and must match
+    /// the buffer's layout. The slice length does not have to be a multiple of
+    /// the row width; a tile is returned only when its complete rectangle fits.
     ///
     /// Construction proves the following before creating a pointer:
     ///
@@ -1398,29 +1402,43 @@ impl<'a, T, const ROWS: usize, const COLS: usize>
     /// Zero-sized element types are rejected, as for every mutable view:
     /// distinct threads would otherwise share one address.
     ///
-    /// # Safety
+    /// # Why the stride comes from the slice
     ///
-    /// `stride` must be the same value in **every** thread of the launch, and
-    /// it must be the row width actually used for this slice. Passing a
-    /// kernel scalar argument (such as `n`) satisfies this automatically:
-    /// every thread reads the same argument. The danger is a stride computed
-    /// per thread. Two threads that disagree about the row width describe
-    /// two different grids over the same memory, and their "disjoint" tiles
-    /// can land on the same elements. With 1x1 tiles: thread `(1, 0)` with
-    /// stride 5 resolves flat index `1*5 + 0 = 5`, while thread `(0, 5)`
-    /// with stride 100 resolves `0*100 + 5 = 5`. Same element, two `&mut`, a
-    /// data race. This is the same obligation as
-    /// [`crate::thread::index_2d_runtime`]; when the row width is known at
-    /// compile time, prefer the fully safe [`tile_2d32`], which makes a
-    /// mismatch a type error.
+    /// Two threads that disagree about the row width describe two different
+    /// grids over the same memory, and their "disjoint" tiles can land on the
+    /// same elements. With 1x1 tiles: thread `(1, 0)` with stride 5 resolves
+    /// flat index `1*5 + 0 = 5`, while thread `(0, 5)` with stride 100
+    /// resolves `0*100 + 5 = 5`. Same element, two `&mut`, a data race.
+    ///
+    /// The row width is therefore a property of the slice rather than of the
+    /// call. The host writes it into the launch packet beside the pointer and
+    /// length, every thread reads that one word, and device code has no step
+    /// at which it could substitute another. Under a width fixed this way the
+    /// `last_col < stride` check below keeps each tile inside one logical row,
+    /// which makes the coordinate-to-offset mapping injective and the tiles of
+    /// distinct threads disjoint.
+    ///
+    /// A per-call width cannot give that guarantee even when each candidate
+    /// value is itself launch-uniform, because safe code can select between two
+    /// such values under a thread-varying condition, or pass different ones at
+    /// two call sites on one slice.
+    ///
+    /// The bound width still has to be the row width this slice actually uses
+    /// for the kernel to compute the intended result. That is a correctness
+    /// requirement rather than a safety one: a width that misdescribes the
+    /// layout gives wrong answers inside the slice, never aliasing or an
+    /// out-of-bounds access.
+    ///
+    /// When the row width is known at compile time, prefer [`tile_2d32`],
+    /// which makes a mismatch a type error.
     ///
     /// [`tile_2d32`]: DisjointSlice::tile_2d32
     #[inline(always)]
-    pub unsafe fn tile_2d32_rt<'kernel>(
+    pub fn tile_2d32_rt<'kernel>(
         &mut self,
         thread: ThreadCoord2D32<'kernel>,
-        stride: u32,
     ) -> Option<RuntimeTileMut32<'_, T, ROWS, COLS>> {
+        let stride = self.row_width();
         let start = checked_runtime_tile_start::<T, ROWS, COLS>(
             thread.row(),
             thread.col(),
@@ -1434,8 +1452,9 @@ impl<'a, T, const ROWS: usize, const COLS: usize>
         // SAFETY: the scalar-only helper checked the complete rectangle.
         // The `&mut self` borrow keeps at most one tile live per thread, and
         // a re-minted coordinate re-derives the same rectangle. Across
-        // threads, the caller asserts a launch-uniform pitch, under which
-        // distinct hardware coordinates map to disjoint row and column bands.
+        // threads, the row width is the one the host bound to this slice, under
+        // which distinct hardware coordinates map to disjoint row and column
+        // bands.
         Some(unsafe {
             RuntimeTileMut32::from_checked_ptr(self.as_mut_ptr().add(start as usize), stride)
         })
@@ -1526,7 +1545,7 @@ fn checked_runtime_tile_start<T, const ROWS: usize, const COLS: usize>(
     let last_col = start_col + (cols - 1);
 
     // The X tile must remain inside one logical row. Under a launch-uniform
-    // pitch this also makes tiles owned by adjacent X threads disjoint.
+    // row width this also makes tiles owned by adjacent X threads disjoint.
     if last_col >= stride {
         return INVALID_LINEAR_2D;
     }
@@ -1861,7 +1880,7 @@ mod tests {
         assert_eq!(checked_row_band_start(0, 8, 8, 24), 0);
         assert_eq!(checked_row_band_start(2, 8, 8, 24), 16);
         assert_eq!(checked_row_band_start(3, 8, 8, 24), INVALID_LINEAR_2D);
-        // A prefix of a row is fine; spilling past the pitch is not.
+        // A prefix of a row is fine; spilling past the row width is not.
         assert_eq!(checked_row_band_start(1, 8, 3, 24), 8);
         assert_eq!(checked_row_band_start(1, 8, 9, 24), INVALID_LINEAR_2D);
         // Degenerate shapes.
@@ -1967,7 +1986,7 @@ mod tests {
 
     #[test]
     fn runtime_tile_helper_checks_the_complete_rectangle() {
-        // 2 x 4 tiles in a matrix with runtime pitch 16 (same shapes as the
+        // 2 x 4 tiles in a matrix with runtime row width 16 (same shapes as the
         // static helper test above).
         assert_eq!(checked_runtime_tile_start::<u32, 2, 4>(1, 1, 16, 56), 36);
         assert_eq!(
@@ -1980,7 +1999,7 @@ mod tests {
             checked_runtime_tile_start::<u32, 1, 2>(0, 32, 64, 128),
             INVALID_LINEAR_2D
         );
-        // Degenerate pitches and zero-sized elements are rejected.
+        // Degenerate row widths and zero-sized elements are rejected.
         assert_eq!(
             checked_runtime_tile_start::<u32, 1, 1>(0, 0, 0, 16),
             INVALID_LINEAR_2D
@@ -2013,7 +2032,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn runtime_tile_wrapper_is_pointer_plus_pitch() {
+    fn runtime_tile_wrapper_is_pointer_plus_row_width() {
         assert_eq!(
             size_of::<RuntimeTileMut32<'_, u32, 1, 1>>(),
             2 * size_of::<usize>()
