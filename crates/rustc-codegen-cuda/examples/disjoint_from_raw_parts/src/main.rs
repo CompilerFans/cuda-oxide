@@ -155,5 +155,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("scale_row_width_slice: {grid_len} elements at row width {ROW_WIDTH}, exact match");
 
+    println!("SUCCESS: disjoint slices built in-kernel behave like parameter slices");
     Ok(())
 }
