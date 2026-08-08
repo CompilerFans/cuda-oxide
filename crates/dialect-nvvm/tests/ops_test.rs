@@ -36,9 +36,10 @@ use dialect_nvvm::ops::{
     SparseMmaShapeAttr, StmatrixM8n8X4Op, Tcgen05AllocOp, Tcgen05CommitMulticastCg2Op,
     Tcgen05Ld16x32bx2X1RawOp, Tcgen05Ld16x256bPureOp, Tcgen05MmaF16Op, ThreadfenceBlockOp,
     ThreadfenceOp, ThreadfenceSystemOp, VoteSyncAllOp, VoteSyncAnyOp, VoteSyncBallotOp,
-    VoteSyncUniOp, VprintfOp, WgmmaMakeSmemDescOp, WgmmaMmaGroupM64N64K16F32Bf16Op,
-    WgmmaMmaGroupValuesM64N64K16F32Bf16Op, WgmmaMmaLoopValuesM64N64K16F32Bf16Op,
-    WgmmaMmaM64N64K16F32Bf16Op,
+    VoteSyncUniOp, VprintfOp, WgmmaMakeSmemDescOp, WgmmaMaxPendingAttr,
+    WgmmaMmaGroupM64N64K16F32Bf16Op, WgmmaMmaGroupValuesM64N64K16F32Bf16Op,
+    WgmmaMmaLoopValuesM64N64K16F32Bf16Op, WgmmaMmaM64N64K16F32Bf16Op,
+    WgmmaMmaPipelineValuesM64N64K16F32Bf16Op,
 };
 
 #[test]
@@ -90,6 +91,7 @@ fn handwritten_ops_match_reviewed_allowlist() {
         ("wgmma.rs", "WgmmaMmaGroupM64N64K16F32Bf16Op"),
         ("wgmma.rs", "WgmmaMmaGroupValuesM64N64K16F32Bf16Op"),
         ("wgmma.rs", "WgmmaMmaLoopValuesM64N64K16F32Bf16Op"),
+        ("wgmma.rs", "WgmmaMmaPipelineValuesM64N64K16F32Bf16Op"),
     ];
     expected.sort_unstable();
     found.sort_unstable();
@@ -4719,6 +4721,97 @@ fn handwritten_ffi_and_wgmma_carriers_verify_exact_shapes() {
         WgmmaMmaLoopValuesM64N64K16F32Bf16Op::new(wrong_loop_result_type)
             .verify(&ctx)
             .is_err()
+    );
+
+    let pipeline_group = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::build(
+        &mut ctx,
+        vec![f32_value; 64],
+        vec![u64_value; 8],
+        1,
+    );
+    {
+        let pipeline_ref = pipeline_group.deref(&ctx);
+        assert_eq!(pipeline_ref.get_num_operands(), 72);
+        assert_eq!(pipeline_ref.get_num_results(), 64);
+    }
+    let pipeline = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::new(pipeline_group);
+    assert_eq!(pipeline.max_pending_groups(&ctx), Some(1));
+    assert!(pipeline.verify(&ctx).is_ok());
+
+    let too_few_pipeline_slots = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::build(
+        &mut ctx,
+        vec![f32_value; 32],
+        vec![u64_value; 4],
+        1,
+    );
+    assert!(
+        WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::new(too_few_pipeline_slots)
+            .verify(&ctx)
+            .is_err()
+    );
+
+    assert!(WgmmaMaxPendingAttr(1).verify(&ctx).is_ok());
+    assert!(WgmmaMaxPendingAttr(7).verify(&ctx).is_ok());
+    assert!(WgmmaMaxPendingAttr(0).verify(&ctx).is_err());
+    assert!(WgmmaMaxPendingAttr(8).verify(&ctx).is_err());
+
+    let zero_pending_pipeline = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::build(
+        &mut ctx,
+        vec![f32_value; 32],
+        vec![u64_value; 2],
+        0,
+    );
+    let zero_pending_error = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::new(zero_pending_pipeline)
+        .verify(&ctx)
+        .unwrap_err();
+    assert!(
+        zero_pending_error
+            .err
+            .to_string()
+            .contains("nvvm.wgmma_max_pending_groups must be in 1..=7, got 0"),
+        "unexpected zero-pending error: {}",
+        zero_pending_error.err
+    );
+
+    let excess_pending_pipeline = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::build(
+        &mut ctx,
+        vec![f32_value; 32],
+        vec![u64_value; 2],
+        8,
+    );
+    let excess_pending_error =
+        WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::new(excess_pending_pipeline)
+            .verify(&ctx)
+            .unwrap_err();
+    assert!(
+        excess_pending_error
+            .err
+            .to_string()
+            .contains("nvvm.wgmma_max_pending_groups must be in 1..=7, got 8"),
+        "unexpected excess-pending error: {}",
+        excess_pending_error.err
+    );
+
+    let mut missing_attr_operands = vec![f32_value; 64];
+    missing_attr_operands.extend([u64_value; 8]);
+    let missing_attr_pipeline = Operation::new(
+        &mut ctx,
+        WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::get_concrete_op_info(),
+        vec![f32_ty.into(); 64],
+        missing_attr_operands,
+        vec![],
+        0,
+    );
+    let missing_attr_error = WgmmaMmaPipelineValuesM64N64K16F32Bf16Op::new(missing_attr_pipeline)
+        .verify(&ctx)
+        .unwrap_err();
+    assert!(
+        missing_attr_error
+            .err
+            .to_string()
+            .contains("requires an nvvm.wgmma_max_pending_groups attribute"),
+        "unexpected missing-attribute error: {}",
+        missing_attr_error.err
     );
 }
 
