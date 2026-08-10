@@ -32,9 +32,10 @@ use crate::model::{
     Tcgen05Adapter, Tcgen05CpGroup, Tcgen05CpMember, Tcgen05LdMultiplicity, Tcgen05LdShape,
     Tcgen05Mma, Tcgen05MmaAlias, Tcgen05MmaBUsage, Tcgen05MmaForm, Tcgen05MmaKind,
     Tcgen05MmaSelectorLayout, Tcgen05Operation, Tcgen05SourceContract, TmaAdapter, TmaOperation,
-    VoteAdapter, VoteMode, WarpBarrierAdapter, WarpMatchAdapter, WarpMatchMode, WarpShuffleAdapter,
-    WarpShuffleMode, WarpShuffleOperandEncoding, WarpShuffleValueKind, WgmmaControlAdapter,
-    WgmmaControlMode, WgmmaControlParticipation,
+    TmaReductionLoadMode, TmaReductionOperation, VoteAdapter, VoteMode, WarpBarrierAdapter,
+    WarpMatchAdapter, WarpMatchMode, WarpShuffleAdapter, WarpShuffleMode,
+    WarpShuffleOperandEncoding, WarpShuffleValueKind, WgmmaControlAdapter, WgmmaControlMode,
+    WgmmaControlParticipation,
 };
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1194,6 +1195,15 @@ fn validate_renderable(catalog: &CatalogFile) -> Result<()> {
                                     !record.rust.safe
                                         && record.semantics.convergent
                                         && record.semantics.memory == "read_write"
+                                }
+                                (
+                                    TmaOperation::Reduce,
+                                    TmaAdapter::ReductionPointersCoordinatesInjectDefaults,
+                                ) => {
+                                    !record.rust.safe
+                                        && record.semantics.convergent
+                                        && record.semantics.memory == "read_write"
+                                        && tma.reduction.is_some()
                                 }
                                 (TmaOperation::CommitGroup, TmaAdapter::NoOperands) => {
                                     record.rust.safe
@@ -4796,6 +4806,10 @@ fn render_raw_abi(catalog: &CatalogFile, hash: &str) -> String {
                         "/// The source must name a live shared-memory tile, and the tensor map must be a live descriptor for this dimensionality.\n\
                          /// Keep both objects alive until the committed bulk-copy group completes.\n",
                     ),
+                    TmaAdapter::ReductionPointersCoordinatesInjectDefaults => output.push_str(
+                        "/// The source must name a live shared-memory tile, and the tensor map must describe a compatible global tensor destination for this dimensionality.\n\
+                         /// Keep both objects alive until the committed asynchronous reduction completes.\n",
+                    ),
                     TmaAdapter::DescriptorPointer
                     | TmaAdapter::DescriptorCoordinatesInjectDefaults
                     | TmaAdapter::DescriptorCoordinatesCacheHintInjectFlag => output.push_str(
@@ -5902,7 +5916,7 @@ fn render_compat_tma(catalog: &CatalogFile, hash: &str) -> String {
         let tma = record.tma.as_ref().expect("TMA contract");
         let operation = tma.operation;
         writeln!(output, "/// {}", record.summary).unwrap();
-        let dimensions = operation.dimensions();
+        let dimensions = tma.dimensions();
         let is_g2s = matches!(
             operation,
             TmaOperation::G2sTile1d
@@ -5921,6 +5935,7 @@ fn render_compat_tma(catalog: &CatalogFile, hash: &str) -> String {
                 | TmaOperation::S2gTile4d
                 | TmaOperation::S2gTile5d
         );
+        let is_reduction = operation == TmaOperation::Reduce;
         if !record.rust.safe {
             output.push_str("///\n/// # Safety\n");
             if is_g2s {
@@ -5930,6 +5945,10 @@ fn render_compat_tma(catalog: &CatalogFile, hash: &str) -> String {
             } else if is_s2g {
                 output.push_str(
                     "/// `src` and `tensor_map` must remain valid until the committed copy group completes.\n",
+                );
+            } else if is_reduction {
+                output.push_str(
+                    "/// `src` must name a live shared-memory tile and `tensor_map` must describe a compatible global destination until the committed reduction completes.\n",
                 );
             } else if matches!(
                 tma.adapter,
@@ -5978,7 +5997,7 @@ fn render_compat_tma(catalog: &CatalogFile, hash: &str) -> String {
             )
             .unwrap();
             writeln!(output, "    let _ = ({});", values.join(", ")).unwrap();
-        } else if is_s2g {
+        } else if is_s2g || is_reduction {
             let dimensions = dimensions.unwrap();
             let mut arguments = vec![
                 "src: *const u8".to_owned(),
@@ -14570,7 +14589,7 @@ fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
     if tma_intrinsics(catalog).next().is_some() {
         output = output.replace(
             "prmt::convert_generated_prmt, warp::{",
-            "prmt::convert_generated_prmt, tma::{convert_control, convert_g2s, convert_g2s_multicast_cg2, convert_prefetch_tensormap, convert_prefetch_tile, convert_s2g, convert_tensormap_fence, convert_tensormap_replace, PrefetchTileConfig}, warp::{",
+            "prmt::convert_generated_prmt, tma::{convert_control, convert_g2s, convert_g2s_multicast_cg2, convert_prefetch_tensormap, convert_prefetch_tile, convert_reduce_s2g, convert_s2g, convert_tensormap_fence, convert_tensormap_replace, PrefetchTileConfig, ReduceConfig}, warp::{",
         );
     }
     if execution_controls(catalog).next().is_some() {
@@ -16211,6 +16230,34 @@ fn convert_generated_tcgen05_load(
                 )
                 .unwrap();
             }
+            TmaOperation::Reduce => {
+                let reduction = record
+                    .tma
+                    .as_ref()
+                    .and_then(|tma| tma.reduction.as_ref())
+                    .expect("TMA reduction contract");
+                let reduction_name = match reduction.operation {
+                    TmaReductionOperation::Add => "add",
+                    TmaReductionOperation::And => "and",
+                    TmaReductionOperation::Dec => "dec",
+                    TmaReductionOperation::Inc => "inc",
+                    TmaReductionOperation::Max => "max",
+                    TmaReductionOperation::Min => "min",
+                    TmaReductionOperation::Or => "or",
+                    TmaReductionOperation::Xor => "xor",
+                };
+                let load_mode = match reduction.load_mode {
+                    TmaReductionLoadMode::Tile => "tile",
+                    TmaReductionLoadMode::Im2col => "im2col",
+                };
+                writeln!(
+                    output,
+                    "        convert_reduce_s2g(ctx, rewriter, self.get_operation(), operands_info, ReduceConfig::new({}, {reduction_name:?}, {load_mode:?}, {:?}))",
+                    reduction.dimensions,
+                    record.resolved_llvm_identifier()
+                )
+                    .unwrap();
+            }
             TmaOperation::CommitGroup | TmaOperation::WaitGroup | TmaOperation::WaitGroupRead => {
                 let operation_name = match operation {
                     TmaOperation::CommitGroup => "commit_group",
@@ -17524,12 +17571,13 @@ fn render_special_register_probe(
 }
 
 fn render_tma_probe(catalog: &CatalogFile, record: &CatalogIntrinsic, hash: &str) -> String {
-    let operation = record.tma.as_ref().expect("TMA contract").operation;
+    let tma = record.tma.as_ref().expect("TMA contract");
+    let operation = tma.operation;
     let llvm = llvm(record);
     let symbol = llvm.resolved_symbol.as_ref().unwrap_or(&llvm.symbol);
     let mut output = llvm_header(catalog, hash);
     output.push_str("target triple = \"nvptx64-nvidia-cuda\"\n\n");
-    if let Some(dimensions) = operation.dimensions() {
+    if let Some(dimensions) = tma.dimensions() {
         let is_g2s = matches!(
             operation,
             TmaOperation::G2sTile1d
@@ -20289,7 +20337,7 @@ mod tests {
     fn catalog_with_tma() -> CatalogFile {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = crate::resolve::test_catalog_with_tma(&repo_root).unwrap();
-        assert_eq!(tma_intrinsics(&catalog).count(), 47);
+        assert_eq!(tma_intrinsics(&catalog).count(), 111);
         catalog
     }
 
@@ -22244,7 +22292,7 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let catalog = crate::resolve::resolve(&repo_root).unwrap();
         validate_renderable(&catalog).unwrap();
-        assert_eq!(catalog.intrinsics.len(), 922);
+        assert_eq!(catalog.intrinsics.len(), 986);
         let records: Vec<_> = register_mmas(&catalog).collect();
         assert_eq!(records.len(), 154);
         let generated_records = records
@@ -23456,6 +23504,12 @@ mod tests {
         ));
         assert!(compatibility.contains("pub fn cp_async_bulk_commit_group()"));
         assert!(compatibility.contains("pub fn cp_async_bulk_wait_group(n: u32)"));
+        assert!(compatibility.contains(
+            "pub unsafe fn cp_async_bulk_tensor_reduce_add_tile_2d(src: *const u8, tensor_map: *const TmaDescriptor, coord0: i32, coord1: i32)"
+        ));
+        assert!(compatibility.contains(
+            "pub unsafe fn cp_async_bulk_tensor_reduce_xor_im2col_5d(src: *const u8, tensor_map: *const TmaDescriptor, coord0: i32, coord1: i32, coord2: i32, coord3: i32, coord4: i32)"
+        ));
         for dimensions in 1..=5 {
             assert!(compatibility.contains(&format!(
                 "pub unsafe fn cp_async_bulk_prefetch_tensor_{dimensions}d_l2("
@@ -23478,8 +23532,8 @@ mod tests {
         assert!(compatibility.contains("pub fn fence_proxy_tensormap_generic_release_system()"));
 
         let dialect = render_dialect_tma(&catalog, "test-hash");
-        assert_eq!(dialect.matches("pub struct ").count(), 47);
-        assert_eq!(dialect.matches("NResultsInterface<0>").count(), 47);
+        assert_eq!(dialect.matches("pub struct ").count(), 111);
+        assert_eq!(dialect.matches("NResultsInterface<0>").count(), 111);
         assert!(dialect.contains("NOpdsInterface<10>"));
         assert!(dialect.contains("CpAsyncBulkWaitGroupReadOp::register(ctx)"));
         assert!(
@@ -23505,11 +23559,15 @@ mod tests {
         assert!(importer.contains("require_arity(name, args.len(), 1, &loc)?;"));
         assert!(importer.contains("args.first(), Some(mir::Operand::Constant(_))"));
         assert!(importer.contains("\"v1:i0328\""));
+        assert!(importer.contains("cp_async_bulk_tensor_reduce_add_tile_2d"));
+        assert!(importer.contains(
+            "dialect_nvvm::ops::CpAsyncBulkTensorReduceAddTile2dOp::get_concrete_op_info()"
+        ));
 
         let lowering = render_lowering(&catalog, "test-hash");
         assert!(lowering.contains("CpAsyncBulkTensorG2sTile1dOp"));
         assert!(lowering.contains(
-            "tma::{convert_control, convert_g2s, convert_g2s_multicast_cg2, convert_prefetch_tensormap, convert_prefetch_tile, convert_s2g, convert_tensormap_fence, convert_tensormap_replace, PrefetchTileConfig}"
+            "tma::{convert_control, convert_g2s, convert_g2s_multicast_cg2, convert_prefetch_tensormap, convert_prefetch_tile, convert_reduce_s2g, convert_s2g, convert_tensormap_fence, convert_tensormap_replace, PrefetchTileConfig, ReduceConfig}"
         ));
         assert!(
             lowering.contains(
@@ -23521,6 +23579,9 @@ mod tests {
         );
         assert!(lowering.contains(
             "convert_control(ctx, rewriter, self.get_operation(), operands_info, \"commit_group\", \"llvm_nvvm_cp_async_bulk_commit_group\")"
+        ));
+        assert!(lowering.contains(
+            "convert_reduce_s2g(ctx, rewriter, self.get_operation(), operands_info, ReduceConfig::new(2, \"add\", \"tile\", \"llvm_nvvm_cp_async_bulk_tensor_reduce_add_tile_2d\"))"
         ));
         assert!(lowering.contains(
             "convert_prefetch_tile(ctx, rewriter, self.get_operation(), operands_info, PrefetchTileConfig::new(5, false, false, \"llvm_nvvm_cp_async_bulk_tensor_prefetch_tile_5d\"))"
@@ -23548,6 +23609,17 @@ mod tests {
             .unwrap();
         let s2g_probe = render_probe(&catalog, s2g, "test-hash");
         assert!(s2g_probe.contains("ptr %tensor_map, i32 %coord0, i32 %coord1, i64 0, i1 false"));
+
+        let reduce = tma_intrinsics(&catalog)
+            .find(|record| record.id == "cp_async_bulk_tensor_reduce_add_tile_2d")
+            .unwrap();
+        let reduce_probe = render_probe(&catalog, reduce, "test-hash");
+        assert!(reduce_probe.contains(
+            "declare void @llvm.nvvm.cp.async.bulk.tensor.reduce.add.tile.2d(ptr addrspace(3), ptr, i32, i32, i64, i1)"
+        ));
+        assert!(reduce_probe.contains(
+            "call void @llvm.nvvm.cp.async.bulk.tensor.reduce.add.tile.2d(ptr addrspace(3) %src, ptr %tensor_map, i32 %coord0, i32 %coord1, i64 0, i1 false)"
+        ));
 
         for stem in [
             "cp_async_bulk_prefetch_tensor_1d_l2",
