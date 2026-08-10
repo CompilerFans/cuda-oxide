@@ -12,7 +12,7 @@ use crate::provenance::{
 };
 use crate::validation::is_valid_cubin;
 use crate::{FinalizerError, validate_name};
-use nvjitlink_sys::{InputType, LibNvJitLink, LinkOutput, Linker};
+use nvjitlink_sys::{InputType, LibNvJitLink, LinkOutput, Linker, NvJitLinkError};
 use std::sync::{Arc, Mutex, OnceLock};
 
 struct LoadedLinkerTool {
@@ -34,7 +34,7 @@ pub struct LinkReport {
     pub resource_usage: Vec<KernelResourceUsage>,
 }
 
-/// Driver-independent ordered LTOIR linker.
+/// Driver-independent linker for LTOIR and PTX inputs.
 #[derive(Clone)]
 pub struct LtoLinker {
     tool: Arc<LoadedLinkerTool>,
@@ -109,12 +109,52 @@ impl LtoLinker {
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
         validate_inputs(inputs)?;
+        self.link_inputs(
+            inputs,
+            InputType::Ltoir,
+            options,
+            output,
+            collect_resource_usage,
+        )
+    }
+
+    /// Compile and link one PTX module to a validated target-specific cubin.
+    pub fn link_ptx_to_cubin(
+        &self,
+        input: NamedInput<'_>,
+        options: &FinalizationOptions,
+    ) -> Result<Vec<u8>, FinalizerError> {
+        validate_inputs(std::slice::from_ref(&input))?;
+        // Enforce the PTX C-string rule up front so this route rejects
+        // exactly the inputs `ptx_artifact_digest` rejects, with the
+        // finalizer's error vocabulary. `Linker::add` NUL-terminates the FFI
+        // backing itself through the same shared nvjitlink-sys rule.
+        logical_ptx(input)?;
+        Ok(self
+            .link_inputs(
+                std::slice::from_ref(&input),
+                InputType::Ptx,
+                options,
+                FinalizerOutput::Cubin,
+                false,
+            )?
+            .image)
+    }
+
+    fn link_inputs(
+        &self,
+        inputs: &[NamedInput<'_>],
+        input_type: InputType,
+        options: &FinalizationOptions,
+        output: FinalizerOutput,
+        collect_resource_usage: bool,
+    ) -> Result<LinkReport, FinalizerError> {
         with_revalidated_tool_identity(
             "nvJitLink",
             self.tool.digest,
             || current_linker_tool_digest(&self.tool),
             || {
-                match self.run_link(inputs, options, output, collect_resource_usage) {
+                match self.run_link(inputs, input_type, options, output, collect_resource_usage) {
                     // Older nvJitLink versions reject the diagnostic-only
                     // reporting options with NVJITLINK_ERROR_UNRECOGNIZED_OPTION.
                     // The caller asked for the same program plus a best-effort
@@ -123,7 +163,7 @@ impl LtoLinker {
                     Err(FinalizerError::NvJitLink(error))
                         if collect_resource_usage && error.is_unrecognized_option() =>
                     {
-                        self.run_link(inputs, options, output, false)
+                        self.run_link(inputs, input_type, options, output, false)
                     }
                     result => result,
                 }
@@ -134,11 +174,16 @@ impl LtoLinker {
     fn run_link(
         &self,
         inputs: &[NamedInput<'_>],
+        input_type: InputType,
         options: &FinalizationOptions,
         output: FinalizerOutput,
         collect_resource_usage: bool,
     ) -> Result<LinkReport, FinalizerError> {
-        let mut option_storage = options.nvjitlink_options(output);
+        let mut option_storage = if input_type == InputType::Ptx {
+            options.nvjitlink_ptx_options()
+        } else {
+            options.nvjitlink_ltoir_options(output)
+        };
         if collect_resource_usage {
             option_storage.extend(options.nvjitlink_diagnostic_options(output));
         }
@@ -148,7 +193,7 @@ impl LtoLinker {
             .collect::<Vec<_>>();
         let mut linker = Linker::new(&self.tool.library, &option_refs)?;
         for input in inputs {
-            linker.add(InputType::Ltoir, input.bytes, input.name)?;
+            linker.add(input_type, input.bytes, input.name)?;
         }
 
         let LinkOutput { image, info_log } = match output {
@@ -189,6 +234,24 @@ impl LtoLinker {
             inputs, options, output, &nvjitlink,
         ))
     }
+
+    /// Digest every semantic input to a PTX-to-cubin link.
+    pub fn ptx_artifact_digest(
+        &self,
+        input: NamedInput<'_>,
+        options: &FinalizationOptions,
+    ) -> Result<Option<[u8; 32]>, FinalizerError> {
+        validate_inputs(std::slice::from_ref(&input))?;
+        let ptx = logical_ptx(input)?;
+        let Some(nvjitlink) = self.nvjitlink_digest() else {
+            return Ok(None);
+        };
+        Ok(Some(ptx_artifact_digest_parts(
+            NamedInput::new(input.name, ptx),
+            options,
+            &nvjitlink,
+        )))
+    }
 }
 
 fn current_linker_tool_digest(tool: &LoadedLinkerTool) -> Option<[u8; 32]> {
@@ -209,6 +272,25 @@ fn validate_inputs(inputs: &[NamedInput<'_>]) -> Result<(), FinalizerError> {
         }
     }
     Ok(())
+}
+
+/// Logical PTX bytes shared by the digest and link routes.
+///
+/// nvjitlink-sys owns the PTX C-string rule (strip the single optional
+/// trailing NUL, reject any other NUL); this wrapper only adds the
+/// finalizer's non-empty-input policy and error vocabulary on top.
+fn logical_ptx(input: NamedInput<'_>) -> Result<&[u8], FinalizerError> {
+    let logical =
+        nvjitlink_sys::logical_ptx(input.bytes, input.name).map_err(|error| match error {
+            NvJitLinkError::InteriorNulPtx { name, .. } => FinalizerError::InteriorNulPtx { name },
+            other => FinalizerError::NvJitLink(other),
+        })?;
+    if logical.is_empty() {
+        return Err(FinalizerError::EmptyInput {
+            name: input.name.to_string(),
+        });
+    }
+    Ok(logical)
 }
 
 fn load_linker_tool() -> Result<Arc<LoadedLinkerTool>, FinalizerError> {
@@ -258,7 +340,25 @@ pub(crate) fn ltoir_artifact_digest_parts(
             .field("ltoir-name", input.name.as_bytes())
             .field("ltoir", input.bytes);
     }
-    for option in options.nvjitlink_options(output) {
+    for option in options.nvjitlink_ltoir_options(output) {
+        digest = digest.field("nvjitlink-option", option.as_bytes());
+    }
+    digest
+        .field("libnvjitlink-sha256", nvjitlink_digest)
+        .finish()
+}
+
+pub(crate) fn ptx_artifact_digest_parts(
+    input: NamedInput<'_>,
+    options: &FinalizationOptions,
+    nvjitlink_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = StableDigest::new()
+        .field("recipe", recipe_digest())
+        .field("route", b"ptx-to-cubin")
+        .field("ptx-name", input.name.as_bytes())
+        .field("ptx", input.bytes);
+    for option in options.nvjitlink_ptx_options() {
         digest = digest.field("nvjitlink-option", option.as_bytes());
     }
     digest
@@ -343,5 +443,97 @@ mod tests {
             validate_inputs(&[NamedInput::new("bad\0name", b"x")]),
             Err(FinalizerError::InvalidInputName { .. })
         ));
+    }
+
+    #[test]
+    fn ptx_digest_covers_name_bytes_policy_and_linker_identity() {
+        let options = FinalizationOptions::new("sm_80".parse().unwrap());
+        let baseline =
+            ptx_artifact_digest_parts(NamedInput::new("kernel.ptx", b"ptx"), &options, &[7; 32]);
+        assert_ne!(
+            baseline,
+            ptx_artifact_digest_parts(NamedInput::new("other.ptx", b"ptx"), &options, &[7; 32])
+        );
+        assert_ne!(
+            baseline,
+            ptx_artifact_digest_parts(
+                NamedInput::new("kernel.ptx", b"changed"),
+                &options,
+                &[7; 32]
+            )
+        );
+        assert_ne!(
+            baseline,
+            ptx_artifact_digest_parts(
+                NamedInput::new("kernel.ptx", b"ptx"),
+                &options.clone().with_fma_contraction(false),
+                &[7; 32]
+            )
+        );
+        assert_ne!(
+            baseline,
+            ptx_artifact_digest_parts(NamedInput::new("kernel.ptx", b"ptx"), &options, &[8; 32])
+        );
+    }
+
+    #[test]
+    fn ptx_normalization_ignores_one_terminator_and_rejects_interior_nuls() {
+        let plain = NamedInput::new("kernel.ptx", b"ptx");
+        let terminated = NamedInput::new("kernel.ptx", b"ptx\0");
+        assert_eq!(logical_ptx(plain).unwrap(), b"ptx");
+        assert_eq!(logical_ptx(terminated).unwrap(), b"ptx");
+        assert!(matches!(
+            logical_ptx(NamedInput::new("bad.ptx", b"p\0tx")),
+            Err(FinalizerError::InteriorNulPtx { ref name }) if name == "bad.ptx"
+        ));
+        assert!(matches!(
+            logical_ptx(NamedInput::new("bad.ptx", b"ptx\0\0")),
+            Err(FinalizerError::InteriorNulPtx { ref name }) if name == "bad.ptx"
+        ));
+        assert!(matches!(
+            logical_ptx(NamedInput::new("empty.ptx", b"\0")),
+            Err(FinalizerError::EmptyInput { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    const ACQUIRE_LOAD_PTX: &[u8] = br#"
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry acquire_load(
+    .param .u64 input,
+    .param .u64 output
+)
+{
+    .reg .b32 value;
+    .reg .b64 input_ptr;
+    .reg .b64 output_ptr;
+
+    ld.param.u64 input_ptr, [input];
+    ld.param.u64 output_ptr, [output];
+    ld.acquire.gpu.global.u32 value, [input_ptr];
+    st.global.u32 [output_ptr], value;
+    ret;
+}
+"#;
+
+    #[test]
+    #[ignore = "requires discoverable CUDA Toolkit nvJitLink"]
+    fn live_ptx_pipeline_compiles_acquire_load_to_cubin() {
+        let linker = LtoLinker::discover().unwrap();
+        let options = FinalizationOptions::new("sm_80".parse().unwrap());
+        let cubin = linker
+            .link_ptx_to_cubin(
+                NamedInput::new("acquire-load.ptx", ACQUIRE_LOAD_PTX),
+                &options,
+            )
+            .unwrap();
+        assert!(is_valid_cubin(&cubin));
     }
 }

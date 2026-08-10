@@ -30,7 +30,7 @@ use provenance::common_provenance_digest;
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Failures while compiling NVVM IR or linking LTOIR.
+/// Failures while compiling or linking CUDA artifacts.
 #[derive(Debug, Error)]
 pub enum FinalizerError {
     /// libNVVM failed to load, validate, or compile.
@@ -82,8 +82,13 @@ pub enum FinalizerError {
     #[error("CUDA artifact input is empty: {name}")]
     EmptyInput { name: String },
 
+    /// PTX is a C-string input to nvJitLink and may only contain its optional
+    /// terminating NUL at the end.
+    #[error("PTX input contains an interior NUL byte: {name}")]
+    InteriorNulPtx { name: String },
+
     /// nvJitLink was invoked without an input module.
-    #[error("at least one ordered LTOIR input is required")]
+    #[error("at least one link input is required (ordered LTOIR modules or a single PTX module)")]
     NoLinkInputs,
 
     /// nvJitLink returned bytes that are not a complete CUDA ELF image.
@@ -189,7 +194,7 @@ impl Finalizer {
         &self.compiler
     }
 
-    /// Ordered LTOIR linker component.
+    /// CUDA artifact linker component.
     pub fn linker(&self) -> &LtoLinker {
         &self.linker
     }

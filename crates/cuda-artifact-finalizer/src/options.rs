@@ -77,18 +77,40 @@ impl FinalizationOptions {
         options
     }
 
-    pub(crate) fn nvjitlink_options(&self, output: FinalizerOutput) -> Vec<String> {
+    pub(crate) fn nvjitlink_ltoir_options(&self, output: FinalizerOutput) -> Vec<String> {
         let mut options = vec![format!("-arch={}", self.target.sm()), "-lto".to_string()];
         if output == FinalizerOutput::Ptx {
             options.push("-ptx".to_string());
         }
+        self.append_nvjitlink_codegen_options(&mut options);
+        options
+    }
+
+    /// Options for compiling one PTX module to cubin (no `-lto`).
+    ///
+    /// `-lineinfo` and `-g` are honored on this route (verified on CUDA 13.3:
+    /// debug sections appear in the cubin). `-fma=<n>` is accepted without
+    /// `-lto` but observed to be inert for PTX input on CUDA 13.3 nvJitLink:
+    /// `-fma=0` and `-fma=1` produce byte-identical cubins even for
+    /// contractable modeless `mul.f32`+`add.f32` PTX, which standalone
+    /// `ptxas --fmad=false` does split. FMA policy for PTX inputs is
+    /// therefore decided by the PTX producer (cuda-oxide's llc pass emits
+    /// pre-fused `fma.rn` and modeless mul/add pairs that nvJitLink's
+    /// internal SASS stage contracts by default). The option is still passed
+    /// and digested so a future toolkit that honors it stays cache-correct.
+    pub(crate) fn nvjitlink_ptx_options(&self) -> Vec<String> {
+        let mut options = vec![format!("-arch={}", self.target.sm())];
+        self.append_nvjitlink_codegen_options(&mut options);
+        options
+    }
+
+    fn append_nvjitlink_codegen_options(&self, options: &mut Vec<String>) {
         options.push(self.fma_option().to_string());
         match self.debug {
             DebugPolicy::None => {}
             DebugPolicy::LineTables => options.push("-lineinfo".to_string()),
             DebugPolicy::Full => options.push("-g".to_string()),
         }
-        options
     }
 
     /// Non-semantic nvJitLink options used only to collect resource diagnostics.
@@ -136,7 +158,7 @@ pub enum FinalizerOutput {
 pub struct NamedInput<'a> {
     /// Name shown by CUDA-tool diagnostics and included in provenance.
     pub name: &'a str,
-    /// Complete LTOIR input bytes.
+    /// Complete input bytes in the format selected by the linker operation.
     pub bytes: &'a [u8],
 }
 
@@ -161,14 +183,20 @@ mod tests {
             ["-arch=compute_90a", "-gen-lto", "-fma=0"]
         );
         assert_eq!(
-            base.nvjitlink_options(FinalizerOutput::Cubin),
+            base.nvjitlink_ltoir_options(FinalizerOutput::Cubin),
             ["-arch=sm_90a", "-lto", "-fma=0"]
         );
         assert_eq!(
             base.clone()
                 .with_debug_policy(DebugPolicy::LineTables)
-                .nvjitlink_options(FinalizerOutput::Ptx),
+                .nvjitlink_ltoir_options(FinalizerOutput::Ptx),
             ["-arch=sm_90a", "-lto", "-ptx", "-fma=0", "-lineinfo"]
+        );
+        assert_eq!(
+            base.clone()
+                .with_debug_policy(DebugPolicy::LineTables)
+                .nvjitlink_ptx_options(),
+            ["-arch=sm_90a", "-fma=0", "-lineinfo"]
         );
         assert_eq!(
             base.clone()
@@ -184,7 +212,7 @@ mod tests {
         );
         assert_eq!(
             base.with_debug_policy(DebugPolicy::Full)
-                .nvjitlink_options(FinalizerOutput::Cubin),
+                .nvjitlink_ltoir_options(FinalizerOutput::Cubin),
             ["-arch=sm_90a", "-lto", "-fma=0", "-g"]
         );
     }
@@ -204,7 +232,13 @@ mod tests {
         let diagnostic = options.nvjitlink_diagnostic_options(FinalizerOutput::Cubin);
         assert!(
             options
-                .nvjitlink_options(FinalizerOutput::Cubin)
+                .nvjitlink_ltoir_options(FinalizerOutput::Cubin)
+                .iter()
+                .all(|option| !diagnostic.contains(option))
+        );
+        assert!(
+            options
+                .nvjitlink_ptx_options()
                 .iter()
                 .all(|option| !diagnostic.contains(option))
         );
@@ -227,7 +261,16 @@ mod tests {
             );
             assert_eq!(
                 options
-                    .nvjitlink_options(FinalizerOutput::Cubin)
+                    .nvjitlink_ltoir_options(FinalizerOutput::Cubin)
+                    .iter()
+                    .filter(|option| option.starts_with("-fma="))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            assert_eq!(
+                options
+                    .nvjitlink_ptx_options()
                     .iter()
                     .filter(|option| option.starts_with("-fma="))
                     .map(String::as_str)
