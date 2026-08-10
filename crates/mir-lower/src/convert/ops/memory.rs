@@ -150,6 +150,22 @@ fn copy_debug_local_variable(ctx: &mut Context, mir_op: Ptr<Operation>, llvm_op:
     }
 }
 
+/// Carry Rust-local provenance from the MIR alloca to the LLVM alloca.
+///
+/// This is compiler-only metadata stored in the in-memory dialect operation;
+/// it is not emitted as LLVM metadata because an unrecognized metadata node is
+/// not a preservation contract for middle-end passes. The textual exporter
+/// instead consumes the attribute to choose a stable SSA name before `opt`.
+fn copy_local_memory_provenance(
+    ctx: &mut Context,
+    mir_op: Ptr<Operation>,
+    llvm_op: Ptr<Operation>,
+) {
+    if let Some(provenance) = llvm_export::ops::local_memory_provenance(ctx, mir_op) {
+        llvm_export::ops::set_local_memory_provenance(ctx, llvm_op, provenance);
+    }
+}
+
 /// Convert `mir.memcpy` to the matching `llvm.memcpy.p<dst>.p<src>.i<bits>`.
 ///
 /// MIR's count is measured in pointee elements, while LLVM's memcpy intrinsic
@@ -447,6 +463,7 @@ pub(crate) fn convert_alloca(
         llvm_export::ops::set_op_alignment(ctx, alloca.get_operation(), align as u32);
     }
     copy_debug_local_variable(ctx, op, alloca.get_operation());
+    copy_local_memory_provenance(ctx, op, alloca.get_operation());
     rewriter.insert_operation(ctx, alloca.get_operation());
     rewriter.replace_operation(ctx, op, alloca.get_operation());
 
@@ -1662,6 +1679,40 @@ mod tests {
                 encoding: "DW_ATE_signed",
             }
         );
+    }
+
+    #[test]
+    fn convert_alloca_preserves_local_memory_provenance() {
+        let mut ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+
+        let alloca_op = Operation::new(
+            &mut ctx,
+            mir::MirAllocaOp::get_concrete_op_info(),
+            vec![mir_ptr_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let provenance = llvm_export::ops::LocalMemoryProvenanceAttr {
+            local_index: 3,
+            size_bytes: 16,
+            binding_name: "scratch".into(),
+            type_name: "[u32; 4]".into(),
+        };
+        llvm_export::ops::set_local_memory_provenance(&mut ctx, alloca_op, provenance.clone());
+        alloca_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let alloca = find_first::<llvm::AllocaOp>(&ctx, &body).unwrap();
+        let copied =
+            llvm_export::ops::local_memory_provenance(&ctx, alloca.get_operation()).unwrap();
+        assert_eq!(copied, provenance);
     }
 
     #[test]
