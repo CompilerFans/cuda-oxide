@@ -358,24 +358,29 @@ let from_above = warp::shuffle_down_f32(val, delta);
 let from_below = warp::shuffle_up_f32(val, delta);
 let from_lane  = warp::shuffle_f32(val, src_lane);
 
-// i32 variants
-let partner_i = warp::shuffle_xor_i32(val, mask);
+// u32 is the unsuffixed form
+let partner_u = warp::shuffle_xor(val_u32, mask);
 
 // Vote
 let all_true = warp::all(predicate);
 let any_true = warp::any(predicate);
 let mask     = warp::ballot(predicate);
-let count    = warp::popc(mask);
+let count    = warp::popc(predicate); // == ballot(predicate).count_ones()
 ```
 
 ### Shuffle Operations
 
-| Function                              | Description                       |
-|:--------------------------------------|:----------------------------------|
-| `shuffle_xor_{f32,i32}(val, mask)`    | Exchange with lane `id ^ mask`    |
-| `shuffle_down_{f32,i32}(val, delta)`  | Read from lane `id + delta`       |
-| `shuffle_up_{f32,i32}(val, delta)`    | Read from lane `id - delta`       |
-| `shuffle_{f32,i32}(val, src)`         | Read from specific lane           |
+The unsuffixed name takes `u32`; `_f32`, `_f64` and `_u64` are the other
+widths. Each also has a `_sync` form taking an explicit member mask. There is
+no `_i32` variant — reinterpret an `i32` and use the `u32` form, since a
+shuffle moves bits and does not interpret them.
+
+| Function                                    | Description                       |
+|:--------------------------------------------|:----------------------------------|
+| `shuffle_xor(val, mask)` + `_f32/_f64/_u64` | Exchange with lane `id ^ mask`    |
+| `shuffle_down(val, delta)` + `_f32/_f64/_u64` | Read from lane `id + delta`     |
+| `shuffle_up(val, delta)` + `_f32/_f64/_u64` | Read from lane `id - delta`       |
+| `shuffle(val, src)` + `_f32/_f64/_u64`      | Read from specific lane           |
 
 ### Vote Operations
 
@@ -384,7 +389,7 @@ let count    = warp::popc(mask);
 | `all(pred)`    | `bool`   | True if predicate holds for all lanes        |
 | `any(pred)`    | `bool`   | True if predicate holds for any lane         |
 | `ballot(pred)` | `u32`    | Bitmask of lanes where predicate is true     |
-| `popc(mask)`   | `u32`    | Population count of set bits                 |
+| `popc(pred)`   | `u32`    | Count of lanes where predicate is true       |
 
 ---
 
