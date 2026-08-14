@@ -274,6 +274,34 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 - 调试注意：示例构建失败时 smoketest 会跑**陈旧二进制**（输出与源码不符时先 `cargo build` 验证编译错误）。
 - Wave64 SIMT 上的波内原子自旋（spin on atomic）是死锁高发区：自旋必须有界。
 
+
+### 4.0.2 2026-08-15 上游主线合并（upstream/main → main）
+
+**合并范围**：NVlabs/cuda-oxide upstream/main 50 个新提交（生成式 intrinsic catalog、dialect-nvvm 生成化、translator 重构、`IntrinsicBackend`（LlvmNvptx/LibNvvm）枚举、oxide-artifacts 新 crate、示例从 137 增至 213）。
+
+**冲突规模**：50 个文件冲突，约 400 个冲突块。处理策略：上游重构为主的文件取上游版后重放 MACA 差异；双方都有语义的文件取并集；纯机械冲突（Cargo.lock/.gitignore/Cargo.toml）手动合并。
+
+**MACA 适配重放（关键项）**：
+1. `BackendTarget(Maca)` 与上游新 `IntrinsicBackend` 枚举共存于 LoweringOptions。
+2. `generated_intrinsics.rs`（上游新的生成式转换文件）中 60+ 个 op 加了 MACA 预分发，调用我们原有的 native C500 helper（basic.rs/warp.rs）。
+3. **mask 类 op 加宽为 64 位**：ballot/lanemask/match/active_mask 的 build+verify 结果 32→64，member-mask operand 接受 i32|i64，importer 用 `emit_generated_nvvm_intrinsic_u64`。这是 Wave64 语义在新 catalog 架构下的落点。
+4. MACA export 分支恢复（MacaExportConfig、`kernel_calling_convention` 在 PipelineExportConfig 转发、alloca_address_space 转发）——缺转发会静默降级为普通 `define void`，kernel 符号找不到。
+5. `trap;`/`ld.acquire.gpu.*`/`fence.acq_rel.gpu` 等上游 inline-PTX 路径加 MACA 分支（llvm.trap / LLVM atomic load/store / LLVM fence）。
+6. m16n16k16 native MMA 全链路恢复：op 定义（generated/maca_mma.rs）+ importer 识别 + lowering impl。
+7. cu-bridge compat 扩展：CUlimit、CUctx_flags、流优先级、函数属性枚举、错误码别名（上游 cuda-core 新 API 面）。
+8. libdevice 一致性检查对 MACA 豁免（__nv_* → mc_math_func_* 重写导致 lowered 检测为 false 是预期行为）。
+9. cuda-device `live_lanes_1d`/`live_lane_mask` wave64 化；movmatrix 与上游生成版去重。
+
+**验证结果**：
+- workspace 全量构建 ✓；关键 crate 单元测试 535 通过 ✓
+- MACA 全套件：**210/213 通过（98.6%）**，3 个 NVIDIA 专属 skip（mma_mxf8f6f4/partial_warp_reduce/small_type_ffi_test）
+- 合并前基线 112/137（82%），合并后提升且无回归
+
+**教训**：
+- 上游架构迁移（手写 op → 生成 catalog）时，自定义后端的每个 hook 点都要在新架构里找到对应位置（op 定义/verify/importer/lowering 四层都要检查）。
+- trait 默认实现的静默回退是危险信号：`kernel_calling_convention` 没转发时编译照过、运行时符号找不到。
+- 生成文件（DO NOT EDIT 标记）与后端扩展的边界：maca_mma.rs 作为手写扩展模块注册进 generated/ 目录是可行模式。
+
 ### 4.1 高优先级
 
 | 任务 | 说明 | 阻塞因素 |
