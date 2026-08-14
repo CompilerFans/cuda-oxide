@@ -30,13 +30,11 @@
 use crate::context::{DynamicSmemAlignmentMap, SharedGlobalsMap};
 use crate::convert::types::{
     StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
-    is_zero_sized_type,
+    is_zero_sized_type, transparent_scalar_field,
 };
 
 use dialect_mir::ops::MirFuncOp;
-use dialect_mir::types::{
-    MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType, MirUnionType,
-};
+use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
 use llvm_export::ops as llvm;
 use pliron::{
     basic_block::BasicBlock,
@@ -51,7 +49,7 @@ use pliron::{
     op::Op,
     operation::Operation,
     result::Result,
-    r#type::{TypeHandle, Typed},
+    r#type::TypeHandle,
     value::Value,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -225,14 +223,10 @@ pub fn convert_func(
     // Kernel parameters are host data: the host writes them (by value at
     // launch, or into DeviceBuffer memory behind a pointer or slice) and
     // the kernel reads the same bytes, so both sides must agree on what
-    // every byte means. Most enums are fine; their device layout is
-    // byte-identical to rustc's. The exception is enums whose layout we
-    // do not model: niche-encoded ones like Option<&T>, where the host
-    // stores NO tag at all (it marks None with an impossible payload
-    // value, null, since a real &T is never null) while the device adds
-    // an explicit tag of its own. The two sides would read different
-    // bytes, so reject those here at the boundary. Using such an enum
-    // purely inside a kernel is fine and stays allowed.
+    // every byte means. Importer-produced Direct, Niche, Single, and Empty
+    // enum layouts are byte-identical to rustc. A legacy/hand-built Unknown
+    // layout has no such proof, so reject it here with a focused ABI error;
+    // physical lowering independently rejects Unknown layouts everywhere.
     if is_kernel {
         let mir_arg_types = {
             use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -246,17 +240,12 @@ pub fn convert_func(
                     .map_err(anyhow_to_pliron)?
             {
                 return pliron::input_err_noloc!(
-                    "kernel `{}` parameter {} contains enum `{}`, whose layout differs \
-                     between host and device: the host encodes the variant inside the \
-                     payload itself (Rust's niche optimisation, e.g. null means None for \
-                     a never-null reference) while the device stores an explicit tag. \
-                     Reading it from a kernel would read the wrong bytes. Give the enum an \
-                     explicit discriminant repr (e.g. #[repr(u32)]) to pass it across the \
-                     kernel boundary; using `{}` only inside kernel code (locals, \
-                     construct, match) works as before.",
+                    "kernel `{}` parameter {} contains enum `{}` with unknown physical \
+                     rustc layout at the kernel boundary; refusing to guess its bytes. \
+                     This indicates legacy or malformed dialect-mir input rather than an \
+                     unsupported Rust niche layout.",
                     func_name_str,
                     i,
-                    enum_name,
                     enum_name
                 );
             }
@@ -289,11 +278,6 @@ pub fn convert_func(
             (Some(body), Some(contract)) => Some(body.max(contract)),
             (body, contract) => body.or(contract),
         };
-
-        // Stamp ABI alignment onto load/store/alloca/ref ops while types are
-        // still MIR — repr(align(N)) is visible on MirStructType but lost after
-        // type conversion (LLVM struct types carry no over-alignment).
-        stamp_memory_op_alignment(ctx, &mir_blocks);
 
         if let Some(align) = max_align {
             let symbol_name: pliron::identifier::Identifier =
@@ -355,6 +339,9 @@ fn propagate_kernel_attrs(
             "cluster_dim_z",
             "maxntid",
             "minctasm",
+            "reqntid_x",
+            "reqntid_y",
+            "reqntid_z",
         ]
         .iter()
         .filter_map(|key_str| {
@@ -413,10 +400,11 @@ fn propagate_alwaysinline_attr(
 ///
 /// The LLVM entry block args reflect the post-flatten function signature.
 /// Slices always arrive as `(ptr, len)` pairs and get re-assembled via
-/// `insertvalue`. Structs only arrive flattened on the internal device-fn
-/// ABI; at kernel boundaries (`is_kernel_entry = true`) they arrive as a
-/// single byval value and pass through. This function decides the shape
-/// per-argument and emits the matching reconstruction sequence.
+/// `insertvalue`. Ordinary structs only arrive flattened on the internal
+/// device-fn ABI; at kernel boundaries they arrive as a single byval value.
+/// A rustc-proven `repr(transparent)` scalar wrapper is the exception: its
+/// kernel parameter is the underlying scalar, so the entry prologue rebuilds
+/// the MIR struct from that one non-ZST field.
 fn build_entry_prologue(
     ctx: &mut Context,
     mir_arg_types: &[TypeHandle],
@@ -429,21 +417,33 @@ fn build_entry_prologue(
     let mut result_args = Vec::new();
 
     for &mir_ty in mir_arg_types {
-        let kind = classify_argument_type(ctx, mir_ty, is_kernel_entry);
+        let kind = classify_argument_type(ctx, mir_ty, is_kernel_entry)?;
 
         match kind {
-            ReconstructKind::Slice => {
-                if llvm_arg_idx + 1 >= llvm_args.len() {
+            ReconstructKind::Slice { space_fields } => {
+                let needed = 2 + space_fields;
+                if llvm_arg_idx + needed > llvm_args.len() {
                     return Err(anyhow::anyhow!(
-                        "Entry block arg mismatch: need 2 more LLVM args for slice"
+                        "Entry block arg mismatch: need {} more LLVM args for slice",
+                        needed
                     ));
                 }
                 let ptr_val = llvm_args[llvm_arg_idx];
                 let len_val = llvm_args[llvm_arg_idx + 1];
-                llvm_arg_idx += 2;
+                let space_vals: Vec<Value> = (0..space_fields)
+                    .map(|i| llvm_args[llvm_arg_idx + 2 + i])
+                    .collect();
+                llvm_arg_idx += needed;
 
-                let (val, new_last) =
-                    reconstruct_slice(ctx, llvm_entry, last_op, mir_ty, ptr_val, len_val)?;
+                let (val, new_last) = reconstruct_slice(
+                    ctx,
+                    llvm_entry,
+                    last_op,
+                    mir_ty,
+                    ptr_val,
+                    len_val,
+                    &space_vals,
+                )?;
                 last_op = Some(new_last);
                 result_args.push(val);
             }
@@ -461,6 +461,20 @@ fn build_entry_prologue(
 
                 let (val, new_last) =
                     reconstruct_struct(ctx, llvm_entry, last_op, mir_ty, &field_vals)?;
+                last_op = Some(new_last);
+                result_args.push(val);
+            }
+            ReconstructKind::TransparentScalar => {
+                if llvm_arg_idx >= llvm_args.len() {
+                    return Err(anyhow::anyhow!(
+                        "Entry block arg mismatch: no scalar argument available for transparent struct"
+                    ));
+                }
+                let scalar_val = llvm_args[llvm_arg_idx];
+                llvm_arg_idx += 1;
+
+                let (val, new_last) =
+                    reconstruct_transparent_scalar(ctx, llvm_entry, last_op, mir_ty, scalar_val)?;
                 last_op = Some(new_last);
                 result_args.push(val);
             }
@@ -492,10 +506,13 @@ fn build_entry_prologue(
 
 /// Classification of argument types for reconstruction strategy.
 enum ReconstructKind {
-    /// A slice type (`&[T]` or `DisjointSlice<T>`), flattened to `(ptr, len)`.
-    Slice,
+    /// A slice type (`&[T]` or `DisjointSlice<T>`), flattened to `(ptr, len)`
+    /// followed by `space_fields` index-space layout arguments.
+    Slice { space_fields: usize },
     /// A struct type with N non-ZST fields, flattened to N separate arguments.
     Struct(usize),
+    /// A rustc-proven transparent scalar wrapper, passed as one scalar.
+    TransparentScalar,
     /// A zero-sized argument omitted from the LLVM signature.
     Zst,
     /// A simple type that passes through without reconstruction.
@@ -505,31 +522,48 @@ enum ReconstructKind {
 /// Classify an argument type to determine how to reconstruct it from
 /// flattened LLVM entry block arguments.
 ///
-/// At kernel-entry boundaries (`is_kernel_entry = true`) structs arrive
-/// intact, so they're classified as `None` even though the MIR type is
-/// `MirStructType`. Slices keep their `(ptr, len)` reconstruction on
-/// both ABIs.
+/// At kernel-entry boundaries (`is_kernel_entry = true`) ordinary structs
+/// arrive intact and are classified as `None`. A rustc-proven transparent
+/// scalar wrapper arrives as one scalar field and is classified as
+/// `TransparentScalar` so the MIR aggregate is reconstructed. Slices keep their
+/// `(ptr, len)` reconstruction on both ABIs.
 fn classify_argument_type(
     ctx: &mut Context,
     arg_ty: TypeHandle,
     is_kernel_entry: bool,
-) -> ReconstructKind {
+) -> std::result::Result<ReconstructKind, anyhow::Error> {
     if convert_type(ctx, arg_ty).is_ok_and(|llvm_ty| is_zero_sized_type(ctx, llvm_ty)) {
-        return ReconstructKind::Zst;
+        return Ok(ReconstructKind::Zst);
     }
 
-    let (is_slice, struct_fields) = {
+    let (slice_space_tys, struct_info) = {
         let arg_ty_ref = arg_ty.deref(ctx);
-        let is_slice = arg_ty_ref.is::<MirSliceType>() || arg_ty_ref.is::<MirDisjointSliceType>();
-        let struct_fields = arg_ty_ref
+        let slice_space_tys = if arg_ty_ref.is::<MirSliceType>() {
+            Some(Vec::new())
+        } else {
+            arg_ty_ref
+                .downcast_ref::<MirDisjointSliceType>()
+                .map(|s| s.space_tys.clone())
+        };
+        let struct_info = arg_ty_ref
             .downcast_ref::<MirStructType>()
-            .map(|s| s.field_types.clone());
-        (is_slice, struct_fields)
+            .map(|s| (s.field_types.clone(), s.is_transparent_scalar()));
+        (slice_space_tys, struct_info)
     };
 
-    if is_slice {
-        ReconstructKind::Slice
-    } else if let Some(fields) = struct_fields {
+    if let Some(space_tys) = slice_space_tys {
+        // A zero-sized index-space field contributes no argument, matching
+        // `convert_function_type`.
+        let space_fields = space_tys
+            .iter()
+            .filter(|f| {
+                convert_type(ctx, **f)
+                    .map(|llvm_ty| !is_zero_sized_type(ctx, llvm_ty))
+                    .unwrap_or(true)
+            })
+            .count();
+        Ok(ReconstructKind::Slice { space_fields })
+    } else if let Some((fields, is_transparent_scalar)) = struct_info {
         // Count non-ZST fields the same way `convert_function_type` does
         // — empty structs and structs of all-ZSTs are themselves ZST and
         // get dropped from the LLVM signature on both ABIs.
@@ -543,17 +577,21 @@ fn classify_argument_type(
             .count();
 
         if non_zst_count == 0 {
-            ReconstructKind::Zst
+            Ok(ReconstructKind::Zst)
+        } else if is_kernel_entry && is_transparent_scalar {
+            // Validate the one-non-ZST-field invariant here as well as during
+            // signature conversion, so hand-written dialect input fails closed.
+            let _ = transparent_scalar_field(ctx, arg_ty)?;
+            Ok(ReconstructKind::TransparentScalar)
         } else if is_kernel_entry {
-            // Kernel boundary: struct arrived as a single byval value,
-            // so the MIR entry block can consume it directly without
-            // any insertvalue prologue.
-            ReconstructKind::None
+            // Ordinary kernel-boundary struct arrived as a single byval value,
+            // so the MIR entry block can consume it directly.
+            Ok(ReconstructKind::None)
         } else {
-            ReconstructKind::Struct(non_zst_count)
+            Ok(ReconstructKind::Struct(non_zst_count))
         }
     } else {
-        ReconstructKind::None
+        Ok(ReconstructKind::None)
     }
 }
 
@@ -561,9 +599,13 @@ fn classify_argument_type(
 // Aggregate Reconstruction
 // ============================================================================
 
-/// Reconstruct a slice value from flattened pointer and length.
+/// Reconstruct a slice value from its flattened fields.
 ///
-/// Generates: `undef → insertvalue ptr[0] → insertvalue len[1]`.
+/// Generates: `undef → insertvalue ptr[0] → insertvalue len[1]`, then one
+/// `insertvalue` per index-space layout field at slot `2 + i`. Leaving those
+/// slots undef would give every thread a garbage row width, so the count here
+/// has to match what `convert_function_type` put in the signature.
+///
 /// Returns the final reconstructed value and the last inserted operation.
 fn reconstruct_slice(
     ctx: &mut Context,
@@ -572,6 +614,7 @@ fn reconstruct_slice(
     mir_ty: TypeHandle,
     ptr_val: Value,
     len_val: Value,
+    space_vals: &[Value],
 ) -> std::result::Result<(Value, Ptr<Operation>), anyhow::Error> {
     let struct_ty = convert_type(ctx, mir_ty)?;
 
@@ -588,9 +631,49 @@ fn reconstruct_slice(
     let insert_len = llvm::InsertValueOp::new(ctx, val_with_ptr, len_val, vec![1]);
     let insert_len_op = insert_len.get_operation();
     insert_len_op.insert_after(ctx, insert_ptr_op);
-    let final_val = insert_len_op.deref(ctx).get_result(0);
 
-    Ok((final_val, insert_len_op))
+    let mut last_op = insert_len_op;
+    let mut current_val = insert_len_op.deref(ctx).get_result(0);
+    for (i, &space_val) in space_vals.iter().enumerate() {
+        let insert_space =
+            llvm::InsertValueOp::new(ctx, current_val, space_val, vec![2 + i as u32]);
+        let insert_space_op = insert_space.get_operation();
+        insert_space_op.insert_after(ctx, last_op);
+        current_val = insert_space_op.deref(ctx).get_result(0);
+        last_op = insert_space_op;
+    }
+
+    Ok((current_val, last_op))
+}
+
+/// Reconstruct a nested `repr(transparent)` scalar wrapper from one LLVM scalar.
+///
+/// Each wrapper layer has exactly one non-ZST field. If that field is another
+/// transparent scalar struct, rebuild it first, then insert the resulting value
+/// into the outer layer. ZST marker fields remain omitted exactly as in ordinary
+/// struct reconstruction.
+fn reconstruct_transparent_scalar(
+    ctx: &mut Context,
+    llvm_block: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    mir_ty: TypeHandle,
+    scalar_val: Value,
+) -> std::result::Result<(Value, Ptr<Operation>), anyhow::Error> {
+    let field_ty = transparent_scalar_field(ctx, mir_ty)?;
+    let nested_transparent = {
+        let field_ref = field_ty.deref(ctx);
+        field_ref
+            .downcast_ref::<MirStructType>()
+            .is_some_and(MirStructType::is_transparent_scalar)
+    };
+
+    if nested_transparent {
+        let (field_val, nested_last) =
+            reconstruct_transparent_scalar(ctx, llvm_block, prev_op, field_ty, scalar_val)?;
+        reconstruct_struct(ctx, llvm_block, Some(nested_last), mir_ty, &[field_val])
+    } else {
+        reconstruct_struct(ctx, llvm_block, prev_op, mir_ty, &[scalar_val])
+    }
 }
 
 /// Reconstruct a struct value from flattened field values.
@@ -718,83 +801,6 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
 }
 
 // ============================================================================
-// Alignment Pre-Pass
-// ============================================================================
-
-/// The real (rustc) alignment of a struct or enum type, when recorded.
-///
-/// The converted LLVM struct alone can claim too little: an enum that
-/// lowers to `{ i8, [7 x i8] }` looks like "align 1" to LLVM even when
-/// Rust requires align 8. Memory ops touching such values get stamped
-/// with the recorded alignment instead.
-fn aggregate_over_align(ctx: &Context, ty: TypeHandle) -> Option<u64> {
-    let ty_ref = ty.deref(ctx);
-    if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
-        return Some(s.abi_align).filter(|a| *a > 0);
-    }
-    if let Some(e) = ty_ref.downcast_ref::<dialect_mir::types::MirEnumType>() {
-        return Some(e.abi_align()).filter(|a| *a > 0);
-    }
-    if let Some(u) = ty_ref.downcast_ref::<MirUnionType>() {
-        return Some(u.abi_align()).filter(|a| *a > 0);
-    }
-    None
-}
-
-/// Stamp the true ABI alignment onto every `mir.load`, `mir.store`,
-/// `mir.alloca`, and `mir.ref` whose accessed/allocated type carries a
-/// rustc ABI alignment in `MirStructType`, `MirEnumType`, or `MirUnionType`.
-///
-/// Must run BEFORE `inline_region` moves the blocks and BEFORE dialect
-/// conversion replaces MIR types with LLVM types, since the alignment
-/// information lives on the MIR types and is not expressible on LLVM
-/// struct types.
-fn stamp_memory_op_alignment(ctx: &mut Context, mir_blocks: &[Ptr<BasicBlock>]) {
-    let load_id = dialect_mir::ops::MirLoadOp::get_opid_static();
-    let store_id = dialect_mir::ops::MirStoreOp::get_opid_static();
-    let alloca_id = dialect_mir::ops::MirAllocaOp::get_opid_static();
-    let ref_id = dialect_mir::ops::MirRefOp::get_opid_static();
-
-    // Collect (op, align) first (read-only pass), then stamp (write pass).
-    let mut to_stamp: Vec<(Ptr<Operation>, u64)> = Vec::new();
-    for mir_block in mir_blocks {
-        let ops: Vec<_> = mir_block.deref(ctx).iter(ctx).collect();
-        for op in ops {
-            let op_id = Operation::get_opid(op, ctx);
-            let align = if op_id == load_id {
-                // load: result(0) is the loaded value.
-                aggregate_over_align(ctx, op.deref(ctx).get_result(0).get_type(ctx))
-            } else if op_id == store_id {
-                // store: operand(1) is the stored value.
-                aggregate_over_align(ctx, op.deref(ctx).get_operand(1).get_type(ctx))
-            } else if op_id == alloca_id {
-                // alloca: pointee type lives inside the MirPtrType result.
-                let res_ty = op.deref(ctx).get_result(0).get_type(ctx);
-                res_ty
-                    .deref(ctx)
-                    .downcast_ref::<MirPtrType>()
-                    .map(|p| p.pointee)
-                    .and_then(|pointee| aggregate_over_align(ctx, pointee))
-            } else if op_id == ref_id {
-                // ref: operand(0) is the value being referenced (spilled to
-                // stack). If it is an over-aligned struct, the synthesised
-                // alloca+store in convert_ref must honour that alignment.
-                aggregate_over_align(ctx, op.deref(ctx).get_operand(0).get_type(ctx))
-            } else {
-                None
-            };
-            if let Some(a) = align {
-                to_stamp.push((op, a));
-            }
-        }
-    }
-
-    for (op, align) in to_stamp {
-        llvm_export::ops::set_op_alignment(ctx, op, align as u32);
-    }
-}
-
-// ============================================================================
 // Pass Registration
 // ============================================================================
 
@@ -849,5 +855,138 @@ mod dynamic_shared_contract_tests {
         assert!(!propagated.contains_key("external"));
         assert!(!propagated.contains_key("uncontracted"));
         assert!(!propagated.contains_key("unreached_helper"));
+    }
+}
+
+#[cfg(test)]
+mod transparent_scalar_abi_tests {
+    use super::*;
+    use dialect_mir::types::StructAbiKind;
+    use pliron::builtin::types::{IntegerType, Signedness};
+
+    fn make_ctx() -> Context {
+        let mut ctx = Context::new();
+        dialect_mir::register(&mut ctx);
+        crate::register(&mut ctx);
+        ctx
+    }
+
+    fn u32_ty(ctx: &mut Context) -> TypeHandle {
+        IntegerType::get(ctx, 32, Signedness::Unsigned).into()
+    }
+
+    fn transparent_struct(
+        ctx: &mut Context,
+        name: &str,
+        fields: Vec<TypeHandle>,
+        offsets: Vec<u64>,
+        total_size: u64,
+        abi_align: u64,
+    ) -> TypeHandle {
+        let names = (0..fields.len()).map(|index| index.to_string()).collect();
+        let memory_order = (0..fields.len()).collect();
+        MirStructType::get_with_full_layout_and_abi(
+            ctx,
+            name.into(),
+            names,
+            fields,
+            memory_order,
+            offsets,
+            total_size,
+            abi_align,
+            StructAbiKind::TransparentScalar,
+        )
+        .into()
+    }
+
+    #[test]
+    fn kernel_transparent_scalar_reconstructs_from_one_field() {
+        let mut ctx = make_ctx();
+        let value = u32_ty(&mut ctx);
+        let wrapper = transparent_struct(&mut ctx, "Scalar", vec![value], vec![0], 4, 4);
+
+        assert!(matches!(
+            classify_argument_type(&mut ctx, wrapper, true).unwrap(),
+            ReconstructKind::TransparentScalar
+        ));
+    }
+
+    #[test]
+    fn kernel_transparent_scalar_ignores_zst_markers() {
+        let mut ctx = make_ctx();
+        let value = u32_ty(&mut ctx);
+        let marker: TypeHandle =
+            MirStructType::get(&mut ctx, "Marker".into(), vec![], vec![]).into();
+        let wrapper = transparent_struct(&mut ctx, "Marked", vec![value, marker], vec![0, 4], 4, 4);
+
+        assert!(matches!(
+            classify_argument_type(&mut ctx, wrapper, true).unwrap(),
+            ReconstructKind::TransparentScalar
+        ));
+    }
+
+    #[test]
+    fn ordinary_one_field_kernel_struct_stays_aggregate() {
+        let mut ctx = make_ctx();
+        let value = u32_ty(&mut ctx);
+        let wrapper: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Ordinary".into(),
+            vec!["0".into()],
+            vec![value],
+            vec![0],
+            vec![0],
+            4,
+            4,
+        )
+        .into();
+
+        assert!(matches!(
+            classify_argument_type(&mut ctx, wrapper, true).unwrap(),
+            ReconstructKind::None
+        ));
+    }
+
+    #[test]
+    fn nested_transparent_scalar_reaches_underlying_integer() {
+        let mut ctx = make_ctx();
+        let value = u32_ty(&mut ctx);
+        let inner = transparent_struct(&mut ctx, "Inner", vec![value], vec![0], 4, 4);
+        let outer = transparent_struct(&mut ctx, "Outer", vec![inner], vec![0], 4, 4);
+
+        let llvm_ty = crate::convert::types::transparent_scalar_llvm_type(&mut ctx, outer)
+            .expect("nested transparent scalar must lower");
+        let width = llvm_ty
+            .deref(&ctx)
+            .downcast_ref::<IntegerType>()
+            .expect("underlying type must be an integer")
+            .width();
+        assert_eq!(width, 32);
+    }
+
+    #[test]
+    fn transparent_pointer_reaches_underlying_pointer() {
+        let mut ctx = make_ctx();
+        let value = u32_ty(&mut ctx);
+        let pointer: TypeHandle =
+            dialect_mir::types::MirPtrType::get_generic(&mut ctx, value, false).into();
+        let wrapper = transparent_struct(&mut ctx, "Pointer", vec![pointer], vec![0], 8, 8);
+
+        let llvm_ty = crate::convert::types::transparent_scalar_llvm_type(&mut ctx, wrapper)
+            .expect("transparent pointer must lower");
+        assert!(llvm_ty.deref(&ctx).is::<llvm_export::types::PointerType>());
+    }
+
+    #[test]
+    fn malformed_transparent_scalar_fails_closed() {
+        let mut ctx = make_ctx();
+        let a = u32_ty(&mut ctx);
+        let b = u32_ty(&mut ctx);
+        let wrapper = transparent_struct(&mut ctx, "Bad", vec![a, b], vec![0, 4], 8, 4);
+
+        let error = classify_argument_type(&mut ctx, wrapper, true)
+            .err()
+            .expect("malformed transparent scalar must fail");
+        assert!(error.to_string().contains("more than one non-ZST field"));
     }
 }

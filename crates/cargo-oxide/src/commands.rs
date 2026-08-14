@@ -9,16 +9,270 @@
 //! - Backend path resolved via discovery chain instead of hardcoded relative path
 //! - Workspace root resolved by walking up from CWD instead of assuming CWD
 
+use crate::backend;
+use sha2::Digest as _;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::backend;
+const MATERIALIZE_ENV: &str = reserved_oxide_symbols::MATERIALIZE_CUBIN_ENV;
+const EXPECTED_PROVENANCE_ENV: &str = reserved_oxide_symbols::MATERIALIZER_PROVENANCE_ENV;
+const CODEGEN_FINGERPRINT_ENV: &str = reserved_oxide_symbols::CODEGEN_FINGERPRINT_ENV;
+const DEVICE_CODEGEN_CRATE_ENV: &str = reserved_oxide_symbols::DEVICE_CODEGEN_CRATE_ENV;
+const BACKEND_IDENTITY_CFG: &str = "cuda_oxide_internal_backend_identity";
+const LEGACY_CODEGEN_FINGERPRINT_CFG: &str = "cuda_oxide_internal_codegen_env";
+const LEGACY_MATERIALIZER_PROVENANCE_CFG: &str = "cuda_oxide_internal_materializer_provenance";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MaterializationMode {
+    provenance: Option<String>,
+}
+
+impl MaterializationMode {
+    fn enabled(&self) -> bool {
+        self.provenance.is_some()
+    }
+
+    fn apply(&self, cmd: &mut Command) {
+        if let Some(provenance) = &self.provenance {
+            // These override inherited/project values: they are a single
+            // wrapper-generated handshake tied to this Cargo invocation.
+            cmd.env(MATERIALIZE_ENV, "1")
+                .env(EXPECTED_PROVENANCE_ENV, provenance)
+                .env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
+        }
+    }
+}
+
+fn prepare_materialization(
+    ctx: &Context,
+    cli_requested: bool,
+    cli_arch: Option<&str>,
+    emit_nvvm_ir: bool,
+) -> MaterializationMode {
+    prepare_materialization_result(ctx, cli_requested, cli_arch, emit_nvvm_ir).unwrap_or_else(
+        |error| {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        },
+    )
+}
+
+/// `prepare_materialization` with the ambient `CUDA_OXIDE_MATERIALIZE_CUBIN`
+/// injected, so `cargo_passthrough_command_with_env` can reach
+/// `materialization_requested_with_env`.
+///
+/// Note this still exits the process on error, which inside a unit test aborts
+/// the whole test binary rather than failing one case -- a further reason tests
+/// must not reach the ambient read.
+fn prepare_materialization_with_env(
+    ctx: &Context,
+    cli_requested: bool,
+    cli_arch: Option<&str>,
+    emit_nvvm_ir: bool,
+    materialize_env: Option<std::ffi::OsString>,
+) -> MaterializationMode {
+    prepare_materialization_result_with_env(
+        ctx,
+        cli_requested,
+        cli_arch,
+        emit_nvvm_ir,
+        materialize_env,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    })
+}
+
+const EMIT_NVVM_IR_ENV: &str = "CUDA_OXIDE_EMIT_NVVM_IR";
+
+fn nvvm_ir_requested(ctx: &Context) -> Result<bool, String> {
+    nvvm_ir_requested_with_env(ctx, std::env::var_os(EMIT_NVVM_IR_ENV))
+}
+
+/// `nvvm_ir_requested` with the ambient `CUDA_OXIDE_EMIT_NVVM_IR` injected.
+///
+/// The process value outranks project config, so resolution has to be
+/// injectable for unit tests: an exported `CUDA_OXIDE_EMIT_NVVM_IR` would
+/// otherwise decide the answer before the configured value is consulted.
+fn nvvm_ir_requested_with_env(
+    ctx: &Context,
+    env_value: Option<std::ffi::OsString>,
+) -> Result<bool, String> {
+    if let Some(value) = env_value {
+        let value = value
+            .into_string()
+            .map_err(|_| format!("{EMIT_NVVM_IR_ENV} is not valid Unicode"))?;
+        return parse_strict_bool(EMIT_NVVM_IR_ENV, &value);
+    }
+
+    if let Some(value) = project_config_env(ctx, EMIT_NVVM_IR_ENV) {
+        return parse_strict_bool(EMIT_NVVM_IR_ENV, value);
+    }
+
+    Ok(false)
+}
+
+fn materialization_requested(ctx: &Context, cli_requested: bool) -> Result<bool, String> {
+    materialization_requested_with_env(ctx, cli_requested, std::env::var_os(MATERIALIZE_ENV))
+}
+
+/// `materialization_requested` with the ambient `CUDA_OXIDE_MATERIALIZE_CUBIN`
+/// injected.
+///
+/// The process value outranks project config, so resolution has to be
+/// injectable for unit tests: an exported value would otherwise turn
+/// materialization on for tests that pass `materialize_cubin: false`, sending
+/// them into `discover_materializer_provenance`. Same rationale as
+/// `nvvm_ir_requested_with_env`.
+fn materialization_requested_with_env(
+    ctx: &Context,
+    cli_requested: bool,
+    env_value: Option<std::ffi::OsString>,
+) -> Result<bool, String> {
+    if cli_requested {
+        return Ok(true);
+    }
+
+    if let Some(value) = env_value {
+        let value = value
+            .into_string()
+            .map_err(|_| format!("{MATERIALIZE_ENV} is not valid Unicode"))?;
+        return parse_strict_bool(MATERIALIZE_ENV, &value);
+    }
+
+    if let Some(value) = project_config_env(ctx, MATERIALIZE_ENV) {
+        return parse_strict_bool(MATERIALIZE_ENV, value);
+    }
+
+    Ok(false)
+}
+
+fn prepare_materialization_result(
+    ctx: &Context,
+    cli_requested: bool,
+    cli_arch: Option<&str>,
+    emit_nvvm_ir: bool,
+) -> Result<MaterializationMode, String> {
+    prepare_materialization_result_with_env(
+        ctx,
+        cli_requested,
+        cli_arch,
+        emit_nvvm_ir,
+        std::env::var_os(MATERIALIZE_ENV),
+    )
+}
+
+/// `prepare_materialization_result` with the ambient
+/// `CUDA_OXIDE_MATERIALIZE_CUBIN` injected, forwarded to
+/// `materialization_requested_with_env`.
+fn prepare_materialization_result_with_env(
+    ctx: &Context,
+    cli_requested: bool,
+    cli_arch: Option<&str>,
+    emit_nvvm_ir: bool,
+    materialize_env: Option<std::ffi::OsString>,
+) -> Result<MaterializationMode, String> {
+    let enabled = materialization_requested_with_env(ctx, cli_requested, materialize_env)?;
+    if !enabled {
+        return Ok(MaterializationMode::default());
+    }
+    if emit_nvvm_ir {
+        return Err(
+            "--materialize-cubin cannot be combined with --emit-nvvm-ir; one requests a final cubin and the other requests NVVM IR"
+                .to_string(),
+        );
+    }
+
+    let arch = configured_arch_label(ctx, cli_arch).ok_or_else(|| {
+        "--materialize-cubin requires --arch, CUDA_OXIDE_TARGET, or a configured default-arch"
+            .to_string()
+    })?;
+    let _: cuda_artifact_finalizer::CudaArch = arch
+        .parse()
+        .map_err(|error| format!("invalid materialization target {arch:?}: {error}"))?;
+
+    Ok(MaterializationMode {
+        provenance: Some(discover_materializer_provenance(ctx)?),
+    })
+}
+
+fn discover_materializer_provenance(ctx: &Context) -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate cargo-oxide executable: {error}"))?;
+    let mut command = materializer_discovery_command(ctx, &executable);
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start CUDA materializer discovery: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "CUDA materializer discovery failed: {}",
+            stderr.trim()
+        ));
+    }
+    let provenance = String::from_utf8(output.stdout)
+        .map_err(|_| "CUDA materializer discovery returned non-UTF-8 output".to_string())?;
+    let provenance = provenance.trim();
+    if provenance.len() != 64
+        || !provenance
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "CUDA materializer discovery returned an invalid provenance digest: {provenance:?}"
+        ));
+    }
+    Ok(provenance.to_string())
+}
+
+fn materializer_discovery_command(ctx: &Context, executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.arg("__materializer-provenance");
+    apply_config_env(&mut command, ctx);
+    apply_ld_library_path(&mut command, ctx);
+    command
+}
+
+pub fn print_materializer_provenance() {
+    let finalizer = cuda_artifact_finalizer::Finalizer::discover().unwrap_or_else(|error| {
+        eprintln!("could not discover CUDA artifact finalizer: {error}");
+        std::process::exit(1);
+    });
+    let provenance = finalizer.provenance_digest().unwrap_or_else(|| {
+        eprintln!(
+            "the loaded libNVVM or nvJitLink library cannot be tied to an exact file; refusing materialization because Cargo could not fingerprint the compiler inputs"
+        );
+        std::process::exit(1);
+    });
+    println!("{}", digest_hex(&provenance));
+}
+
+fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{name} must be a boolean (accepted true values: 1, true, yes, on; false values: 0, false, no, off), got {value:?}"
+        )),
+    }
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
 
 const TARGET_BACKEND_ENV: &str = "CUDA_OXIDE_TARGET_BACKEND";
 
 /// Project-local cuda-oxide defaults loaded from `.cargo/cuda-oxide.toml`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OxideConfig {
     /// Explicit backend shared object path.
     pub backend: Option<PathBuf>,
@@ -100,19 +354,20 @@ pub fn resolve_context() -> Context {
     std::process::exit(1);
 }
 
-/// Resolve a context for `cargo oxide doctor` with NO side effects.
+/// Resolve a context for commands that must not build or fetch the backend.
 ///
 /// Identical discovery to [`resolve_context`], except the backend `.so` is
-/// only *located* (via [`backend::backend_so_candidate`]), never built and
-/// never cloned. A diagnostic command must be runnable on a machine where
-/// nothing is set up yet; gating it behind a multi-minute backend build (or
-/// a network clone) would hide the very problems it exists to report.
+/// only located via [`backend::backend_so_candidate`], never built and never
+/// cloned, and an invalid `.cargo/cuda-oxide.toml` degrades to defaults with
+/// a warning instead of exiting (so `doctor` can report it as a failed
+/// check). Passive commands such as `doctor` and `clean` must remain usable
+/// without triggering backend setup or network access.
 /// `run`/`build`/`pipeline`/`setup` still build the backend on demand.
-pub fn resolve_doctor_context() -> Context {
+pub fn resolve_passive_context() -> Context {
     if let Some(workspace_root) = backend::find_workspace_root() {
         let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
         let examples_dir = codegen_crate.join("examples");
-        let config = load_oxide_config(&workspace_root);
+        let config = load_oxide_config_lenient(&workspace_root);
         let backend_so = backend::backend_so_candidate(&workspace_root, config.backend.as_deref());
         return Context {
             workspace_root,
@@ -130,7 +385,7 @@ pub fn resolve_doctor_context() -> Context {
     });
 
     if cwd.join("Cargo.toml").is_file() {
-        let config = load_oxide_config(&cwd);
+        let config = load_oxide_config_lenient(&cwd);
         let backend_so = backend::backend_so_candidate(&cwd, config.backend.as_deref());
         return Context {
             workspace_root: cwd.clone(),
@@ -149,6 +404,617 @@ pub fn resolve_doctor_context() -> Context {
     std::process::exit(1);
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ExampleInfo {
+    name: String,
+    title: String,
+    description: String,
+    requirements: Vec<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ParsedReadme {
+    title: Option<String>,
+    description: Option<String>,
+    requirements: Vec<String>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ManifestInfo {
+    description: Option<String>,
+}
+
+pub fn list_examples(ctx: &Context, json: bool) {
+    if !ctx.is_workspace {
+        eprintln!("Error: `cargo oxide list` must be run from inside a cuda-oxide checkout.");
+        eprintln!();
+        eprintln!("The command lists examples under crates/rustc-codegen-cuda/examples/.");
+        std::process::exit(1);
+    }
+
+    let examples = discover_examples(&ctx.examples_dir).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+
+    let output = if json {
+        format_examples_json(&examples).unwrap_or_else(|error| {
+            eprintln!("Error: could not serialize example list: {error}");
+            std::process::exit(1);
+        })
+    } else {
+        format_examples_human(&examples)
+    };
+
+    print!("{output}");
+}
+
+fn discover_examples(examples_dir: &Path) -> Result<Vec<ExampleInfo>, String> {
+    let entries = fs::read_dir(examples_dir).map_err(|error| {
+        format!(
+            "could not read examples directory {}: {error}",
+            examples_dir.display()
+        )
+    })?;
+
+    let mut examples = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not read an entry under {}: {error}",
+                examples_dir.display()
+            )
+        })?;
+
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", entry.path().display()))?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let example_dir = entry.path();
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "example directory name is not valid UTF-8: {}",
+                name.to_string_lossy()
+            )
+        })?;
+
+        // A directory without a manifest is not an example (scratch dirs,
+        // checked-out tooling, ...). Skip it instead of failing the listing.
+        let manifest_path = example_dir.join("Cargo.toml");
+        if !manifest_path.is_file() {
+            eprintln!(
+                "Warning: skipping {}: no top-level Cargo.toml",
+                example_dir.display()
+            );
+            continue;
+        }
+
+        let manifest = parse_example_manifest(&manifest_path)?;
+
+        let readme_path = example_dir.join("README.md");
+        let parsed_readme = if readme_path.is_file() {
+            let contents = fs::read_to_string(&readme_path)
+                .map_err(|error| format!("could not read {}: {error}", readme_path.display()))?;
+            parse_example_readme(&name, &contents)
+        } else {
+            ParsedReadme::default()
+        };
+
+        let ParsedReadme {
+            title,
+            description,
+            requirements,
+        } = parsed_readme;
+
+        let title = title.unwrap_or_else(|| name.clone());
+
+        let description = description.or(manifest.description).unwrap_or_else(|| {
+            if title != name {
+                title.clone()
+            } else {
+                "No description documented.".to_string()
+            }
+        });
+
+        examples.push(ExampleInfo {
+            name,
+            title,
+            description,
+            requirements,
+        });
+    }
+
+    examples.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if examples.is_empty() {
+        return Err(format!(
+            "no examples found under {}",
+            examples_dir.display()
+        ));
+    }
+
+    Ok(examples)
+}
+
+fn parse_example_manifest(path: &Path) -> Result<ManifestInfo, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+
+    let manifest: toml::Value = toml::from_str(&contents)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format!("{} has no [package] table", path.display()))?;
+
+    let description = package
+        .get("description")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_owned);
+
+    Ok(ManifestInfo { description })
+}
+
+fn parse_example_readme(crate_name: &str, contents: &str) -> ParsedReadme {
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut headings = Vec::new();
+    let mut in_code_fence = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        if is_code_fence(line) {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some((level, title)) = parse_markdown_heading(line) {
+            headings.push((index, level, title));
+        }
+    }
+
+    let crate_heading = normalize_heading(crate_name);
+
+    let selected_heading = match headings.first() {
+        Some(first) if normalize_heading(&first.2) == crate_heading => headings
+            .get(1)
+            .filter(|heading| {
+                heading.1 == 2
+                    && first_prose_paragraph_in_range(&lines, first.0 + 1, heading.0).is_none()
+                    && !is_generic_section_heading(&normalize_heading(&heading.2))
+            })
+            .or(Some(first)),
+        Some(first) => Some(first),
+        None => None,
+    };
+
+    let title = selected_heading
+        .map(|(_, _, title)| strip_inline_markdown(title))
+        .filter(|title| !title.is_empty());
+
+    let description_start = selected_heading.map(|(index, _, _)| index + 1).unwrap_or(0);
+
+    let description_end = headings
+        .iter()
+        .find(|(index, _, _)| *index >= description_start)
+        .map(|(index, _, _)| *index)
+        .unwrap_or(lines.len());
+
+    let description = first_prose_paragraph_in_range(&lines, description_start, description_end);
+    let requirements = extract_requirements(&lines);
+
+    ParsedReadme {
+        title,
+        description,
+        requirements,
+    }
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+
+    let remainder = &trimmed[level..];
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let title = remainder.trim().trim_end_matches('#').trim();
+
+    if title.is_empty() {
+        None
+    } else {
+        Some((level, title.to_string()))
+    }
+}
+
+fn is_code_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn strip_inline_markdown(value: &str) -> String {
+    value
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
+}
+
+fn normalize_heading(value: &str) -> String {
+    strip_inline_markdown(value)
+        .trim_matches(|character: char| {
+            character == ':' || character == '-' || character.is_whitespace()
+        })
+        .to_ascii_lowercase()
+}
+
+fn is_generic_section_heading(heading: &str) -> bool {
+    matches!(
+        heading,
+        "overview"
+            | "what this example does"
+            | "key concepts"
+            | "key concepts demonstrated"
+            | "build"
+            | "build and run"
+            | "usage"
+            | "expected output"
+            | "requirements"
+            | "hardware requirements"
+            | "prerequisites"
+            | "potential errors"
+            | "how it works"
+            | "how it works under the hood"
+            | "generated ptx"
+            | "run"
+            | "test"
+            | "tests"
+            | "correctness"
+            | "trigger"
+            | "kernels"
+            | "features tested"
+            | "what this tests"
+            | "what it tests"
+            | "what this demonstrates"
+            | "why this exists"
+            | "the bug"
+            | "final design"
+    )
+}
+
+fn first_prose_paragraph_in_range(lines: &[&str], start: usize, end: usize) -> Option<String> {
+    let end = end.min(lines.len());
+    let start = start.min(end);
+    let mut paragraph = Vec::new();
+    let mut in_code_fence = false;
+
+    for line in &lines[start..end] {
+        if is_code_fence(line) {
+            if !paragraph.is_empty() {
+                break;
+            }
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        if parse_markdown_heading(trimmed).is_some() {
+            break;
+        }
+
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        if is_non_prose_markdown(trimmed) {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        paragraph.push(trimmed);
+    }
+
+    if paragraph.is_empty() {
+        None
+    } else {
+        Some(paragraph.join(" "))
+    }
+}
+
+fn is_non_prose_markdown(line: &str) -> bool {
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("+ ")
+        || line.starts_with('>')
+        || line.starts_with('|')
+        || line.starts_with("![")
+        || line.starts_with("<!--")
+        || is_ordered_list_item(line)
+}
+
+fn is_ordered_list_item(line: &str) -> bool {
+    strip_ordered_list_marker(line).is_some()
+}
+
+/// Strip a `1. ` / `42. ` ordered-list marker, returning the item text.
+fn strip_ordered_list_marker(line: &str) -> Option<&str> {
+    let (marker, item) = line.split_once(". ")?;
+    if !marker.is_empty() && marker.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(item.trim_start())
+    } else {
+        None
+    }
+}
+
+/// Collect the requirement entries documented under a requirements-style
+/// heading ([`is_requirements_heading`]).
+///
+/// Recognized forms:
+/// - unordered list items (`- ` / `* ` / `+ `), with indented
+///   wrap-continuation lines joined onto the item;
+/// - ordered list items (`1. `), same continuation rule;
+/// - two-column markdown tables, emitted as `name: value` per data row.
+///
+/// Tables with any other column count are skipped whole: without knowing
+/// which columns carry the requirement, half-parsing them would produce
+/// garbage entries.
+fn extract_requirements(lines: &[&str]) -> Vec<String> {
+    let mut requirements = Vec::new();
+    let mut current_requirement: Option<String> = None;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut requirement_level = None;
+    let mut in_code_fence = false;
+
+    for line in lines {
+        if is_code_fence(line) {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_markdown_heading(line) {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+
+            let normalized = normalize_heading(&heading);
+
+            if is_requirements_heading(&normalized) {
+                requirement_level = Some(level);
+            } else if requirement_level.is_some_and(|active| level <= active) {
+                requirement_level = None;
+            }
+
+            continue;
+        }
+
+        if requirement_level.is_none() {
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        // A blank line terminates the current list item or table. Whatever
+        // follows is a new paragraph (prose, a code fence, ...), not a
+        // wrapped continuation of the bullet above it.
+        if trimmed.is_empty() {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            flush_requirement_table(&mut table_rows, &mut requirements);
+            continue;
+        }
+
+        if trimmed.starts_with('|') {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+            table_rows.push(split_table_row(trimmed));
+            continue;
+        }
+        flush_requirement_table(&mut table_rows, &mut requirements);
+
+        let item = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+            .or_else(|| strip_ordered_list_marker(trimmed));
+
+        if let Some(item) = item {
+            if let Some(requirement) = current_requirement.take() {
+                requirements.push(requirement);
+            }
+
+            let item = strip_inline_markdown(item);
+            if !item.is_empty() {
+                current_requirement = Some(item);
+            }
+        } else if let Some(requirement) = &mut current_requirement {
+            requirement.push(' ');
+            requirement.push_str(&strip_inline_markdown(trimmed));
+        }
+    }
+
+    if let Some(requirement) = current_requirement {
+        requirements.push(requirement);
+    }
+    flush_requirement_table(&mut table_rows, &mut requirements);
+
+    requirements.dedup();
+    requirements
+}
+
+/// Split a markdown table row into trimmed cells, honoring `\|` escapes and
+/// dropping the empty leading/trailing cells produced by the outer pipes.
+fn split_table_row(row: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut characters = row.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&'|') => {
+                cell.push('|');
+                characters.next();
+            }
+            '|' => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+            }
+            _ => cell.push(character),
+        }
+    }
+    cells.push(cell.trim().to_string());
+
+    if cells.first().is_some_and(|first| first.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|last| last.is_empty()) {
+        cells.pop();
+    }
+
+    cells
+}
+
+/// The `|---|:---:|` row separating a table header from its data rows.
+fn is_table_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            !cell.is_empty()
+                && cell
+                    .chars()
+                    .all(|character| character == '-' || character == ':')
+        })
+}
+
+/// Convert a buffered `| name | value |` requirements table into one
+/// `name: value` entry per data row. Tables whose header or data rows are
+/// not exactly two columns are dropped whole rather than half-parsed.
+fn flush_requirement_table(table_rows: &mut Vec<Vec<String>>, requirements: &mut Vec<String>) {
+    let rows = std::mem::take(table_rows);
+
+    // Header, separator, and at least one data row.
+    if rows.len() < 3 || !is_table_separator_row(&rows[1]) {
+        return;
+    }
+
+    if !rows.iter().all(|row| row.len() == 2) {
+        return;
+    }
+
+    for row in &rows[2..] {
+        let name = strip_inline_markdown(&row[0]);
+        let value = strip_inline_markdown(&row[1]);
+        if !name.is_empty() && !value.is_empty() {
+            requirements.push(format!("{name}: {value}"));
+        }
+    }
+}
+
+fn is_requirements_heading(heading: &str) -> bool {
+    matches!(
+        heading,
+        "requirements"
+            | "hardware requirements"
+            | "software requirements"
+            | "system requirements"
+            | "toolkit requirements"
+            | "build requirements"
+            | "prerequisites"
+    )
+}
+
+fn format_examples_human(examples: &[ExampleInfo]) -> String {
+    let mut output = String::new();
+
+    for (index, example) in examples.iter().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+
+        output.push_str(&example.name);
+        output.push('\n');
+
+        if example.title != example.name {
+            output.push_str("  ");
+            output.push_str(&example.title);
+            output.push('\n');
+        }
+
+        output.push_str("  ");
+        output.push_str(&example.description);
+        output.push('\n');
+
+        if !example.requirements.is_empty() {
+            output.push_str("  Requirements:\n");
+            for requirement in &example.requirements {
+                output.push_str("    - ");
+                output.push_str(requirement);
+                output.push('\n');
+            }
+        }
+    }
+
+    output
+}
+
+fn format_examples_json(examples: &[ExampleInfo]) -> Result<String, serde_json::Error> {
+    let examples = examples
+        .iter()
+        .map(|example| {
+            serde_json::json!({
+                "name": example.name,
+                "title": example.title,
+                "description": example.description,
+                "requirements": example.requirements,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "examples": examples,
+    });
+
+    let mut output = serde_json::to_string_pretty(&document)?;
+    output.push('\n');
+    Ok(output)
+}
+
 // =============================================================================
 // Run command
 // =============================================================================
@@ -157,7 +1023,8 @@ pub fn resolve_doctor_context() -> Context {
 ///
 /// Cleans stale artifacts, sets encoded rustc flags to point at the backend `.so`,
 /// and invokes `cargo run --release` from the example directory. Environment
-/// variables control output format (PTX / NVVM IR) and verbosity.
+/// variables control output format (PTX / NVVM IR) and verbosity. Trailing
+/// `app_args` are forwarded to the example binary after `--`.
 #[allow(clippy::too_many_arguments)]
 pub fn codegen_run(
     ctx: &Context,
@@ -166,9 +1033,14 @@ pub fn codegen_run(
     emit_nvvm_ir: bool,
     arch: Option<&str>,
     features: Option<&str>,
+    device_features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
     target_backend: Option<&str>,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    materialize_cubin: bool,
+    app_args: &[String],
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -181,6 +1053,7 @@ pub fn codegen_run(
 
     let output_format = format_label(emit_nvvm_ir);
     let target_arch = configured_arch(ctx, arch);
+    let materialization = prepare_materialization(ctx, materialize_cubin, arch, emit_nvvm_ir);
     // Target precedence for `cargo oxide run` (highest first):
     //   1. --arch <sm_XX>            explicit user override   -> CUDA_OXIDE_TARGET
     //   2. CUDA_OXIDE_TARGET=<sm_XX> explicit env override (from the parent)
@@ -194,7 +1067,8 @@ pub fn codegen_run(
     // We only detect for `run`, not `build`/`pipeline`: `run` loads the cubin
     // on the local GPU, whereas those may legitimately cross-compile for
     // another machine.
-    let detected_device_arch = detect_run_target_arch(target_arch, emit_nvvm_ir);
+    let detected_device_arch =
+        detect_run_target_arch(target_arch, emit_nvvm_ir || materialization.enabled());
 
     if let Some(interop) = interop.filter(|config| !config.device_crates.is_empty()) {
         reject_unsupported_interop_target_backend(&target_backend);
@@ -208,10 +1082,18 @@ pub fn codegen_run(
             target_arch,
             detected_device_arch.as_deref(),
             features,
+            device_features,
             bin,
             no_fmad,
+            unchecked_indexing,
+            &materialization,
+            app_args,
         );
         return;
+    }
+    if device_features.is_some() {
+        eprintln!("Error: --device-features requires metadata-declared interop device crates.");
+        std::process::exit(2);
     }
 
     clean_generated_files(&example_dir, example);
@@ -220,7 +1102,15 @@ pub fn codegen_run(
     println!("RUSTC-CODEGEN-CUDA: {}", example);
     println!("=========================================");
     println!();
-    if emit_nvvm_ir {
+    if materialization.enabled() {
+        println!("Output format: materialized cubin");
+        println!(
+            "Target arch: {}",
+            configured_arch_label(ctx, arch)
+                .expect("materialization requires a configured architecture")
+        );
+        println!();
+    } else if emit_nvvm_ir {
         println!("Output format: {}", output_format);
         println!(
             "Target arch: {}",
@@ -251,8 +1141,18 @@ pub fn codegen_run(
     if let Some(features) = features {
         cmd.args(["--features", features]);
     }
+    if !app_args.is_empty() {
+        cmd.arg("--").args(app_args);
+    }
 
-    apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
+    apply_common_codegen_env(
+        &mut cmd,
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+    );
     // Device crates (cuda-device) gate hardware-dependent constants such as
     // WAVE_SIZE on this cfg; it must appear on every MACA device build.
     let target_cfgs = if target_backend == "maca" {
@@ -260,8 +1160,26 @@ pub fn codegen_run(
     } else {
         Vec::new()
     };
-    apply_codegen_rustflags(&mut cmd, ctx, false, &target_cfgs);
-    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
+    let fingerprint = standard_codegen_fingerprint(
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        emit_nvvm_ir,
+        target_arch,
+        detected_device_arch.as_deref(),
+        &target_backend,
+        &materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLike,
+        &target_cfgs,
+        &fingerprint,
+    );
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch, &materialization);
     apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
     apply_target_backend(&mut cmd, &target_backend);
 
@@ -297,6 +1215,9 @@ pub fn codegen_sanitize(
     features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    materialize_cubin: bool,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -308,10 +1229,12 @@ pub fn codegen_sanitize(
     let target_backend = configured_target_backend_or_exit(ctx, None);
     reject_unsupported_sanitize_target_backend(&target_backend);
     let target_arch = configured_arch(ctx, arch);
-    let detected_device_arch = detect_run_target_arch(target_arch, false);
+    let materialization = prepare_materialization(ctx, materialize_cubin, arch, false);
+    let detected_device_arch = detect_run_target_arch(target_arch, materialization.enabled());
 
     if let Some(interop) = interop.filter(|config| !config.device_crates.is_empty()) {
         reject_unsupported_interop_target_backend(&target_backend);
+        reject_interop_output_mode(false, &materialization);
         println!("=========================================");
         println!("RUSTC-CODEGEN-CUDA SANITIZE INTEROP: {}", example);
         println!("=========================================");
@@ -331,10 +1254,13 @@ pub fn codegen_sanitize(
             verbose,
             target_arch,
             detected_device_arch.as_deref(),
+            None,
             InteropDeviceBuildOptions {
                 no_fmad,
+                unchecked_indexing,
                 sanitizer_line_tables: true,
             },
+            &materialization,
         );
         let binary = build_host_cargo(ctx, example, &example_dir, features, bin, verbose);
         run_compute_sanitizer(
@@ -370,6 +1296,9 @@ pub fn codegen_sanitize(
         features,
         bin,
         no_fmad,
+        unchecked_indexing,
+        device_debug,
+        &materialization,
     );
     run_compute_sanitizer(
         ctx,
@@ -394,20 +1323,50 @@ struct InteropConfig {
 #[derive(Debug, Clone)]
 struct DeviceCrateConfig {
     manifest_path: PathBuf,
-    ptx_dir: PathBuf,
+    artifact_dir: PathBuf,
     artifact_name: Option<String>,
+    artifact_kind: InteropArtifactKind,
+    source_identity: bool,
+    bin: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InteropArtifactKind {
+    #[default]
+    Ptx,
+    Cubin,
+}
+
+impl InteropArtifactKind {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Ptx => "ptx",
+            Self::Cubin => "cubin",
+        }
+    }
+
+    fn emits_nvvm_ir(self) -> bool {
+        self == Self::Cubin
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct InteropBinaryTarget {
+    source_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct InteropDeviceBuildOptions {
     no_fmad: bool,
+    unchecked_indexing: bool,
     sanitizer_line_tables: bool,
 }
 
 impl InteropDeviceBuildOptions {
-    fn standard(no_fmad: bool) -> Self {
+    fn standard(no_fmad: bool, unchecked_indexing: bool) -> Self {
         Self {
             no_fmad,
+            unchecked_indexing,
             sanitizer_line_tables: false,
         }
     }
@@ -424,10 +1383,14 @@ fn codegen_run_interop(
     arch: Option<&str>,
     detected_device_arch: Option<&str>,
     features: Option<&str>,
+    device_features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    materialization: &MaterializationMode,
+    app_args: &[String],
 ) {
-    reject_interop_nvvm_ir(emit_nvvm_ir);
+    reject_interop_output_mode(emit_nvvm_ir, materialization);
 
     println!("=========================================");
     println!("RUSTC-CODEGEN-CUDA INTEROP: {}", example);
@@ -447,9 +1410,20 @@ fn codegen_run_interop(
         verbose,
         arch,
         detected_device_arch,
-        InteropDeviceBuildOptions::standard(no_fmad),
+        device_features,
+        InteropDeviceBuildOptions::standard(no_fmad, unchecked_indexing),
+        materialization,
     );
-    run_host_cargo(ctx, example, example_dir, "run", features, bin, verbose);
+    run_host_cargo(
+        ctx,
+        example,
+        example_dir,
+        "run",
+        features,
+        bin,
+        verbose,
+        app_args,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,9 +1436,12 @@ fn codegen_build_interop(
     emit_nvvm_ir: bool,
     arch: Option<&str>,
     features: Option<&str>,
+    device_features: Option<&str>,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    materialization: &MaterializationMode,
 ) {
-    reject_interop_nvvm_ir(emit_nvvm_ir);
+    reject_interop_output_mode(emit_nvvm_ir, materialization);
 
     println!("=========================================");
     println!("RUSTC-CODEGEN-CUDA INTEROP BUILD: {}", example);
@@ -483,15 +1460,33 @@ fn codegen_build_interop(
         verbose,
         arch,
         None,
-        InteropDeviceBuildOptions::standard(no_fmad),
+        device_features,
+        InteropDeviceBuildOptions::standard(no_fmad, unchecked_indexing),
+        materialization,
     );
-    run_host_cargo(ctx, example, example_dir, "build", features, None, verbose);
+    run_host_cargo(
+        ctx,
+        example,
+        example_dir,
+        "build",
+        features,
+        None,
+        verbose,
+        &[],
+    );
 }
 
-fn reject_interop_nvvm_ir(emit_nvvm_ir: bool) {
+fn reject_interop_output_mode(emit_nvvm_ir: bool, materialization: &MaterializationMode) {
+    if materialization.enabled() {
+        eprintln!("Error: --materialize-cubin is not supported for metadata interop examples yet.");
+        eprintln!(
+            "Declare `artifact-kind = \"cubin\"` on each device crate that requires native output."
+        );
+        std::process::exit(2);
+    }
     if emit_nvvm_ir {
         eprintln!("Error: --emit-nvvm-ir is not supported for metadata interop examples yet.");
-        eprintln!("Interop host crates embed PTX artifacts produced by nested device crates.");
+        eprintln!("Interop device output is selected by each metadata `artifact-kind`.");
         std::process::exit(2);
     }
 }
@@ -531,6 +1526,7 @@ fn validate_sanitize_target_backend(target_backend: &str) -> Result<(), String> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_interop_device_crates(
     ctx: &Context,
     example_dir: &Path,
@@ -538,7 +1534,9 @@ fn build_interop_device_crates(
     verbose: bool,
     arch: Option<&str>,
     detected_device_arch: Option<&str>,
+    device_features: Option<&str>,
     options: InteropDeviceBuildOptions,
+    materialization: &MaterializationMode,
 ) {
     for device_crate in &interop.device_crates {
         build_interop_device_crate(
@@ -548,8 +1546,262 @@ fn build_interop_device_crates(
             verbose,
             arch,
             detected_device_arch,
+            device_features,
             options,
+            materialization,
         );
+    }
+}
+
+fn interop_device_artifact_name(manifest_path: &Path, device_crate: &DeviceCrateConfig) -> String {
+    device_crate.artifact_name.clone().unwrap_or_else(|| {
+        normalize_crate_name(&interop_device_cargo_target_name(
+            manifest_path,
+            device_crate,
+        ))
+    })
+}
+
+fn interop_device_cargo_target_name(
+    manifest_path: &Path,
+    device_crate: &DeviceCrateConfig,
+) -> String {
+    device_crate
+        .bin
+        .clone()
+        .unwrap_or_else(|| package_name_from_manifest(manifest_path))
+}
+
+fn interop_device_artifact_path(
+    example_dir: &Path,
+    device_crate: &DeviceCrateConfig,
+    artifact_name: &str,
+) -> PathBuf {
+    example_dir.join(&device_crate.artifact_dir).join(format!(
+        "{}.{}",
+        artifact_stem(artifact_name),
+        device_crate.artifact_kind.extension()
+    ))
+}
+
+/// Pre-build requirement check for `artifact-kind = "cubin"` device crates.
+///
+/// A native cubin needs a deliberate target, so require one from `--arch`,
+/// `CUDA_OXIDE_TARGET`, project configuration, or the device detected by
+/// `run` before spending a device build. This is a requirement check only:
+/// the arch the finalizer actually compiles for comes from the
+/// backend-recorded `.target` sidecar (see
+/// [`read_interop_recorded_target`]), because the backend may resolve a
+/// different arch than the hint (e.g. escalate a detected `sm_120a` to the
+/// `sm_90a` WGMMA floor).
+fn interop_cubin_target(
+    arch: Option<&str>,
+    detected_device_arch: Option<&str>,
+) -> Result<cuda_artifact_finalizer::CudaArch, String> {
+    let target = arch
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CUDA_OXIDE_TARGET").ok())
+        .or_else(|| detected_device_arch.map(str::to_owned))
+        .ok_or_else(|| {
+            "cubin interop artifacts require --arch, CUDA_OXIDE_TARGET, a configured target, or a detected run device"
+                .to_string()
+        })?;
+    parse_nvvm_arch(&target)
+        .map_err(|error| format!("invalid cubin interop target {target:?}: {error}"))
+}
+
+/// Path of the NVVM IR a cubin-kind device crate emits into its artifact dir.
+fn interop_device_ir_path(
+    example_dir: &Path,
+    device_crate: &DeviceCrateConfig,
+    artifact_name: &str,
+) -> PathBuf {
+    example_dir
+        .join(&device_crate.artifact_dir)
+        .join(format!("{}.ll", artifact_stem(artifact_name)))
+}
+
+/// Read the CUDA target the backend recorded next to an emitted NVVM IR.
+///
+/// The backend publishes `<name>.target` last, after the `.ll` and
+/// `.options`: it is both the authoritative arch record (NVVM IR does not
+/// encode its target) and the completion marker saying the sibling
+/// `.options` file is present and required (see
+/// `write_nvvm_target_sidecar` in mir-importer). A missing or malformed
+/// sidecar therefore means the device build did not complete its artifact
+/// contract, never that some other arch should be guessed.
+fn read_interop_recorded_target(ir_path: &Path) -> Result<String, String> {
+    let path = ir_path.with_extension("target");
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "device build did not record its CUDA target at {} ({error}); \
+             the .target sidecar is the backend's completion marker, so the \
+             emitted NVVM IR cannot be trusted without it",
+            path.display()
+        )
+    })?;
+    let mut lines = text.lines();
+    let target = lines.next().unwrap_or_default().trim();
+    if target.is_empty() {
+        return Err(format!("recorded CUDA target {} is empty", path.display()));
+    }
+    match (lines.next(), lines.next()) {
+        (None, None) => Ok(target.to_string()),
+        (Some(marker), None) if marker == oxide_artifacts::COMPILE_OPTIONS_TARGET_MARKER => {
+            let options_path = ir_path.with_extension("options");
+            if !options_path.is_file() {
+                return Err(format!(
+                    "recorded CUDA target {} requires the sibling compile options {}, which is missing",
+                    path.display(),
+                    options_path.display()
+                ));
+            }
+            Ok(target.to_string())
+        }
+        _ => Err(format!(
+            "recorded CUDA target {} has an unrecognized format: {:?}",
+            path.display(),
+            text.trim()
+        )),
+    }
+}
+
+/// Read the `.target sm_XX` directive from an emitted PTX artifact.
+///
+/// PTX carries its own target record, so the identity sidecar can state the
+/// arch the artifact was actually compiled for instead of echoing a request
+/// hint (which the backend is allowed to override).
+fn ptx_recorded_target(ptx_path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(ptx_path).map_err(|error| {
+        format!(
+            "could not read emitted PTX at {}: {error}",
+            ptx_path.display()
+        )
+    })?;
+    text.lines()
+        .find_map(|line| {
+            let mut tokens = line.split_whitespace();
+            (tokens.next() == Some(".target"))
+                .then(|| tokens.next())
+                .flatten()
+        })
+        .map(|target| target.trim_end_matches(',').to_string())
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "emitted PTX {} does not declare a .target directive",
+                ptx_path.display()
+            )
+        })
+}
+
+/// The CUDA target an interop device artifact was actually built for, read
+/// from the emitted artifact itself: the backend `.target` sidecar for
+/// cubin (the same record the finalizer compiled with) and the `.target`
+/// directive for PTX.
+fn interop_artifact_recorded_target(
+    example_dir: &Path,
+    device_crate: &DeviceCrateConfig,
+    artifact_name: &str,
+) -> Result<String, String> {
+    match device_crate.artifact_kind {
+        InteropArtifactKind::Ptx => ptx_recorded_target(&interop_device_artifact_path(
+            example_dir,
+            device_crate,
+            artifact_name,
+        )),
+        InteropArtifactKind::Cubin => read_interop_recorded_target(&interop_device_ir_path(
+            example_dir,
+            device_crate,
+            artifact_name,
+        )),
+    }
+}
+
+fn finalize_interop_device_artifact(
+    example_dir: &Path,
+    device_crate: &DeviceCrateConfig,
+    artifact_name: &str,
+) -> PathBuf {
+    let artifact_path = interop_device_artifact_path(example_dir, device_crate, artifact_name);
+    match device_crate.artifact_kind {
+        InteropArtifactKind::Ptx => artifact_path,
+        InteropArtifactKind::Cubin => {
+            let ir_path = interop_device_ir_path(example_dir, device_crate, artifact_name);
+            // The backend-recorded target, not the CLI/env/detected hint:
+            // the backend may have resolved a different arch, and this
+            // sidecar doubles as the completion marker for the .ll/.options
+            // pair consumed below.
+            let recorded_target = read_interop_recorded_target(&ir_path).unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            });
+            let target = parse_nvvm_arch(&recorded_target).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: invalid recorded CUDA target {recorded_target:?} next to {}: {error}",
+                    ir_path.display()
+                );
+                std::process::exit(1);
+            });
+            let ir = std::fs::read(&ir_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: could not read emitted NVVM IR at {}: {error}",
+                    ir_path.display()
+                );
+                std::process::exit(1);
+            });
+            let options_path = ir_path.with_extension("options");
+            let options_text = std::fs::read_to_string(&options_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: could not read emitted compile options at {}: {error}",
+                    options_path.display()
+                );
+                std::process::exit(1);
+            });
+            let compile_options =
+                oxide_artifacts::ArtifactCompileOptions::from_sidecar_text(&options_text)
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "Error: invalid emitted compile options at {}: {error}",
+                            options_path.display()
+                        );
+                        std::process::exit(1);
+                    });
+            let finalizer = cuda_artifact_finalizer::Finalizer::discover().unwrap_or_else(|error| {
+                eprintln!("Error: could not initialize the CUDA artifact finalizer: {error}");
+                eprintln!(
+                    "libNVVM and nvJitLink ship with the CUDA Toolkit; run `cargo oxide doctor` to check discovery."
+                );
+                std::process::exit(1);
+            });
+            let options = finalization_options_from_artifact(&target, compile_options);
+            let cubin = finalizer
+                .materialize_nvvm_ir(artifact_name, &ir, &options)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "Error: could not finalize {} for {}: {error}",
+                        ir_path.display(),
+                        target.sm()
+                    );
+                    std::process::exit(1);
+                });
+            let temporary_path = artifact_path.with_extension("cubin.tmp");
+            std::fs::write(&temporary_path, cubin).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: could not write temporary cubin {}: {error}",
+                    temporary_path.display()
+                );
+                std::process::exit(1);
+            });
+            std::fs::rename(&temporary_path, &artifact_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "Error: could not install cubin {}: {error}",
+                    artifact_path.display()
+                );
+                std::process::exit(1);
+            });
+            artifact_path
+        }
     }
 }
 
@@ -561,7 +1813,9 @@ fn build_interop_device_crate(
     verbose: bool,
     arch: Option<&str>,
     detected_device_arch: Option<&str>,
+    device_features: Option<&str>,
     options: InteropDeviceBuildOptions,
+    materialization: &MaterializationMode,
 ) {
     let manifest_path = example_dir.join(&device_crate.manifest_path);
     let manifest_path = manifest_path.canonicalize().unwrap_or_else(|e| {
@@ -573,23 +1827,48 @@ fn build_interop_device_crate(
         std::process::exit(1);
     });
     let device_dir = manifest_path.parent().unwrap_or(example_dir);
-    let ptx_dir = example_dir.join(&device_crate.ptx_dir);
-    std::fs::create_dir_all(&ptx_dir).unwrap_or_else(|e| {
+    // One `cargo metadata` invocation answers both consumers: bin-target
+    // resolution before the build and the uplifted depfile location after
+    // it. Skip it entirely when neither feature is requested.
+    let cargo_metadata = (device_crate.bin.is_some() || device_crate.source_identity).then(|| {
+        interop_cargo_metadata(ctx, device_dir, &manifest_path).unwrap_or_else(|error| {
+            eprintln!("Error: could not query cargo metadata for the device crate: {error}");
+            std::process::exit(1);
+        })
+    });
+    let binary_target = device_crate.bin.as_deref().map(|bin| {
+        let metadata = cargo_metadata
+            .as_ref()
+            .expect("cargo metadata is fetched whenever a bin target is configured");
+        interop_binary_target_from_metadata(metadata, &manifest_path, bin).unwrap_or_else(|error| {
+            eprintln!("Error: could not resolve device binary target: {error}");
+            std::process::exit(1);
+        })
+    });
+    let artifact_dir = example_dir.join(&device_crate.artifact_dir);
+    std::fs::create_dir_all(&artifact_dir).unwrap_or_else(|e| {
         eprintln!(
             "Error: could not create device artifact directory {}: {}",
-            ptx_dir.display(),
+            artifact_dir.display(),
             e
         );
         std::process::exit(1);
     });
 
-    let package_name = package_name_from_manifest(&manifest_path);
-    let artifact_name = device_crate
-        .artifact_name
-        .clone()
-        .unwrap_or_else(|| normalize_crate_name(&package_name));
-    clean_generated_files(&ptx_dir, &artifact_name);
-    touch_main_rs(device_dir);
+    if device_crate.artifact_kind == InteropArtifactKind::Cubin
+        && let Err(error) = interop_cubin_target(arch, detected_device_arch)
+    {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    }
+
+    let artifact_name = interop_device_artifact_name(&manifest_path, device_crate);
+    clean_generated_files(&artifact_dir, &artifact_name);
+    if let Some(target) = &binary_target {
+        touch_source_file(&target.source_path);
+    } else {
+        touch_main_rs(device_dir);
+    }
 
     println!("Building device crate {}...", manifest_path.display());
 
@@ -597,30 +1876,47 @@ fn build_interop_device_crate(
     cmd.args(["build", "--release", "--manifest-path"])
         .arg(&manifest_path)
         .current_dir(device_dir);
+    if let Some(device_features) = device_features {
+        cmd.args(["--features", device_features]);
+    }
+    if let Some(bin) = &device_crate.bin {
+        cmd.args(["--bin", bin]);
+    }
 
     apply_interop_device_codegen_options(&mut cmd, ctx, verbose, options);
     // Metadata interop currently publishes PTX. Pin the supported backend so
     // an explicit `--target cuda` overrides an inherited MACA selection.
     apply_target_backend(&mut cmd, "cuda");
-    let fingerprinted_cfgs = options
-        .sanitizer_line_tables
-        .then(|| {
-            sanitize_codegen_fingerprint_cfg(
-                ctx,
-                verbose,
-                options.no_fmad,
-                arch,
-                detected_device_arch,
-                Some(&ptx_dir),
-            )
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-    apply_codegen_rustflags(&mut cmd, ctx, false, &fingerprinted_cfgs);
+    let fingerprint = interop_codegen_fingerprint(
+        ctx,
+        verbose,
+        options.no_fmad,
+        options.unchecked_indexing,
+        DeviceDebug::Off,
+        arch,
+        detected_device_arch,
+        &artifact_dir,
+        device_crate.artifact_kind.emits_nvvm_ir(),
+        device_features,
+        options.sanitizer_line_tables,
+        materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLike,
+        &[],
+        &fingerprint,
+    );
     // This is an internal artifact contract, so it must override a project
     // `[env]` default for the same variable.
-    cmd.env("CUDA_OXIDE_PTX_DIR", &ptx_dir);
-    apply_output_mode(&mut cmd, false, arch);
+    cmd.env("CUDA_OXIDE_PTX_DIR", &artifact_dir);
+    apply_output_mode(
+        &mut cmd,
+        device_crate.artifact_kind.emits_nvvm_ir(),
+        arch,
+        materialization,
+    );
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch);
 
     let status = cmd.status().expect("Failed to build interop device crate");
@@ -632,17 +1928,69 @@ fn build_interop_device_crate(
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let ptx_path = ptx_dir.join(format!("{}.ptx", artifact_stem(&artifact_name)));
-    if !ptx_path.exists() {
+    let artifact_path = finalize_interop_device_artifact(example_dir, device_crate, &artifact_name);
+    if !artifact_path.exists() {
         eprintln!(
             "Error: device crate build succeeded but did not produce {}",
-            ptx_path.display()
+            artifact_path.display()
         );
         std::process::exit(1);
     }
-    println!("PTX written: {}", ptx_path.display());
+    println!(
+        "{} written: {}",
+        device_crate.artifact_kind.extension().to_ascii_uppercase(),
+        artifact_path.display()
+    );
+    if device_crate.source_identity {
+        // The identity records the arch the artifact was actually built
+        // for, read back from the emitted artifact, never the request hint.
+        let artifact_target =
+            interop_artifact_recorded_target(example_dir, device_crate, &artifact_name)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "Error: could not determine the built CUDA target for {}: {error}",
+                        artifact_path.display()
+                    );
+                    std::process::exit(1);
+                });
+        let cargo_target_name = interop_device_cargo_target_name(&manifest_path, device_crate);
+        let metadata = cargo_metadata
+            .as_ref()
+            .expect("cargo metadata is fetched whenever source-identity is configured");
+        let cargo_target_dir = cargo_target_directory(metadata).unwrap_or_else(|error| {
+            eprintln!("Error: could not locate the device cargo target directory: {error}");
+            std::process::exit(1);
+        });
+        let depfile_path = release_depfile_path(&cargo_target_dir, &cargo_target_name);
+        if !depfile_path.is_file() {
+            eprintln!(
+                "Error: device crate build succeeded but did not produce dependency file {}",
+                depfile_path.display()
+            );
+            std::process::exit(1);
+        }
+        let identity_base = artifact_path.parent().unwrap_or(example_dir);
+        let identity_path = crate::artifact_identity::write(
+            &artifact_path,
+            &depfile_path,
+            &manifest_path,
+            identity_base,
+            &cargo_target_dir,
+            &artifact_target,
+            device_features,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "Error: could not write source identity for {}: {error}",
+                artifact_path.display()
+            );
+            std::process::exit(1);
+        });
+        println!("Artifact identity written: {}", identity_path.display());
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_host_cargo(
     ctx: &Context,
     example: &str,
@@ -651,6 +1999,7 @@ fn run_host_cargo(
     features: Option<&str>,
     bin: Option<&str>,
     verbose: bool,
+    app_args: &[String],
 ) {
     let mut cmd = Command::new("cargo");
     cmd.arg(cargo_subcommand)
@@ -664,6 +2013,9 @@ fn run_host_cargo(
     }
     if let Some(features) = features {
         cmd.args(["--features", features]);
+    }
+    if cargo_subcommand == "run" && !app_args.is_empty() {
+        cmd.arg("--").args(app_args);
     }
 
     apply_config_env(&mut cmd, ctx);
@@ -705,6 +2057,9 @@ fn codegen_build_host_binary(
     features: Option<&str>,
     bin: Option<&str>,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    materialization: &MaterializationMode,
 ) -> PathBuf {
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(example_dir);
@@ -716,12 +2071,34 @@ fn codegen_build_host_binary(
         cmd.args(["--features", features]);
     }
 
-    apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
-    apply_default_sanitizer_line_tables(&mut cmd, ctx);
-    let fingerprint =
-        sanitize_codegen_fingerprint_cfg(ctx, verbose, no_fmad, arch, detected_device_arch, None);
-    apply_codegen_rustflags(&mut cmd, ctx, false, &[fingerprint]);
-    apply_output_mode(&mut cmd, false, arch);
+    apply_common_codegen_env(
+        &mut cmd,
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+    );
+    apply_default_sanitizer_line_tables(&mut cmd, ctx, device_debug);
+    let fingerprint = sanitize_codegen_fingerprint(
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        arch,
+        detected_device_arch,
+        None,
+        materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLike,
+        &[],
+        &fingerprint,
+    );
+    apply_output_mode(&mut cmd, false, arch, materialization);
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch);
 
     if let Some(bin) = bin {
@@ -1181,6 +2558,16 @@ fn sanitizer_option_is_no(args: &[String], name: &str) -> bool {
     })
 }
 
+/// Fallback locations probed for `compute-sanitizer` when it is neither on
+/// PATH nor under the configured CUDA toolkit root. Shared by `sanitize`
+/// (`run_compute_sanitizer`) and `doctor` so both use the same discovery
+/// order by construction.
+const COMPUTE_SANITIZER_FALLBACK_PATHS: &[&str] = &[
+    "/usr/local/cuda/bin/compute-sanitizer",
+    "/opt/cuda/bin/compute-sanitizer",
+    "/usr/bin/compute-sanitizer",
+];
+
 fn run_compute_sanitizer(
     ctx: &Context,
     example_dir: &Path,
@@ -1192,11 +2579,7 @@ fn run_compute_sanitizer(
     let compute_sanitizer = find_cuda_toolkit_executable(
         ctx,
         "compute-sanitizer",
-        &[
-            "/usr/local/cuda/bin/compute-sanitizer",
-            "/opt/cuda/bin/compute-sanitizer",
-            "/usr/bin/compute-sanitizer",
-        ],
+        COMPUTE_SANITIZER_FALLBACK_PATHS,
     )
     .unwrap_or_else(|| {
         eprintln!("Error: compute-sanitizer not found.");
@@ -1267,6 +2650,7 @@ fn run_compute_sanitizer(
 /// Same as [`codegen_run`] but uses `cargo build --release` instead of
 /// `cargo run`. Useful for cross-compilation or when the target hardware
 /// (e.g., Blackwell tensor cores) isn't available on the build machine.
+#[allow(clippy::too_many_arguments)]
 pub fn codegen_build(
     ctx: &Context,
     example: &str,
@@ -1274,11 +2658,16 @@ pub fn codegen_build(
     emit_nvvm_ir: bool,
     arch: Option<&str>,
     features: Option<&str>,
+    device_features: Option<&str>,
     no_fmad: bool,
     target_backend: Option<&str>,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    materialize_cubin: bool,
 ) {
     let target_arch = configured_arch(ctx, arch);
     let target_backend = configured_target_backend_or_exit(ctx, target_backend);
+    let materialization = prepare_materialization(ctx, materialize_cubin, arch, emit_nvvm_ir);
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
@@ -1298,9 +2687,16 @@ pub fn codegen_build(
             emit_nvvm_ir,
             target_arch,
             features,
+            device_features,
             no_fmad,
+            unchecked_indexing,
+            &materialization,
         );
         return;
+    }
+    if device_features.is_some() {
+        eprintln!("Error: --device-features requires metadata-declared interop device crates.");
+        std::process::exit(2);
     }
 
     clean_generated_files(&example_dir, example);
@@ -1319,14 +2715,41 @@ pub fn codegen_build(
         cmd.args(["--features", features]);
     }
 
-    apply_common_codegen_env(&mut cmd, ctx, verbose, no_fmad);
+    apply_common_codegen_env(
+        &mut cmd,
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+    );
+    // Device crates (cuda-device) gate hardware-dependent constants such as
+    // WAVE_SIZE on this cfg; it must appear on every MACA device build.
     let target_cfgs = if target_backend == "maca" {
         vec!["cuda_oxide_target_maca".to_string()]
     } else {
         Vec::new()
     };
-    apply_codegen_rustflags(&mut cmd, ctx, false, &target_cfgs);
-    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
+    let fingerprint = standard_codegen_fingerprint(
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        emit_nvvm_ir,
+        target_arch,
+        None,
+        &target_backend,
+        &materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLike,
+        &target_cfgs,
+        &fingerprint,
+    );
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch, &materialization);
     apply_target_backend(&mut cmd, &target_backend);
 
     println!("Building {}...", example);
@@ -1336,6 +2759,82 @@ pub fn codegen_build(
     if !status.success() {
         eprintln!("\nBuild failed with exit code: {:?}", status.code());
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+// =============================================================================
+// Inspect command
+// =============================================================================
+
+/// Build an example as PTX and print the generated artifact.
+#[allow(clippy::too_many_arguments)]
+pub fn codegen_inspect_ptx(
+    ctx: &Context,
+    example: &str,
+    arch: Option<&str>,
+    features: Option<&str>,
+    verbose: bool,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+) {
+    let materialization_enabled = materialization_requested(ctx, false).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    });
+
+    if materialization_enabled {
+        eprintln!("Error: inspect requires PTX output, but {MATERIALIZE_ENV} is enabled");
+        std::process::exit(2);
+    }
+
+    let nvvm_ir_enabled = nvvm_ir_requested(ctx).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    });
+
+    if nvvm_ir_enabled {
+        eprintln!("Error: inspect requires PTX output, but CUDA_OXIDE_EMIT_NVVM_IR is enabled");
+        std::process::exit(2);
+    }
+
+    let example_dir = if ctx.is_workspace {
+        resolve_example_dir(ctx, example)
+    } else {
+        ctx.workspace_root.clone()
+    };
+    if load_interop_config(&example_dir).is_some_and(|interop| {
+        interop
+            .device_crates
+            .iter()
+            .any(|device_crate| device_crate.artifact_kind != InteropArtifactKind::Ptx)
+    }) {
+        eprintln!(
+            "Error: inspect requires PTX output, but metadata declares a non-PTX device artifact."
+        );
+        std::process::exit(2);
+    }
+
+    codegen_build(
+        ctx,
+        example,
+        verbose,
+        false,
+        arch,
+        features,
+        None,
+        no_fmad,
+        None,
+        unchecked_indexing,
+        device_debug,
+        false,
+    );
+
+    for path in ptx_artifact_paths(&example_dir, example) {
+        print_ptx_artifact(&path).unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
     }
 }
 
@@ -1356,6 +2855,7 @@ pub fn codegen_build(
 /// `arch` is required because LTOIR is architecture-specific. It accepts
 /// `sm_XX`, `compute_XX`, or a bare `XX`, all mapped to libNVVM's
 /// `-arch=compute_XX`.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_ltoir(
     ctx: &Context,
     example: &str,
@@ -1364,6 +2864,8 @@ pub fn emit_ltoir(
     output: Option<&Path>,
     verbose: bool,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -1396,12 +2898,16 @@ pub fn emit_ltoir(
         true,
         Some(&sm_arch),
         features,
+        None,
         no_fmad,
         Some("cuda"), // LTOIR is NVVM-only; override inherited/project MACA selection
+        unchecked_indexing,
+        device_debug,
+        false,
     );
 
     // Step 2: compile that NVVM IR to LTOIR via libNVVM -gen-lto.
-    let ll_path = example_dir.join(format!("{example}.ll"));
+    let ll_path = emitted_ll_path(&example_dir, example);
     let ir = std::fs::read(&ll_path).unwrap_or_else(|e| {
         eprintln!(
             "Error: could not read emitted NVVM IR at {}: {e}",
@@ -1429,17 +2935,12 @@ pub fn emit_ltoir(
     });
 
     let compute_arch = parsed_arch.compute();
-    let ltoir = compile_nvvm_to_ltoir(
-        &ir,
-        example,
-        &parsed_arch,
-        compile_options.fma_contraction_enabled(),
-    );
+    let ltoir = compile_nvvm_to_ltoir(&ir, example, &parsed_arch, compile_options);
 
     // Step 3: write the artifact.
     let out_path = output
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| example_dir.join(format!("{example}.ltoir")));
+        .unwrap_or_else(|| default_ltoir_path(&example_dir, example));
     for metadata_path in [
         out_path.with_extension("target"),
         out_path.with_extension("options"),
@@ -1499,7 +3000,9 @@ pub fn emit_ltoir(
 ///
 /// Accepts `sm_XX` (the form `--arch` and the rest of cargo-oxide use),
 /// `compute_XX` (passed through), or a bare `XX`.
-fn parse_nvvm_arch(arch: &str) -> Result<libnvvm_sys::CudaArch, libnvvm_sys::CudaArchParseError> {
+fn parse_nvvm_arch(
+    arch: &str,
+) -> Result<cuda_artifact_finalizer::CudaArch, cuda_artifact_finalizer::CudaArchParseError> {
     let normalized = if arch.starts_with("sm_") || arch.starts_with("compute_") {
         arch.to_string()
     } else {
@@ -1514,98 +3017,85 @@ fn parse_nvvm_arch(arch: &str) -> Result<libnvvm_sys::CudaArch, libnvvm_sys::Cud
 fn compile_nvvm_to_ltoir(
     ir: &[u8],
     name: &str,
-    arch: &libnvvm_sys::CudaArch,
-    allow_fma_contraction: bool,
+    arch: &cuda_artifact_finalizer::CudaArch,
+    compile_options: oxide_artifacts::ArtifactCompileOptions,
 ) -> Vec<u8> {
-    let nvvm = libnvvm_sys::LibNvvm::load().unwrap_or_else(|e| {
-        eprintln!("Error: could not load libNVVM: {e}");
+    let compiler = cuda_artifact_finalizer::NvvmCompiler::discover().unwrap_or_else(|e| {
+        eprintln!("Error: could not initialize the CUDA artifact compiler: {e}");
         eprintln!("libNVVM ships with the CUDA Toolkit at <CUDA>/nvvm/lib64/libnvvm.so.");
         eprintln!("Run `cargo oxide doctor` to check your toolkit setup.");
         std::process::exit(1);
     });
-    let ir_version = nvvm.ir_version().unwrap_or_else(|e| {
-        eprintln!("Error: could not query libNVVM's accepted IR version: {e}");
-        std::process::exit(1);
-    });
-    if (ir_version.ir_major, ir_version.ir_minor) != (2, 0) {
-        eprintln!(
-            "Error: installed libNVVM accepts NVVM IR {}.{}, but cuda-oxide emits NVVM IR 2.0",
-            ir_version.ir_major, ir_version.ir_minor
-        );
-        std::process::exit(1);
-    }
-    if let Some(llvm_major) = nvvm.llvm_version(arch).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not query libNVVM's LLVM dialect for {}: {e}",
-            arch.compute()
-        );
-        std::process::exit(1);
-    }) {
-        let mismatch = if arch.uses_legacy_llvm() {
-            llvm_major != 7
-        } else {
-            llvm_major == 7
-        };
-        if mismatch {
-            let expected = if arch.uses_legacy_llvm() {
-                "legacy LLVM 7 typed-pointer"
-            } else {
-                "modern opaque-pointer"
-            };
-            eprintln!(
-                "Error: libNVVM reports LLVM {llvm_major} for {}, but cuda-oxide selected the {expected} dialect",
-                arch.compute()
-            );
-            std::process::exit(1);
-        }
-    }
-    let mut program = libnvvm_sys::Program::new(&nvvm).unwrap_or_else(|e| {
-        eprintln!("Error: nvvmCreateProgram failed: {e}");
-        std::process::exit(1);
-    });
-
-    // Add libdevice before the kernel module so any __nv_* math calls (exp,
-    // sin, cos, etc.) are resolved at LTOIR compile time, matching the pattern
-    // used by NVCC and cuda-host's own LTOIR path.
-    let libdevice_path = libnvvm_sys::find_libdevice().unwrap_or_else(|e| {
-        eprintln!("Error: could not locate libdevice.10.bc: {e}");
-        eprintln!("Set CUDA_OXIDE_LIBDEVICE, CUDA_TOOLKIT_PATH, or CUDA_HOME.");
-        std::process::exit(1);
-    });
-    let libdevice_bytes = std::fs::read(&libdevice_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not read libdevice at {}: {e}",
-            libdevice_path.display()
-        );
-        std::process::exit(1);
-    });
-    program
-        .add_module(&libdevice_bytes, "libdevice.10.bc")
-        .unwrap_or_else(|e| {
-            eprintln!("Error: libNVVM rejected libdevice module: {e}");
-            std::process::exit(1);
-        });
-
-    program.add_module(ir, name).unwrap_or_else(|e| {
-        eprintln!("Error: libNVVM rejected the NVVM IR module: {e}");
-        std::process::exit(1);
-    });
-    let arch_opt = format!("-arch={}", arch.compute());
-    program.verify(&[&arch_opt]).unwrap_or_else(|e| {
-        eprintln!("Error: libNVVM verification failed: {e}");
-        std::process::exit(1);
-    });
-    let fma_opt = if allow_fma_contraction {
-        "-fma=1"
-    } else {
-        "-fma=0"
-    };
-    program
-        .compile(&[&arch_opt, "-gen-lto", fma_opt])
+    let options = finalization_options_from_artifact(arch, compile_options);
+    compiler
+        .compile_nvvm_ir_to_ltoir(name, ir, &options)
         .unwrap_or_else(|e| {
             eprintln!("Error: libNVVM -gen-lto compilation failed: {e}");
             std::process::exit(1);
         })
+}
+
+fn finalization_options_from_artifact(
+    arch: &cuda_artifact_finalizer::CudaArch,
+    compile_options: oxide_artifacts::ArtifactCompileOptions,
+) -> cuda_artifact_finalizer::FinalizationOptions {
+    let debug = match compile_options.debug_policy() {
+        oxide_artifacts::ArtifactDebugPolicy::None => cuda_artifact_finalizer::DebugPolicy::None,
+        oxide_artifacts::ArtifactDebugPolicy::LineTables => {
+            cuda_artifact_finalizer::DebugPolicy::LineTables
+        }
+        oxide_artifacts::ArtifactDebugPolicy::Full => cuda_artifact_finalizer::DebugPolicy::Full,
+    };
+    cuda_artifact_finalizer::FinalizationOptions::new(arch.clone())
+        .with_fma_contraction(compile_options.fma_contraction_enabled())
+        .with_debug_policy(debug)
+}
+
+/// Device debug-information policy requested on the command line.
+///
+/// Mirrors nvcc: `--lineinfo` is `-lineinfo` (line tables, optimization intact)
+/// and `--device-debug` is `-G` (full debug, libNVVM optimization disabled).
+/// The two are ordered, not exclusive: asking for both yields [`Self::Full`],
+/// because full debug already carries line tables.
+///
+/// This is the CLI surface for a policy that already exists end to end --
+/// `CUDA_OXIDE_DEBUG`, `ArtifactCompileOptions`'s debug bits, and
+/// `FinalizationOptions::with_debug_policy` all predate it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceDebug {
+    /// Request no device debug information (the default).
+    #[default]
+    Off,
+    /// Preserve source line mappings without disabling optimization.
+    LineTables,
+    /// Emit full debug information; MIR optimization is disabled and libNVVM finalization runs unoptimized.
+    Full,
+}
+
+impl DeviceDebug {
+    /// Resolve the two independent CLI booleans into one ordered policy.
+    #[must_use]
+    pub fn from_flags(lineinfo: bool, device_debug: bool) -> Self {
+        match (device_debug, lineinfo) {
+            (true, _) => Self::Full,
+            (false, true) => Self::LineTables,
+            (false, false) => Self::Off,
+        }
+    }
+
+    /// Value for `CUDA_OXIDE_DEBUG`, or `None` when nothing must be exported.
+    ///
+    /// `Off` deliberately returns `None` rather than `"off"`: exporting `off`
+    /// would override a debug level the surrounding environment had already
+    /// asked for, turning an absent flag into an active opt-out.
+    #[must_use]
+    pub fn env_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::LineTables => Some("line"),
+            Self::Full => Some("full"),
+        }
+    }
 }
 
 /// Options for `cargo oxide build -- ...` / `cargo oxide test -- ...`.
@@ -1620,6 +3110,36 @@ pub struct CargoPassthroughOptions<'a> {
     pub device_cfgs: &'a [String],
     pub no_fmad: bool,
     pub target_backend: Option<&'a str>,
+    pub unchecked_indexing: bool,
+    pub materialize_cubin: bool,
+    pub device_debug: DeviceDebug,
+}
+
+/// Cargo operations supported by the passthrough path.
+///
+/// The subcommand determines who owns profile-related rustc flags: regular
+/// builds retain cuda-oxide's release-like defaults, while tests leave the
+/// selected Cargo profile intact (including `--release` and `--profile`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CargoPassthroughSubcommand {
+    Build,
+    Test,
+}
+
+impl CargoPassthroughSubcommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Test => "test",
+        }
+    }
+
+    fn codegen_profile(self) -> CodegenProfilePolicy {
+        match self {
+            Self::Build => CodegenProfilePolicy::ReleaseLike,
+            Self::Test => CodegenProfilePolicy::CargoSelected,
+        }
+    }
 }
 
 fn normalize_device_codegen_crates(raw: &str) -> Result<String, String> {
@@ -1659,11 +3179,11 @@ fn configured_device_codegen_crates(
     ctx: &Context,
     explicit: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let inherited = std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok();
+    let inherited = std::env::var(DEVICE_CODEGEN_CRATE_ENV).ok();
     resolve_device_codegen_crates(
         explicit,
         inherited.as_deref(),
-        project_config_env(ctx, "CUDA_OXIDE_DEVICE_CODEGEN_CRATE"),
+        project_config_env(ctx, DEVICE_CODEGEN_CRATE_ENV),
     )
 }
 
@@ -1714,27 +3234,36 @@ fn resolve_device_codegen_crates(
         .transpose()
 }
 
+/// The ambient environment, in the shape the fingerprint helpers consume.
+///
+/// Split out so both fingerprint wrappers share one collection, and so their
+/// `_with_env` counterparts stay the only entry points a unit test needs.
+fn inherited_process_env() -> BTreeMap<String, Vec<u8>> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| {
+            key.into_string()
+                .ok()
+                .map(|key| (key, value.as_encoded_bytes().to_vec()))
+        })
+        .collect()
+}
+
 fn passthrough_codegen_fingerprint(
     ctx: &Context,
     opts: &CargoPassthroughOptions<'_>,
     owner_filter: Option<&str>,
     target_arch: Option<&str>,
     target_backend: &str,
+    materialization: &MaterializationMode,
 ) -> String {
-    let inherited_env: BTreeMap<String, Option<String>> = std::env::vars_os()
-        .filter_map(|(key, value)| {
-            key.into_string()
-                .ok()
-                .map(|key| (key, value.into_string().ok()))
-        })
-        .collect();
     passthrough_codegen_fingerprint_with_env(
         ctx,
         opts,
         owner_filter,
         target_arch,
         target_backend,
-        &inherited_env,
+        materialization,
+        &inherited_process_env(),
     )
 }
 
@@ -1744,13 +3273,10 @@ fn passthrough_codegen_fingerprint_with_env(
     owner_filter: Option<&str>,
     target_arch: Option<&str>,
     target_backend: &str,
-    inherited_env: &BTreeMap<String, Option<String>>,
+    materialization: &MaterializationMode,
+    inherited_env: &BTreeMap<String, Vec<u8>>,
 ) -> String {
     let mut effective_env = BTreeMap::new();
-    effective_env.insert(
-        "__CUDA_OXIDE_BACKEND_ARTIFACT".to_string(),
-        backend_artifact_identity(&ctx.backend_so),
-    );
 
     let affects_codegen = |key: &str| {
         key.starts_with("CUDA_OXIDE_") || (target_backend == "maca" && key == "MACA_PATH")
@@ -1763,98 +3289,156 @@ fn passthrough_codegen_fingerprint_with_env(
         if !affects_codegen(key) {
             continue;
         }
-        match inherited_env.get(key) {
-            Some(Some(value)) => {
-                effective_env.insert(key.clone(), value.clone());
-            }
-            // `apply_config_env` sees the non-Unicode parent value through
-            // var_os and does not replace it; backend readers using `var`
-            // ignore it, so there is no effective Unicode value to hash.
-            Some(None) => {}
-            None => {
-                effective_env.insert(key.clone(), configured_value.clone());
-            }
+        if let Some(value) = inherited_env.get(key) {
+            // Keep the platform encoding. Presence-only backend switches such
+            // as CUDA_OXIDE_NO_FMA remain effective even when their value is
+            // not Unicode, so dropping those bytes could reuse stale code.
+            effective_env.insert(key.clone(), value.clone());
+        } else {
+            effective_env.insert(key.clone(), configured_value.as_bytes().to_vec());
         }
     }
     // Capture backend settings inherited outside project config, including
     // current and future CUDA_OXIDE_* switches plus the MACA SDK root.
     for (key, value) in inherited_env
         .iter()
-        .filter(|(key, value)| affects_codegen(key) && value.is_some())
+        .filter(|(key, _)| affects_codegen(key) && key.as_str() != CODEGEN_FINGERPRINT_ENV)
     {
-        effective_env.insert(
-            key.clone(),
-            value
-                .as_ref()
-                .expect("filtered to Unicode environment values")
-                .clone(),
-        );
+        effective_env.insert(key.clone(), value.clone());
     }
 
+    // These are wrapper-owned semantic values. Normalize away inherited
+    // false/stale handshakes before inserting the effective materialization
+    // state below, so no-op values do not create distinct Cargo identities.
+    effective_env.remove(CODEGEN_FINGERPRINT_ENV);
+    effective_env.remove(MATERIALIZE_ENV);
+    effective_env.remove(EXPECTED_PROVENANCE_ENV);
+
     if opts.verbose {
-        effective_env.insert("CUDA_OXIDE_VERBOSE".to_string(), "1".to_string());
+        effective_env.insert("CUDA_OXIDE_VERBOSE".to_string(), b"1".to_vec());
     }
     if opts.no_fmad {
-        effective_env.insert("CUDA_OXIDE_NO_FMA".to_string(), "1".to_string());
+        effective_env.insert("CUDA_OXIDE_NO_FMA".to_string(), b"1".to_vec());
     }
-    if opts.emit_nvvm_ir {
-        effective_env.insert("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), "1".to_string());
+    if opts.unchecked_indexing {
+        effective_env.insert("CUDA_OXIDE_UNCHECKED_INDEXING".to_string(), b"1".to_vec());
+    }
+    if let Some(level) = opts.device_debug.env_value() {
+        effective_env.insert("CUDA_OXIDE_DEBUG".to_string(), level.as_bytes().to_vec());
+    }
+    if opts.emit_nvvm_ir || materialization.enabled() {
+        effective_env.insert("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), b"1".to_vec());
+    }
+    if let Some(provenance) = &materialization.provenance {
+        effective_env.insert(MATERIALIZE_ENV.to_string(), b"1".to_vec());
+        effective_env.insert(
+            EXPECTED_PROVENANCE_ENV.to_string(),
+            provenance.as_bytes().to_vec(),
+        );
     }
     if let Some(target_arch) = target_arch {
-        effective_env.insert("CUDA_OXIDE_TARGET".to_string(), target_arch.to_string());
+        effective_env.insert(
+            "CUDA_OXIDE_TARGET".to_string(),
+            target_arch.as_bytes().to_vec(),
+        );
     }
-    effective_env.insert(TARGET_BACKEND_ENV.to_string(), target_backend.to_string());
+    effective_env.insert(
+        TARGET_BACKEND_ENV.to_string(),
+        target_backend.as_bytes().to_vec(),
+    );
     if target_backend == "maca" {
         let mxcc = effective_env
             .get("CUDA_OXIDE_MXCC")
-            .map(PathBuf::from)
+            .map(|bytes| PathBuf::from(String::from_utf8_lossy(bytes).into_owned()))
             .or_else(|| {
-                effective_env
-                    .get("MACA_PATH")
-                    .map(|path| PathBuf::from(path).join("mxgpu_llvm/bin/mxcc"))
+                effective_env.get("MACA_PATH").map(|bytes| {
+                    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+                        .join("mxgpu_llvm/bin/mxcc")
+                })
             });
         if let Some(mxcc) = mxcc {
             effective_env.insert(
                 "__CUDA_OXIDE_MXCC_ARTIFACT".to_string(),
-                backend_artifact_identity(&mxcc),
+                backend_artifact_digest(&mxcc)
+                    .unwrap_or_else(|error| format!("unavailable:{error}"))
+                    .into_bytes(),
             );
         }
     }
     if let Some(owner_filter) = owner_filter {
         effective_env.insert(
-            "CUDA_OXIDE_DEVICE_CODEGEN_CRATE".to_string(),
-            owner_filter.to_string(),
+            DEVICE_CODEGEN_CRATE_ENV.to_string(),
+            owner_filter.as_bytes().to_vec(),
         );
     }
 
-    // Stable FNV-1a over length-delimited key/value pairs. The cfg carries
-    // only the digest, so backend settings are not included verbatim in rustc
-    // command lines or diagnostics.
-    let mut hash = 0xcbf29ce484222325_u64;
+    // SHA-256 over length-delimited key/value pairs. The complete digest is
+    // tracked by device-owning procedural macros, so settings are neither
+    // exposed verbatim in diagnostics nor reduced to a small collision space.
+    let mut hash = sha2::Sha256::new();
     for (key, value) in effective_env {
         update_codegen_fingerprint_hash(&mut hash, key.as_bytes());
-        update_codegen_fingerprint_hash(&mut hash, value.as_bytes());
+        update_codegen_fingerprint_hash(&mut hash, &value);
     }
-    format!("{hash:016x}")
+    finish_codegen_fingerprint(hash)
 }
 
-fn update_codegen_fingerprint_hash(hash: &mut u64, bytes: &[u8]) {
-    for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
+fn update_codegen_fingerprint_hash(hash: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest as _;
+
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
 }
 
-/// Put sanitizer-only output settings into an otherwise-unused cfg so Cargo
-/// recompiles every selected Rust target, including `src/bin/*` and virtual
-/// workspace members. Cargo does not fingerprint arbitrary backend env vars.
-fn sanitize_codegen_fingerprint_cfg(
+fn finish_codegen_fingerprint(hash: sha2::Sha256) -> String {
+    use sha2::Digest as _;
+
+    let digest: [u8; 32] = hash.finalize().into();
+    digest_hex(&digest)
+}
+
+/// Track sanitizer-only device output settings in crates that declare device
+/// code, without invalidating their host-only dependency graph.
+#[allow(clippy::too_many_arguments)]
+fn sanitize_codegen_fingerprint(
     ctx: &Context,
     verbose: bool,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
     target_arch: Option<&str>,
     detected_device_arch: Option<&str>,
     ptx_dir: Option<&Path>,
+    materialization: &MaterializationMode,
+) -> String {
+    sanitize_codegen_fingerprint_with_env(
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        target_arch,
+        detected_device_arch,
+        ptx_dir,
+        materialization,
+        &inherited_process_env(),
+    )
+}
+
+/// `sanitize_codegen_fingerprint` with the inherited environment injected, the
+/// counterpart to `passthrough_codegen_fingerprint_with_env`.
+#[allow(clippy::too_many_arguments)]
+fn sanitize_codegen_fingerprint_with_env(
+    ctx: &Context,
+    verbose: bool,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    target_arch: Option<&str>,
+    detected_device_arch: Option<&str>,
+    ptx_dir: Option<&Path>,
+    materialization: &MaterializationMode,
+    inherited_env: &BTreeMap<String, Vec<u8>>,
 ) -> String {
     let opts = CargoPassthroughOptions {
         verbose,
@@ -1865,11 +3449,22 @@ fn sanitize_codegen_fingerprint_cfg(
         device_codegen_crate: None,
         device_cfgs: &[],
         no_fmad,
+        unchecked_indexing,
+        materialize_cubin: materialization.enabled(),
+        device_debug,
         target_backend: None,
     };
     let target_backend = configured_target_backend_or_exit(ctx, None);
-    let base = passthrough_codegen_fingerprint(ctx, &opts, None, target_arch, &target_backend);
-    let mut hash = 0xcbf29ce484222325_u64;
+    let base = passthrough_codegen_fingerprint_with_env(
+        ctx,
+        &opts,
+        None,
+        target_arch,
+        &target_backend,
+        materialization,
+        inherited_env,
+    );
+    let mut hash = sha2::Sha256::new();
     for bytes in [
         "sanitize-line-tables-v1".as_bytes(),
         base.as_bytes(),
@@ -1880,53 +3475,230 @@ fn sanitize_codegen_fingerprint_cfg(
     if let Some(ptx_dir) = ptx_dir {
         update_codegen_fingerprint_hash(&mut hash, ptx_dir.as_os_str().as_encoded_bytes());
     }
-    format!("cuda_oxide_internal_codegen_env=\"{hash:016x}\"")
+    finish_codegen_fingerprint(hash)
 }
 
-fn backend_artifact_identity(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let path = canonical.to_string_lossy();
-    let Ok(metadata) = std::fs::metadata(&canonical) else {
-        return format!("{path}|missing");
+#[allow(clippy::too_many_arguments)]
+fn standard_codegen_fingerprint(
+    ctx: &Context,
+    verbose: bool,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    emit_nvvm_ir: bool,
+    target_arch: Option<&str>,
+    detected_device_arch: Option<&str>,
+    target_backend: &str,
+    materialization: &MaterializationMode,
+) -> String {
+    let opts = CargoPassthroughOptions {
+        verbose,
+        emit_nvvm_ir,
+        arch: target_arch,
+        features: None,
+        cargo_target_dir: None,
+        device_codegen_crate: None,
+        device_cfgs: &[],
+        no_fmad,
+        target_backend: None,
+        unchecked_indexing,
+        materialize_cubin: materialization.enabled(),
+        device_debug,
     };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{path}|{}|{modified}", metadata.len())
+    let base = passthrough_codegen_fingerprint(
+        ctx,
+        &opts,
+        None,
+        target_arch,
+        target_backend,
+        materialization,
+    );
+    let mut hash = sha2::Sha256::new();
+    for bytes in [
+        "standard-codegen-v1".as_bytes(),
+        base.as_bytes(),
+        detected_device_arch.unwrap_or("").as_bytes(),
+    ] {
+        update_codegen_fingerprint_hash(&mut hash, bytes);
+    }
+    finish_codegen_fingerprint(hash)
+}
+
+fn pipeline_codegen_fingerprint(
+    ctx: &Context,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    emit_nvvm_ir: bool,
+    target_arch: Option<&str>,
+    materialization: &MaterializationMode,
+) -> String {
+    let target_backend = configured_target_backend_or_exit(ctx, None);
+    let base = standard_codegen_fingerprint(
+        ctx,
+        true,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        emit_nvvm_ir,
+        target_arch,
+        None,
+        &target_backend,
+        materialization,
+    );
+    let mut hash = sha2::Sha256::new();
+    for value in [
+        base.as_str(),
+        "CUDA_OXIDE_SHOW_RUSTC_MIR=1",
+        "CUDA_OXIDE_DUMP_MIR=1",
+        "CUDA_OXIDE_DUMP_LLVM=1",
+    ] {
+        update_codegen_fingerprint_hash(&mut hash, value.as_bytes());
+    }
+    finish_codegen_fingerprint(hash)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interop_codegen_fingerprint(
+    ctx: &Context,
+    verbose: bool,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    target_arch: Option<&str>,
+    detected_device_arch: Option<&str>,
+    artifact_dir: &Path,
+    emit_nvvm_ir: bool,
+    device_features: Option<&str>,
+    sanitizer_line_tables: bool,
+    materialization: &MaterializationMode,
+) -> String {
+    let target_backend = configured_target_backend_or_exit(ctx, None);
+    let base = standard_codegen_fingerprint(
+        ctx,
+        verbose,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        emit_nvvm_ir,
+        target_arch,
+        detected_device_arch,
+        &target_backend,
+        materialization,
+    );
+    let mut hash = sha2::Sha256::new();
+    for bytes in [
+        "interop-codegen-v1".as_bytes(),
+        base.as_bytes(),
+        if sanitizer_line_tables {
+            b"line-tables"
+        } else {
+            b"default-debug"
+        },
+        artifact_dir.as_os_str().as_encoded_bytes(),
+        device_features.unwrap_or("").as_bytes(),
+    ] {
+        update_codegen_fingerprint_hash(&mut hash, bytes);
+    }
+    finish_codegen_fingerprint(hash)
+}
+
+fn backend_artifact_digest(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut hasher = Sha256::new();
+    if path == Path::new("llvm") {
+        hasher.update(b"rustc built-in LLVM backend");
+        let digest: [u8; 32] = hasher.finalize().into();
+        return Ok(digest_hex(&digest));
+    }
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve backend {}: {error}", path.display()))?;
+    let mut file = std::fs::File::open(&canonical).map_err(|error| {
+        format!(
+            "could not open backend {} for fingerprinting: {error}",
+            canonical.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut chunk).map_err(|error| {
+            format!(
+                "could not read backend {} for fingerprinting: {error}",
+                canonical.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(digest_hex(&digest))
 }
 
 fn cargo_passthrough_command(
     ctx: &Context,
-    cargo_subcommand: &str,
+    cargo_subcommand: CargoPassthroughSubcommand,
     opts: &CargoPassthroughOptions<'_>,
     cargo_args: &[String],
 ) -> Result<Command, String> {
+    cargo_passthrough_command_with_env(
+        ctx,
+        cargo_subcommand,
+        opts,
+        cargo_args,
+        std::env::var_os(MATERIALIZE_ENV),
+    )
+}
+
+/// `cargo_passthrough_command` with the ambient
+/// `CUDA_OXIDE_MATERIALIZE_CUBIN` injected.
+///
+/// Unit tests must call this with `None`: the ambient value outranks
+/// `opts.materialize_cubin`, so an exported one turns materialization on and
+/// sends the test into `discover_materializer_provenance`, which re-executes
+/// `current_exe` -- the libtest binary under `cargo test` -- and then exits the
+/// process over the unusable digest, taking the whole suite with it.
+fn cargo_passthrough_command_with_env(
+    ctx: &Context,
+    cargo_subcommand: CargoPassthroughSubcommand,
+    opts: &CargoPassthroughOptions<'_>,
+    cargo_args: &[String],
+    materialize_env: Option<std::ffi::OsString>,
+) -> Result<Command, String> {
     let target_arch = configured_arch(ctx, opts.arch);
     let target_backend = configured_target_backend(ctx, opts.target_backend)?;
+    let materialization = prepare_materialization_with_env(
+        ctx,
+        opts.materialize_cubin,
+        opts.arch,
+        opts.emit_nvvm_ir,
+        materialize_env,
+    );
     let owner_filter = configured_device_codegen_crates(ctx, opts.device_codegen_crate)?;
-    let mut fingerprinted_device_cfgs = opts.device_cfgs.to_vec();
-    // Cargo does not fingerprint arbitrary child environment variables. An
-    // otherwise-unused cfg makes every effective codegen setting part of the
-    // rustc command line, so changing target/output/FMA/filter settings reruns
-    // the backend instead of silently reusing stale PTX or NVVM IR.
+    // Device-owning macros track this identity in their crate dep-info. Keep it
+    // out of global rustflags so host-only dependencies retain one cache key.
     let fingerprint = passthrough_codegen_fingerprint(
         ctx,
         opts,
         owner_filter.as_deref(),
         target_arch,
         &target_backend,
+        &materialization,
     );
-    fingerprinted_device_cfgs.push(format!("cuda_oxide_internal_codegen_env=\"{fingerprint}\""));
     // Device crates (cuda-device) gate hardware-dependent constants such as
     // WAVE_SIZE on this cfg; it must appear on every MACA device build.
+    let mut device_cfgs = opts.device_cfgs.to_vec();
     if target_backend == "maca" {
-        fingerprinted_device_cfgs.push("cuda_oxide_target_maca".to_string());
+        device_cfgs.push("cuda_oxide_target_maca".to_string());
     }
     let mut cmd = Command::new("cargo");
-    cmd.arg(cargo_subcommand);
+    cmd.arg(cargo_subcommand.as_str());
     if let Some(features) = opts.features {
         cmd.args(["--features", features]);
     }
@@ -1934,16 +3706,29 @@ fn cargo_passthrough_command(
 
     // Project configuration provides defaults. Explicit wrapper flags and
     // internal compiler requirements are applied afterward and therefore win.
-    apply_common_codegen_env(&mut cmd, ctx, opts.verbose, opts.no_fmad);
-    apply_codegen_rustflags(&mut cmd, ctx, false, &fingerprinted_device_cfgs);
+    apply_common_codegen_env(
+        &mut cmd,
+        ctx,
+        opts.verbose,
+        opts.no_fmad,
+        opts.unchecked_indexing,
+        opts.device_debug,
+    );
+    apply_codegen_configuration(
+        &mut cmd,
+        ctx,
+        cargo_subcommand.codegen_profile(),
+        &device_cfgs,
+        &fingerprint,
+    )?;
 
     if let Some(cargo_target_dir) = opts.cargo_target_dir {
         cmd.env("CARGO_TARGET_DIR", cargo_target_dir);
     }
     if let Some(owner_filter) = owner_filter {
-        cmd.env("CUDA_OXIDE_DEVICE_CODEGEN_CRATE", owner_filter);
+        cmd.env(DEVICE_CODEGEN_CRATE_ENV, owner_filter);
     }
-    apply_output_mode(&mut cmd, opts.emit_nvvm_ir, target_arch);
+    apply_output_mode(&mut cmd, opts.emit_nvvm_ir, target_arch, &materialization);
     apply_target_backend(&mut cmd, &target_backend);
     Ok(cmd)
 }
@@ -1955,12 +3740,13 @@ fn cargo_passthrough_command(
 /// incremental behavior should remain intact.
 pub fn codegen_cargo_passthrough(
     ctx: &Context,
-    cargo_subcommand: &str,
+    cargo_subcommand: CargoPassthroughSubcommand,
     opts: CargoPassthroughOptions<'_>,
     cargo_args: &[String],
 ) {
+    let cargo_subcommand_name = cargo_subcommand.as_str();
     println!("=========================================");
-    println!("RUSTC-CODEGEN-CUDA CARGO {}", cargo_subcommand);
+    println!("RUSTC-CODEGEN-CUDA CARGO {}", cargo_subcommand_name);
     println!("=========================================");
     println!();
 
@@ -1976,11 +3762,11 @@ pub fn codegen_cargo_passthrough(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     if displayed_args.is_empty() {
-        println!("Running cargo {}...", cargo_subcommand);
+        println!("Running cargo {}...", cargo_subcommand_name);
     } else {
         println!(
             "Running cargo {} {}...",
-            cargo_subcommand,
+            cargo_subcommand_name,
             displayed_args.join(" ")
         );
     }
@@ -1990,14 +3776,14 @@ pub fn codegen_cargo_passthrough(
     if !status.success() {
         eprintln!(
             "\nCargo {} failed with exit code: {:?}",
-            cargo_subcommand,
+            cargo_subcommand_name,
             status.code()
         );
         std::process::exit(status.code().unwrap_or(1));
     }
 
     println!();
-    println!("✓ Cargo {} succeeded", cargo_subcommand);
+    println!("✓ Cargo {} succeeded", cargo_subcommand_name);
 }
 
 // =============================================================================
@@ -2011,19 +3797,28 @@ pub fn codegen_cargo_passthrough(
 /// `dialect-mir` module (pre- and post-`mem2reg`), the LLVM dialect
 /// module, textual LLVM IR, and the final PTX or NVVM IR. After the build,
 /// generated artifacts are printed to stdout.
+#[allow(clippy::too_many_arguments)]
 pub fn codegen_show_pipeline(
     ctx: &Context,
     example: &str,
     emit_nvvm_ir: bool,
     arch: Option<&str>,
     no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+    materialize_cubin: bool,
 ) {
     let target_arch = configured_arch(ctx, arch);
+    let materialization = prepare_materialization(ctx, materialize_cubin, arch, emit_nvvm_ir);
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
         ctx.workspace_root.clone()
     };
+
+    if load_interop_config(&example_dir).is_some_and(|config| !config.device_crates.is_empty()) {
+        reject_interop_output_mode(emit_nvvm_ir, &materialization);
+    }
 
     clean_generated_files(&example_dir, example);
 
@@ -2032,13 +3827,24 @@ pub fn codegen_show_pipeline(
     println!("=========================================");
     println!();
     let target_arch_label = configured_arch_label(ctx, arch);
-    match (emit_nvvm_ir, target_arch_label.as_deref()) {
-        (true, Some(target_arch)) => println!("Output format: NVVM IR (arch: {})", target_arch),
-        (false, Some(target_arch)) => {
+    match (
+        materialization.enabled(),
+        emit_nvvm_ir,
+        target_arch_label.as_deref(),
+    ) {
+        (true, _, Some(target_arch)) => {
+            println!("Output format: materialized cubin (arch: {target_arch})")
+        }
+        (false, true, Some(target_arch)) => {
+            println!("Output format: NVVM IR (arch: {})", target_arch)
+        }
+        (false, false, Some(target_arch)) => {
             println!("Output format: PTX (arch override: {})", target_arch)
         }
-        (false, None) => println!("Output format: PTX (auto-detected arch)"),
-        (true, None) => unreachable!("--emit-nvvm-ir requires a configured architecture"),
+        (false, false, None) => println!("Output format: PTX (auto-detected arch)"),
+        (true, _, None) | (false, true, None) => {
+            unreachable!("IR/final materialization requires a configured architecture")
+        }
     }
     println!();
     println!("Required flags (applied via CARGO_ENCODED_RUSTFLAGS):");
@@ -2046,6 +3852,7 @@ pub fn codegen_show_pipeline(
     println!("  -C debug-assertions=off     Remove debug checks");
     println!("  -Z mir-enable-passes=-JumpThreading");
     println!("                              Prevent barrier duplication");
+    println!("  -Z always-encode-mir        Emit MIR for all reachable device deps");
     println!();
     println!("Note: panic=abort is NOT required - the codegen backend treats");
     println!("      unwind paths as unreachable (CUDA toolchain limitation, not HW).");
@@ -2056,18 +3863,39 @@ pub fn codegen_show_pipeline(
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--release"]).current_dir(&example_dir);
 
-    apply_config_env(&mut cmd, ctx);
-    apply_codegen_rustflags(&mut cmd, ctx, false, &[]);
-    cmd.env("CUDA_OXIDE_VERBOSE", "1");
+    // The shared codegen env (including the CLI debug level) must be on the
+    // command before the rustflags decision below: a full-debug request adds
+    // `-Zmir-opt-level=0`, and `apply_codegen_rustflags` reads the command's
+    // `CUDA_OXIDE_DEBUG` to see it. This is the same ordering build/run use.
+    apply_common_codegen_env(
+        &mut cmd,
+        ctx,
+        true,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+    );
     cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
-    if no_fmad {
-        cmd.env("CUDA_OXIDE_NO_FMA", "1");
-    }
+    let fingerprint = pipeline_codegen_fingerprint(
+        ctx,
+        no_fmad,
+        unchecked_indexing,
+        device_debug,
+        emit_nvvm_ir,
+        target_arch,
+        &materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLike,
+        &[],
+        &fingerprint,
+    );
 
-    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch);
-    apply_ld_library_path(&mut cmd, ctx);
+    apply_output_mode(&mut cmd, emit_nvvm_ir, target_arch, &materialization);
 
     println!("Building {}...", example);
     println!();
@@ -2092,6 +3920,7 @@ pub fn codegen_show_pipeline(
 /// flags, then launches the debugger on the resulting binary. Prints a
 /// quick-reference cheat sheet for common cuda-gdb commands before handing
 /// control to the debugger.
+#[allow(clippy::too_many_arguments)]
 pub fn codegen_debug(
     ctx: &Context,
     example: &str,
@@ -2100,7 +3929,19 @@ pub fn codegen_debug(
     bin: Option<&str>,
     use_cgdb: bool,
     use_tui: bool,
+    materialize_cubin: bool,
 ) {
+    let example_dir = if ctx.is_workspace {
+        resolve_example_dir(ctx, example)
+    } else {
+        ctx.workspace_root.clone()
+    };
+    let target_arch = configured_arch(ctx, arch);
+    let materialization = prepare_materialization(ctx, materialize_cubin, arch, false);
+    if load_interop_config(&example_dir).is_some_and(|config| !config.device_crates.is_empty()) {
+        reject_interop_output_mode(false, &materialization);
+    }
+
     let cuda_gdb = find_cuda_toolkit_executable(
         ctx,
         "cuda-gdb",
@@ -2130,14 +3971,7 @@ pub fn codegen_debug(
         None
     };
 
-    let example_dir = if ctx.is_workspace {
-        resolve_example_dir(ctx, example)
-    } else {
-        ctx.workspace_root.clone()
-    };
-
-    let target_arch = configured_arch(ctx, arch);
-    let detected_device_arch = detect_run_target_arch(target_arch, false);
+    let detected_device_arch = detect_run_target_arch(target_arch, materialization.enabled());
 
     if let Some(bin) = bin {
         println!("Building {} (bin: {}) with debug info...", example, bin);
@@ -2163,9 +3997,28 @@ pub fn codegen_debug(
     }
 
     apply_config_env(&mut cmd, ctx);
-    apply_codegen_rustflags(&mut cmd, ctx, true, &[]);
+    let target_backend = configured_target_backend_or_exit(ctx, None);
+    let fingerprint = standard_codegen_fingerprint(
+        ctx,
+        false,
+        false,
+        false,
+        DeviceDebug::Off,
+        false,
+        target_arch,
+        detected_device_arch.as_deref(),
+        &target_backend,
+        &materialization,
+    );
+    apply_codegen_configuration_or_exit(
+        &mut cmd,
+        ctx,
+        CodegenProfilePolicy::ReleaseLikeWithDebugInfo,
+        &[],
+        &fingerprint,
+    );
     cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "2");
-    apply_output_mode(&mut cmd, false, target_arch);
+    apply_output_mode(&mut cmd, false, target_arch, &materialization);
     apply_device_arch_hint(&mut cmd, target_arch, detected_device_arch.as_deref());
     apply_ld_library_path(&mut cmd, ctx);
 
@@ -2324,17 +4177,241 @@ fn run_cargo_fmt(dir: &Path, check: bool) -> bool {
 // Doctor command
 // =============================================================================
 
+/// Parsed contents of a `rust-toolchain.toml` pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustToolchainPin {
+    channel: String,
+    components: Vec<String>,
+}
+
+/// Components that doctor treats as hard requirements for the cuda-oxide
+/// pipeline even if `rust-toolchain.toml` stops listing them: `rust-src`
+/// (device-side core sources), `rustc-dev` (rustc_private, required to build
+/// the codegen backend), and `llvm-tools`.
+const DOCTOR_REQUIRED_COMPONENTS: &[&str] = &["rust-src", "rustc-dev", "llvm-tools"];
+
+/// The components doctor verifies for a pin: everything the pin itself lists,
+/// plus the [`DOCTOR_REQUIRED_COMPONENTS`] floor.
+///
+/// rustup auto-installs every component named in `rust-toolchain.toml` when it
+/// installs the pinned toolchain, so a pinned component that is absent from
+/// `rustup component list --installed` means a broken or manually trimmed
+/// install and is worth failing doctor over. The floor guards against a future
+/// edit of the pin file dropping a component the pipeline genuinely needs.
+fn doctor_verified_components(pin: &RustToolchainPin) -> Vec<String> {
+    let mut required: Vec<String> = pin.components.clone();
+    for component in DOCTOR_REQUIRED_COMPONENTS {
+        if !required.iter().any(|existing| existing == component) {
+            required.push((*component).to_string());
+        }
+    }
+    required
+}
+
+/// Parse a `rust-toolchain.toml` document for channel and components.
+fn parse_rust_toolchain_toml(contents: &str) -> Result<RustToolchainPin, String> {
+    let value: toml::Value =
+        toml::from_str(contents).map_err(|error| format!("invalid TOML: {error}"))?;
+    let toolchain = value
+        .get("toolchain")
+        .ok_or_else(|| "missing [toolchain] table".to_string())?;
+    let channel = toolchain
+        .get("channel")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
+        .ok_or_else(|| "missing toolchain.channel".to_string())?
+        .to_string();
+    let components = match toolchain.get("components") {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        "toolchain.components entries must be non-empty strings".to_string()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err("toolchain.components must be an array of strings".to_string());
+        }
+    };
+    Ok(RustToolchainPin {
+        channel,
+        components,
+    })
+}
+
+/// True when `rustup show active-toolchain` output matches the pinned channel.
+///
+/// The toolchain name is the first whitespace-delimited token of the first
+/// line in every rustup output format seen so far:
+///
+/// - pre-1.28 and 1.29+: `nightly-2026-04-03-<triple> (default)` or
+///   `nightly-2026-04-03-<triple> (overridden by '<path>')` on one line
+///   (verified against rustup 1.29.0);
+/// - 1.28.x: the bare name on the first line with the reason on a second
+///   `active because: ...` line.
+fn active_toolchain_matches_channel(active_toolchain: &str, channel: &str) -> bool {
+    let active = active_toolchain
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if active.is_empty() || channel.is_empty() {
+        return false;
+    }
+    active == channel || active.starts_with(&format!("{channel}-"))
+}
+
+/// Return required components that are absent from `rustup component list --installed`.
+fn missing_rustup_components<S: AsRef<str>>(installed_list: &str, required: &[S]) -> Vec<String> {
+    required
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|component| !rustup_component_installed(installed_list, component))
+        .map(str::to_string)
+        .collect()
+}
+
+fn rustup_component_installed(installed_list: &str, component: &str) -> bool {
+    installed_list.lines().any(|line| {
+        let name = line.split_whitespace().next().unwrap_or("");
+        name == component || name.starts_with(&format!("{component}-"))
+    })
+}
+
+fn doctor_report_toolchain_pin(ctx: &Context, ok: &mut bool) {
+    let toolchain_file = ctx.workspace_root.join("rust-toolchain.toml");
+    print!("rust-toolchain.toml... ");
+    if !toolchain_file.exists() {
+        println!("✗ not found at {}", toolchain_file.display());
+        *ok = false;
+        return;
+    }
+
+    let contents = match std::fs::read_to_string(&toolchain_file) {
+        Ok(contents) => contents,
+        Err(error) => {
+            println!("✗ present but unreadable ({error})");
+            *ok = false;
+            return;
+        }
+    };
+
+    let pin = match parse_rust_toolchain_toml(&contents) {
+        Ok(pin) => pin,
+        Err(error) => {
+            println!("✗ present but invalid ({error})");
+            *ok = false;
+            return;
+        }
+    };
+    println!("✓ channel {}", pin.channel);
+
+    print!("Pinned toolchain active... ");
+    match Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let active = String::from_utf8_lossy(&output.stdout);
+            let active = active.trim();
+            if active_toolchain_matches_channel(active, &pin.channel) {
+                println!("✓ {active}");
+            } else {
+                println!(
+                    "✗ active `{active}`, expected `{pin_channel}`",
+                    pin_channel = pin.channel
+                );
+                eprintln!(
+                    "  Install/select the pin with `rustup toolchain install {}` and reopen the shell",
+                    pin.channel
+                );
+                eprintln!("  in this workspace so rust-toolchain.toml can select it.");
+                *ok = false;
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("✗ rustup show active-toolchain failed");
+            if !stderr.trim().is_empty() {
+                eprintln!("  {}", stderr.trim());
+            }
+            *ok = false;
+        }
+        Err(_) => {
+            println!("✗ rustup not found");
+            eprintln!("  Install rustup from https://rustup.rs/ so doctor can verify the pin.");
+            *ok = false;
+        }
+    }
+
+    let required = doctor_verified_components(&pin);
+
+    print!("Required rustup components... ");
+    match Command::new("rustup")
+        .args([
+            "component",
+            "list",
+            "--installed",
+            "--toolchain",
+            &pin.channel,
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let installed = String::from_utf8_lossy(&output.stdout);
+            let missing = missing_rustup_components(&installed, &required);
+            if missing.is_empty() {
+                println!("✓ {}", required.join(", "));
+            } else {
+                println!("✗ missing {}", missing.join(", "));
+                eprintln!(
+                    "  Install with `rustup component add --toolchain {} {}`",
+                    pin.channel,
+                    missing.join(" ")
+                );
+                *ok = false;
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("✗ could not list components for {}", pin.channel);
+            if !stderr.trim().is_empty() {
+                eprintln!("  {}", stderr.trim());
+            }
+            eprintln!(
+                "  Try `rustup toolchain install {channel} -c {components}`",
+                channel = pin.channel,
+                components = required.join(" -c ")
+            );
+            *ok = false;
+        }
+        Err(_) => {
+            println!("✗ rustup not found");
+            *ok = false;
+        }
+    }
+}
+
 /// Validate the development environment.
 ///
 /// Checks for: Rust nightly toolchain, `rust-toolchain.toml`, the codegen
 /// backend `.so` (informational), CUDA headers (`cuda.h`), CUDA toolkit
 /// (`nvcc`, libNVVM, nvJitLink, libdevice), LLVM (`llc`), clang/libclang,
-/// the NVIDIA driver / GPU (informational), and optionally `cuda-gdb`.
+/// the NVIDIA driver / GPU (informational), and optionally `cuda-gdb` /
+/// `compute-sanitizer`.
 /// Exits non-zero if any required check fails.
 ///
 /// Doctor itself needs neither the CUDA toolkit nor a driver: every check
 /// is a subprocess, a filesystem probe, or a runtime `dlopen`, and the
-/// caller resolves the context via [`resolve_doctor_context`] so nothing is
+/// caller resolves the context via [`resolve_passive_context`] so nothing is
 /// built first. This is what lets it diagnose a bare machine (issue #87).
 pub fn doctor(ctx: &Context) {
     println!("cargo-oxide environment check");
@@ -2362,15 +4439,8 @@ pub fn doctor(ctx: &Context) {
         }
     }
 
-    // 2. rust-toolchain.toml
-    let toolchain_file = ctx.workspace_root.join("rust-toolchain.toml");
-    print!("rust-toolchain.toml... ");
-    if toolchain_file.exists() {
-        println!("✓ present");
-    } else {
-        println!("✗ not found at {}", toolchain_file.display());
-        ok = false;
-    }
+    // 2. rust-toolchain.toml pin + active channel + required components
+    doctor_report_toolchain_pin(ctx, &mut ok);
 
     // 3. Backend .so. Informational, not fatal: `run`/`build`/`pipeline`
     // build the backend on demand, so "not built yet" is a healthy state
@@ -2382,13 +4452,45 @@ pub fn doctor(ctx: &Context) {
         println!("- not built yet (run `cargo oxide setup`)");
     }
 
+    // 3a. Project config (`.cargo/cuda-oxide.toml`)
+    doctor_report_oxide_config(ctx, &mut ok);
+
+    // 3b. Shared cache. The check above reports the backend this context
+    // resolves to, which inside the repository is the local build. A project
+    // outside the repository resolves to the cache instead, so the two can
+    // disagree while every other check passes.
+    print!("Shared cache (external projects)... ");
+    match backend::cached_backend_path() {
+        Some(cached) => match backend::compare_cache_to_local(&cached, &ctx.backend_so) {
+            backend::CacheReport::Absent => {
+                println!("- empty; external projects build on first use");
+            }
+            backend::CacheReport::UpToDate => {
+                println!("✓ {}", cached.display());
+            }
+            backend::CacheReport::OlderThanLocal => {
+                println!("⚠ {}", cached.display());
+                println!("  Older than the backend built here, so projects outside this");
+                println!("  repository would load a different one. Run `cargo oxide setup`");
+                println!("  to publish, or set CUDA_OXIDE_BACKEND to pin an explicit path.");
+            }
+        },
+        None => println!("- cache directory unknown (set CARGO_HOME or HOME)"),
+    }
+
     // 4. CUDA headers (cuda.h). The host `cuda-bindings` crate cannot build
     // without them; cargo-oxide itself deliberately can, which is what makes
     // this check reachable on a toolkit-less machine instead of dying inside
     // cuda-bindings' build script (issue #87).
     print!("CUDA headers (cuda.h)... ");
     let toolkit = cuda_toolkit_root(|var| std::env::var(var).ok());
-    let header_candidates = cuda_header_candidates(&toolkit, std::env::consts::ARCH);
+    let target_dir_override = std::env::var("CUDA_TOOLKIT_TARGET_DIR").ok();
+    let header_candidates = cuda_header_candidates(
+        &toolkit,
+        target_dir_override.as_deref(),
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    );
     match header_candidates.iter().find(|path| path.is_file()) {
         Some(found) => println!("✓ {}", found.display()),
         None => {
@@ -2650,6 +4752,32 @@ pub fn doctor(ctx: &Context) {
         }
     }
 
+    // 10. compute-sanitizer (optional) — same discovery order as `sanitize`
+    print!("compute-sanitizer (optional)... ");
+    match find_cuda_toolkit_executable(ctx, "compute-sanitizer", COMPUTE_SANITIZER_FALLBACK_PATHS) {
+        Some(path) => match Command::new(&path).arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout);
+                // `compute-sanitizer --version` prints a banner and a
+                // copyright line before the actual "Version ..." line.
+                let line = version
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("Version"))
+                    .or_else(|| version.lines().next().map(str::trim));
+                if let Some(line) = line {
+                    println!("✓ {} ({})", line, path.display());
+                } else {
+                    println!("✓ {}", path.display());
+                }
+            }
+            _ => println!("✓ {}", path.display()),
+        },
+        None => {
+            println!("- not found (only needed for `cargo oxide sanitize`)");
+        }
+    }
+
     println!();
     if ok {
         println!("✅ Environment looks good!");
@@ -2663,9 +4791,9 @@ pub fn doctor(ctx: &Context) {
 /// variable among `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, else `/usr/local/cuda`.
 ///
 /// Kept in lockstep BY HAND with `crates/cuda-bindings/build.rs`
-/// (`cuda_toolkit_dir` / `find_cuda_include_dir` / `toolkit_target_dir`):
-/// doctor cannot import that probe because build.rs logic is not a library.
-/// If the build.rs discovery changes, mirror it here.
+/// (`cuda_toolkit_dir` / `find_cuda_include_dir`): doctor cannot import that
+/// probe because build.rs logic is not a library. If the build.rs discovery
+/// changes, mirror it here.
 fn cuda_toolkit_root(mut get_env: impl FnMut(&str) -> Option<String>) -> String {
     ["CUDA_TOOLKIT_PATH", "CUDA_HOME"]
         .iter()
@@ -2675,24 +4803,268 @@ fn cuda_toolkit_root(mut get_env: impl FnMut(&str) -> Option<String>) -> String 
 
 /// Candidate `cuda.h` paths under `toolkit`, in probe order: the standard
 /// `include/` layout first, then the redistributable `targets/<dir>/include`
-/// layout. CUDA names the target dirs after the GPU platform, not the Rust
-/// triple: x86_64 hosts use `x86_64-linux`, aarch64 servers use `sbsa-linux`.
+/// layouts. CUDA names the target dirs after the GPU platform, not the Rust
+/// triple: x86_64 Linux hosts use `x86_64-linux`; aarch64 Linux is ambiguous
+/// between servers (`sbsa-linux`) and Tegra (`aarch64-linux`), so both are
+/// probed in that order. A non-blank `target_dir_override` (the
+/// `CUDA_TOOLKIT_TARGET_DIR` variable, like nvcc's `-target-dir`) replaces
+/// the table with that single directory.
 ///
-/// `arch` is the host CPU architecture; the caller passes
-/// `std::env::consts::ARCH` (doctor runs at runtime, so there is no cargo
-/// `TARGET` to consult). Injected as a parameter for unit tests.
-fn cuda_header_candidates(toolkit: &str, arch: &str) -> Vec<PathBuf> {
+/// Kept in lockstep BY HAND with the selection table in
+/// `crates/cuda-bindings/toolkit_target.rs` (`resolve_toolkit_target_dirs`):
+/// doctor cannot import it because build-script sources are not a library.
+/// If the selection there changes, mirror it here.
+///
+/// `arch` and `os` are the host CPU architecture and OS; the caller passes
+/// `std::env::consts::ARCH` / `std::env::consts::OS` (doctor runs at
+/// runtime, so there are no cargo target cfgs to consult). Injected as
+/// parameters for unit tests.
+fn cuda_header_candidates(
+    toolkit: &str,
+    target_dir_override: Option<&str>,
+    arch: &str,
+    os: &str,
+) -> Vec<PathBuf> {
     let base = Path::new(toolkit);
     let mut candidates = vec![base.join("include/cuda.h")];
-    let target_dir = match arch {
-        "x86_64" => Some("x86_64-linux"),
-        "aarch64" => Some("sbsa-linux"),
-        _ => None,
+    let target_dirs: Vec<&str> = match target_dir_override.filter(|dir| !dir.trim().is_empty()) {
+        Some(dir) => vec![dir],
+        None => match (arch, os) {
+            ("x86_64", "linux") => vec!["x86_64-linux"],
+            ("aarch64", "linux") => vec!["sbsa-linux", "aarch64-linux"],
+            _ => vec![],
+        },
     };
-    if let Some(dir) = target_dir {
+    for dir in target_dirs {
         candidates.push(base.join("targets").join(dir).join("include/cuda.h"));
     }
     candidates
+}
+
+// =============================================================================
+// Clean command
+// =============================================================================
+
+pub fn clean(ctx: &Context) {
+    match clean_context(ctx) {
+        Ok(summary) if summary.removed_directories == 0 && summary.removed_files == 0 => {
+            println!("Nothing to clean.");
+        }
+        Ok(summary) => {
+            println!(
+                "Removed {} directories and {} generated artifacts.",
+                summary.removed_directories, summary.removed_files
+            );
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct CleanSummary {
+    removed_directories: usize,
+    removed_files: usize,
+}
+
+fn clean_context(ctx: &Context) -> Result<CleanSummary, String> {
+    let mut summary = CleanSummary::default();
+
+    if ctx.is_workspace {
+        clean_workspace(ctx, &mut summary)?;
+    } else {
+        clean_standalone_project(&ctx.workspace_root, &mut summary)?;
+    }
+
+    Ok(summary)
+}
+
+fn clean_standalone_project(project_dir: &Path, summary: &mut CleanSummary) -> Result<(), String> {
+    let manifest_path = project_dir.join("Cargo.toml");
+    let package_name = package_name_for_clean(&manifest_path)?;
+
+    if remove_local_target(project_dir)? {
+        summary.removed_directories += 1;
+    }
+
+    summary.removed_files += remove_generated_artifacts(project_dir, &package_name)?;
+
+    Ok(())
+}
+
+fn clean_workspace(ctx: &Context, summary: &mut CleanSummary) -> Result<(), String> {
+    if remove_local_target(&ctx.workspace_root)? {
+        summary.removed_directories += 1;
+    }
+
+    if remove_local_target(&ctx.codegen_crate)? {
+        summary.removed_directories += 1;
+    }
+
+    let entries = std::fs::read_dir(&ctx.examples_dir).map_err(|error| {
+        format!(
+            "could not read examples directory {}: {error}",
+            ctx.examples_dir.display()
+        )
+    })?;
+
+    let mut example_dirs = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not read an entry in {}: {error}",
+                ctx.examples_dir.display()
+            )
+        })?;
+
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "could not inspect example entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let example_dir = entry.path();
+        if example_dir.join("Cargo.toml").is_file() {
+            example_dirs.push(example_dir);
+        }
+    }
+
+    example_dirs.sort();
+
+    for example_dir in example_dirs {
+        clean_example(&example_dir, summary)?;
+    }
+
+    Ok(())
+}
+
+fn clean_example(example_dir: &Path, summary: &mut CleanSummary) -> Result<(), String> {
+    let manifest_path = example_dir.join("Cargo.toml");
+    let package_name = package_name_for_clean(&manifest_path)?;
+
+    if remove_local_target(example_dir)? {
+        summary.removed_directories += 1;
+    }
+
+    summary.removed_files += remove_generated_artifacts(example_dir, &package_name)?;
+
+    Ok(())
+}
+
+fn package_name_for_clean(manifest_path: &Path) -> Result<String, String> {
+    let source = std::fs::read_to_string(manifest_path).map_err(|error| {
+        format!(
+            "could not read manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+
+    let document: toml::Value = toml::from_str(&source).map_err(|error| {
+        format!(
+            "could not parse manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+
+    document
+        .get("package")
+        .and_then(|value| value.get("name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "manifest {} is missing package.name",
+                manifest_path.display()
+            )
+        })
+}
+
+fn remove_local_target(project_dir: &Path) -> Result<bool, String> {
+    let target_dir = project_dir.join("target");
+
+    let metadata = match std::fs::symlink_metadata(&target_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                target_dir.display()
+            ));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to remove symlinked target directory {}",
+            target_dir.display()
+        ));
+    }
+
+    if !metadata.is_dir() {
+        return Err(format!(
+            "expected {} to be a directory",
+            target_dir.display()
+        ));
+    }
+
+    std::fs::remove_dir_all(&target_dir).map_err(|error| {
+        format!(
+            "could not remove target directory {}: {error}",
+            target_dir.display()
+        )
+    })?;
+
+    println!("Removed {}", target_dir.display());
+
+    Ok(true)
+}
+
+fn remove_generated_artifacts(project_dir: &Path, package_name: &str) -> Result<usize, String> {
+    let mut removed = 0;
+
+    for path in generated_artifact_paths(project_dir, package_name) {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("could not inspect {}: {error}", path.display()));
+            }
+        };
+
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to remove symlinked generated artifact {}",
+                path.display()
+            ));
+        }
+
+        if !metadata.is_file() {
+            return Err(format!(
+                "expected generated artifact {} to be a file",
+                path.display()
+            ));
+        }
+
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+
+        println!("Removed {}", path.display());
+        removed += 1;
+    }
+
+    Ok(removed)
 }
 
 // =============================================================================
@@ -2708,63 +5080,387 @@ pub fn setup(ctx: &Context) {
     println!("Building cuda-oxide codegen backend...");
     println!();
 
-    backend::build_backend_from_source(&ctx.codegen_crate);
+    let built_so = backend::build_backend_from_source(&ctx.codegen_crate);
 
     println!();
     println!("✓ Backend is ready. You can now use:");
     println!("  cargo oxide run <example>");
     println!("  cargo oxide build <example>");
+
+    // A project outside this repository resolves the backend through the
+    // shared cache, since `find_workspace_root` finds no
+    // `crates/rustc-codegen-cuda` above it. Publishing the build there keeps
+    // those projects on the backend that was just built instead of on whatever
+    // the cache last held.
+    match backend::publish_to_cache(&built_so) {
+        Some(path) => {
+            println!();
+            println!("✓ Published to {}", path.display());
+            println!("  Projects outside this repo will now use this build.");
+        }
+        None => {
+            eprintln!();
+            eprintln!("Warning: could not publish the backend to the shared cache.");
+            eprintln!("Projects outside this repo may keep using an older build.");
+            eprintln!("Set CUDA_OXIDE_BACKEND to this build to override.");
+        }
+    }
+}
+
+/// How `cargo oxide update` should behave for the current project mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePlan {
+    /// Inside the monorepo: tell the user to run `setup` (non-destructive).
+    AdviseSetup,
+    /// Inside the monorepo with `--force`: rebuild via `setup`.
+    RunSetup,
+    /// Outside the monorepo: clear and rebuild the shared cache.
+    RefreshCache,
+}
+
+pub fn plan_update(is_workspace: bool, force: bool) -> UpdatePlan {
+    match (is_workspace, force) {
+        (true, false) => UpdatePlan::AdviseSetup,
+        (true, true) => UpdatePlan::RunSetup,
+        (false, _) => UpdatePlan::RefreshCache,
+    }
+}
+
+/// Refresh the codegen backend used by this project.
+///
+/// Inside the cuda-oxide workspace the authoritative backend is the local
+/// source tree, so the default path points at `cargo oxide setup`. Outside
+/// the workspace, the shared `~/.cargo/cuda-oxide/` cache is cleared and
+/// rebuilt via the auto-fetch path.
+/// The backend pin that outranks the shared cache `update` refreshes, if any.
+///
+/// Both the `CUDA_OXIDE_BACKEND` env var and a `.cargo/cuda-oxide.toml`
+/// `backend` entry sit above the cache in backend discovery, so a refreshed
+/// cache would never be consulted while either is set. `update` refuses
+/// rather than mislead.
+fn update_pin_refusal(ctx: &Context) -> Option<String> {
+    update_pin_refusal_with_env(ctx, std::env::var_os("CUDA_OXIDE_BACKEND"))
+}
+
+/// `update_pin_refusal` with the ambient `CUDA_OXIDE_BACKEND` injected.
+///
+/// The env var is checked before the project pin, so resolution has to be
+/// injectable for unit tests: a developer with `CUDA_OXIDE_BACKEND` exported
+/// would otherwise get the env refusal for every input, including the
+/// unpinned case that must return `None`. Same rationale as
+/// `nvvm_ir_requested_with_env`.
+fn update_pin_refusal_with_env(
+    ctx: &Context,
+    backend_env: Option<std::ffi::OsString>,
+) -> Option<String> {
+    if backend_env.is_some() {
+        return Some(
+            "CUDA_OXIDE_BACKEND is set, so `cargo oxide update` will not\n\
+             modify the shared cache. Unset CUDA_OXIDE_BACKEND and re-run, or\n\
+             rebuild the pinned backend path yourself."
+                .to_string(),
+        );
+    }
+    ctx.config.backend.as_deref().map(|pinned| {
+        format!(
+            "`.cargo/cuda-oxide.toml` pins the backend to {}, so\n\
+             `cargo oxide update` will not modify the shared cache. Remove the\n\
+             `backend` entry and re-run, or rebuild the pinned path yourself.",
+            pinned.display()
+        )
+    })
+}
+
+pub fn update(ctx: &Context, force: bool) {
+    if let Some(refusal) = update_pin_refusal(ctx) {
+        eprintln!("Error: {refusal}");
+        std::process::exit(1);
+    }
+
+    match plan_update(ctx.is_workspace, force) {
+        UpdatePlan::AdviseSetup => {
+            println!("Inside the cuda-oxide workspace the codegen backend is built from");
+            println!("local source (`crates/rustc-codegen-cuda`).");
+            println!();
+            println!("Run `cargo oxide setup` to rebuild and publish to the shared cache,");
+            println!("or pass `--force` to run setup from this command.");
+        }
+        UpdatePlan::RunSetup => {
+            println!("`--force` requested inside the workspace; running setup...");
+            println!();
+            setup(ctx);
+        }
+        UpdatePlan::RefreshCache => {
+            println!("Refreshing the shared codegen backend cache for external projects...");
+            println!();
+            let so = backend::refresh_cached_backend();
+            println!();
+            println!("✓ Cached backend ready at {}", so.display());
+        }
+    }
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
+/// Load `.cargo/cuda-oxide.toml`, exiting on an invalid config.
+///
+/// Build commands ([`resolve_context`]) stay strict: they must not run with
+/// a config the user wrote but cargo-oxide cannot honor.
 fn load_oxide_config(workspace_root: &Path) -> OxideConfig {
+    match inspect_oxide_config(workspace_root) {
+        OxideConfigInspection::Missing => OxideConfig::default(),
+        OxideConfigInspection::Valid { config, warnings } => {
+            for warning in warnings {
+                eprintln!("Warning: {warning}");
+            }
+            config
+        }
+        OxideConfigInspection::Invalid { errors, warnings } => {
+            for warning in warnings {
+                eprintln!("Warning: {warning}");
+            }
+            for error in errors {
+                eprintln!("Error: {error}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Load `.cargo/cuda-oxide.toml`, falling back to defaults on an invalid
+/// config instead of exiting.
+///
+/// Passive commands ([`resolve_passive_context`]: `doctor`, `clean`, ...)
+/// must stay usable with a broken config. `doctor` in particular re-inspects
+/// the file and reports the failure as a regular failed check, which it can
+/// only do if context resolution survives long enough for the scan to start.
+fn load_oxide_config_lenient(workspace_root: &Path) -> OxideConfig {
+    match inspect_oxide_config(workspace_root) {
+        OxideConfigInspection::Missing => OxideConfig::default(),
+        OxideConfigInspection::Valid { config, warnings } => {
+            for warning in warnings {
+                eprintln!("Warning: {warning}");
+            }
+            config
+        }
+        OxideConfigInspection::Invalid { errors, warnings } => {
+            for warning in warnings {
+                eprintln!("Warning: {warning}");
+            }
+            for error in errors {
+                eprintln!("Warning: {error}");
+            }
+            eprintln!("Warning: ignoring invalid cuda-oxide config and continuing with defaults");
+            OxideConfig::default()
+        }
+    }
+}
+
+/// Result of reading `.cargo/cuda-oxide.toml` without exiting the process.
+///
+/// `doctor` uses this so a bad config is reported alongside other checks
+/// instead of aborting before the rest of the environment scan runs.
+#[derive(Debug)]
+enum OxideConfigInspection {
+    Missing,
+    Valid {
+        config: OxideConfig,
+        warnings: Vec<String>,
+    },
+    Invalid {
+        errors: Vec<String>,
+        warnings: Vec<String>,
+    },
+}
+
+fn inspect_oxide_config(workspace_root: &Path) -> OxideConfigInspection {
     let config_path = workspace_root.join(".cargo/cuda-oxide.toml");
     if !config_path.exists() {
-        return OxideConfig::default();
+        return OxideConfigInspection::Missing;
     }
 
-    let source = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not read cuda-oxide config {}: {}",
-            config_path.display(),
-            e
-        );
-        std::process::exit(1);
-    });
-    let document: toml::Value = toml::from_str(&source).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not parse cuda-oxide config {}: {}",
-            config_path.display(),
-            e
-        );
-        std::process::exit(1);
-    });
-    let table = document.as_table().unwrap_or_else(|| {
-        eprintln!(
-            "Error: cuda-oxide config {} must be a TOML table",
-            config_path.display()
-        );
-        std::process::exit(1);
-    });
+    let source = match std::fs::read_to_string(&config_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return OxideConfigInspection::Invalid {
+                errors: vec![format!(
+                    "could not read cuda-oxide config {}: {error}",
+                    config_path.display()
+                )],
+                warnings: Vec::new(),
+            };
+        }
+    };
 
-    let backend = optional_config_string(table, "backend", &config_path)
-        .map(PathBuf::from)
-        .map(|path| absolutize_config_path(path, &config_path));
-    let default_arch = optional_config_string(table, "default-arch", &config_path);
-    let extra_rustflags = optional_config_string_array(table, "extra-rustflags", &config_path);
-    let env = table
-        .get("env")
-        .map(|value| parse_config_env(value, &config_path))
-        .unwrap_or_default();
+    let document: toml::Value = match toml::from_str(&source) {
+        Ok(document) => document,
+        Err(error) => {
+            return OxideConfigInspection::Invalid {
+                errors: vec![format!(
+                    "could not parse cuda-oxide config {}: {error}",
+                    config_path.display()
+                )],
+                warnings: Vec::new(),
+            };
+        }
+    };
 
-    OxideConfig {
-        backend,
-        default_arch,
-        extra_rustflags,
-        env,
+    let Some(table) = document.as_table() else {
+        return OxideConfigInspection::Invalid {
+            errors: vec![format!(
+                "cuda-oxide config {} must be a TOML table",
+                config_path.display()
+            )],
+            warnings: Vec::new(),
+        };
+    };
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let backend = match optional_config_string(table, "backend", &config_path) {
+        Ok(value) => value
+            .map(PathBuf::from)
+            .map(|path| absolutize_config_path(path, &config_path)),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    let default_arch = match optional_config_string(table, "default-arch", &config_path) {
+        Ok(value) => {
+            if let Some(ref arch) = value {
+                // Validate with the same parser the consumers use
+                // (`parse_nvvm_arch` normalizes `sm_XX` / `compute_XX` / bare
+                // `XX` into a `CudaArch`), so load-time validation is exactly
+                // as permissive as what a build would accept. Non-`sm_XX`
+                // spellings work but are advisory-warned: `sm_XX` is the form
+                // `--arch` and the rest of cargo-oxide document.
+                match parse_nvvm_arch(arch) {
+                    Ok(parsed) => {
+                        if !arch.starts_with("sm_") {
+                            warnings.push(format!(
+                                "cuda-oxide config {} spells `default-arch` as `{arch}`; \
+                                 prefer the `{}` form used by `--arch`",
+                                config_path.display(),
+                                parsed.sm()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "cuda-oxide config {} field `default-arch`: {error}",
+                            config_path.display()
+                        ));
+                    }
+                }
+            }
+            value
+        }
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    let extra_rustflags = match optional_config_string_array(table, "extra-rustflags", &config_path)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(error);
+            Vec::new()
+        }
+    };
+    let env = match table.get("env") {
+        None => Vec::new(),
+        Some(value) => match parse_config_env(value, &config_path) {
+            Ok(env) => {
+                for (key, _) in &env {
+                    if matches!(key.as_str(), "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS") {
+                        warnings.push(format!(
+                            "cuda-oxide config {} `[env]` key `{key}` is ignored; \
+                             use `extra-rustflags` for project rustc defaults",
+                            config_path.display()
+                        ));
+                    }
+                }
+                env
+            }
+            Err(error) => {
+                errors.push(error);
+                Vec::new()
+            }
+        },
+    };
+
+    if !errors.is_empty() {
+        return OxideConfigInspection::Invalid { errors, warnings };
+    }
+
+    OxideConfigInspection::Valid {
+        config: OxideConfig {
+            backend,
+            default_arch,
+            extra_rustflags,
+            env,
+        },
+        warnings,
+    }
+}
+
+/// Outcome of doctor's project-config check, separated from printing so
+/// tests can assert the doctor-level behavior (headline, detail lines,
+/// pass/fail) directly.
+struct OxideConfigCheck {
+    /// Line printed after the check label.
+    headline: String,
+    /// Indented detail lines (warnings, then errors).
+    details: Vec<String>,
+    /// Whether the check failed (flips doctor to a nonzero exit).
+    failed: bool,
+}
+
+fn check_oxide_config(workspace_root: &Path) -> OxideConfigCheck {
+    let config_path = workspace_root.join(".cargo/cuda-oxide.toml");
+    match inspect_oxide_config(workspace_root) {
+        OxideConfigInspection::Missing => OxideConfigCheck {
+            headline: "- not present (using defaults)".to_string(),
+            details: Vec::new(),
+            failed: false,
+        },
+        OxideConfigInspection::Valid { config, warnings } => OxideConfigCheck {
+            headline: match &config.default_arch {
+                Some(arch) => format!("✓ {} (default-arch = {arch})", config_path.display()),
+                None => format!("✓ {}", config_path.display()),
+            },
+            details: warnings
+                .into_iter()
+                .map(|warning| format!("⚠ {warning}"))
+                .collect(),
+            failed: false,
+        },
+        OxideConfigInspection::Invalid { errors, warnings } => OxideConfigCheck {
+            headline: format!("✗ {}", config_path.display()),
+            details: warnings
+                .into_iter()
+                .map(|warning| format!("⚠ {warning}"))
+                .chain(errors.into_iter().map(|error| format!("✗ {error}")))
+                .collect(),
+            failed: true,
+        },
+    }
+}
+
+fn doctor_report_oxide_config(ctx: &Context, ok: &mut bool) {
+    print!("Project config (.cargo/cuda-oxide.toml)... ");
+    let check = check_oxide_config(&ctx.workspace_root);
+    println!("{}", check.headline);
+    for line in check.details {
+        println!("  {line}");
+    }
+    if check.failed {
+        *ok = false;
     }
 }
 
@@ -2778,73 +5474,75 @@ fn absolutize_config_path(path: PathBuf, config_path: &Path) -> PathBuf {
         .join(path)
 }
 
-fn optional_config_string(table: &toml::Table, key: &str, config_path: &Path) -> Option<String> {
-    table.get(key).map(|value| {
-        value.as_str().map(str::to_string).unwrap_or_else(|| {
-            eprintln!(
-                "Error: cuda-oxide config {} field `{}` must be a string",
-                config_path.display(),
-                key
-            );
-            std::process::exit(1);
-        })
-    })
+fn optional_config_string(
+    table: &toml::Table,
+    key: &str,
+    config_path: &Path,
+) -> Result<Option<String>, String> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_str().map(|s| Some(s.to_string())).ok_or_else(|| {
+            format!(
+                "cuda-oxide config {} field `{key}` must be a string",
+                config_path.display()
+            )
+        }),
+    }
 }
 
-fn optional_config_string_array(table: &toml::Table, key: &str, config_path: &Path) -> Vec<String> {
-    table
-        .get(key)
-        .map(|value| {
-            value
-                .as_array()
-                .unwrap_or_else(|| {
-                    eprintln!(
-                        "Error: cuda-oxide config {} field `{}` must be an array of strings",
-                        config_path.display(),
-                        key
-                    );
-                    std::process::exit(1);
-                })
+fn optional_config_string_array(
+    table: &toml::Table,
+    key: &str,
+    config_path: &Path,
+) -> Result<Vec<String>, String> {
+    match table.get(key) {
+        None => Ok(Vec::new()),
+        Some(value) => {
+            let array = value.as_array().ok_or_else(|| {
+                format!(
+                    "cuda-oxide config {} field `{key}` must be an array of strings",
+                    config_path.display()
+                )
+            })?;
+            array
                 .iter()
                 .map(|item| {
-                    item.as_str().map(str::to_string).unwrap_or_else(|| {
-                        eprintln!(
-                            "Error: cuda-oxide config {} field `{}` must be an array of strings",
-                            config_path.display(),
-                            key
-                        );
-                        std::process::exit(1);
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        format!(
+                            "cuda-oxide config {} field `{key}` must be an array of strings",
+                            config_path.display()
+                        )
                     })
                 })
                 .collect()
-        })
-        .unwrap_or_default()
+        }
+    }
 }
 
-fn parse_config_env(value: &toml::Value, config_path: &Path) -> Vec<(String, String)> {
-    let table = value.as_table().unwrap_or_else(|| {
-        eprintln!(
-            "Error: cuda-oxide config {} field `env` must be a table of strings",
+fn parse_config_env(
+    value: &toml::Value,
+    config_path: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let table = value.as_table().ok_or_else(|| {
+        format!(
+            "cuda-oxide config {} field `env` must be a table of strings",
             config_path.display()
-        );
-        std::process::exit(1);
-    });
+        )
+    })?;
     let mut env: Vec<_> = table
         .iter()
         .map(|(key, value)| {
-            let value = value.as_str().unwrap_or_else(|| {
-                eprintln!(
-                    "Error: cuda-oxide config {} env value `{}` must be a string",
-                    config_path.display(),
-                    key
-                );
-                std::process::exit(1);
-            });
-            (key.clone(), value.to_string())
+            let value = value.as_str().ok_or_else(|| {
+                format!(
+                    "cuda-oxide config {} env value `{key}` must be a string",
+                    config_path.display()
+                )
+            })?;
+            Ok((key.clone(), value.to_string()))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     env.sort_by(|left, right| left.0.cmp(&right.0));
-    env
+    Ok(env)
 }
 
 fn load_interop_config(example_dir: &Path) -> Option<InteropConfig> {
@@ -2907,7 +5605,8 @@ fn parse_device_crate_config(value: &toml::Value, manifest_path: &Path) -> Devic
     });
 
     let device_manifest = required_metadata_string(table, "manifest-path", manifest_path);
-    let ptx_dir = optional_metadata_string(table, "ptx-dir")
+    let artifact_dir = optional_metadata_string(table, "artifact-dir")
+        .or_else(|| optional_metadata_string(table, "ptx-dir"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(&device_manifest)
@@ -2916,11 +5615,36 @@ fn parse_device_crate_config(value: &toml::Value, manifest_path: &Path) -> Devic
                 .to_path_buf()
         });
     let artifact_name = optional_metadata_string(table, "artifact-name");
+    let artifact_kind = match optional_metadata_string(table, "artifact-kind").as_deref() {
+        None | Some("ptx") => InteropArtifactKind::Ptx,
+        Some("cubin") => InteropArtifactKind::Cubin,
+        Some(value) => {
+            eprintln!(
+                "Error: package.metadata.cuda-oxide.device-crates `artifact-kind` in {} must be `ptx` or `cubin`, got {value:?}",
+                manifest_path.display()
+            );
+            std::process::exit(2);
+        }
+    };
+    let source_identity = match table.get("source-identity") {
+        None => false,
+        Some(value) => value.as_bool().unwrap_or_else(|| {
+            eprintln!(
+                "Error: package.metadata.cuda-oxide.device-crates `source-identity` in {} must be a boolean",
+                manifest_path.display()
+            );
+            std::process::exit(2);
+        }),
+    };
+    let bin = optional_metadata_string(table, "bin");
 
     DeviceCrateConfig {
         manifest_path: PathBuf::from(device_manifest),
-        ptx_dir,
+        artifact_dir,
         artifact_name,
+        artifact_kind,
+        source_identity,
+        bin,
     }
 }
 
@@ -2978,6 +5702,125 @@ fn normalize_crate_name(package_name: &str) -> String {
     package_name.replace('-', "_")
 }
 
+/// The target directory cargo reports for a device crate, which locates both
+/// its uplifted build products and the build outputs the identity sidecar
+/// must exclude.
+fn cargo_target_directory(metadata: &serde_json::Value) -> Result<PathBuf, String> {
+    metadata
+        .get("target_directory")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cargo metadata omitted target_directory".to_string())
+}
+
+/// Where cargo uplifts the dep-info file for a release binary target.
+///
+/// Cargo names the uplifted copy after the bin target verbatim, hyphens
+/// preserved: building the `simt-device` target writes
+/// `target/release/simt-device` and `target/release/simt-device.d` (this
+/// repo's own build writes `target/debug/cargo-oxide.d`). Only the internal
+/// per-unit copies under `target/release/deps/` use the underscore-normalized
+/// crate name, so the stem here must NOT be `normalize_crate_name`d.
+fn release_depfile_path(cargo_target_dir: &Path, cargo_target_name: &str) -> PathBuf {
+    cargo_target_dir
+        .join("release")
+        .join(format!("{cargo_target_name}.d"))
+}
+
+fn interop_cargo_metadata(
+    ctx: &Context,
+    device_dir: &Path,
+    manifest_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let mut command = Command::new("cargo");
+    command
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(manifest_path)
+        .current_dir(device_dir);
+    apply_config_env(&mut command, ctx);
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start cargo metadata: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cargo metadata failed with status {}{}{}",
+            output.status,
+            if stderr.is_empty() { "" } else { ": " },
+            stderr.trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("could not parse cargo metadata JSON: {error}"))
+}
+
+fn interop_binary_target_from_metadata(
+    metadata: &serde_json::Value,
+    manifest_path: &Path,
+    bin: &str,
+) -> Result<InteropBinaryTarget, String> {
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "cargo metadata omitted packages".to_string())?;
+    let package = packages
+        .iter()
+        .find(|package| {
+            package
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| Path::new(path) == manifest_path)
+        })
+        .ok_or_else(|| {
+            format!(
+                "cargo metadata omitted package for manifest {}",
+                manifest_path.display()
+            )
+        })?;
+    let targets = package
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "cargo metadata omitted package targets".to_string())?;
+    let is_binary = |target: &&serde_json::Value| {
+        target
+            .get("kind")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
+    };
+    let target = targets
+        .iter()
+        .filter(is_binary)
+        .find(|target| target.get("name").and_then(serde_json::Value::as_str) == Some(bin))
+        .ok_or_else(|| {
+            let mut available = targets
+                .iter()
+                .filter(is_binary)
+                .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>();
+            available.sort_unstable();
+            format!(
+                "manifest {} has no binary target {bin:?}; available binary targets: {}",
+                manifest_path.display(),
+                if available.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+    let source_path = target
+        .get("src_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("cargo metadata omitted source path for binary target {bin:?}"))?;
+    Ok(InteropBinaryTarget { source_path })
+}
+
 /// Resolve an example name to its directory path, or exit with a list of
 /// available examples if not found.
 fn resolve_example_dir(ctx: &Context, example: &str) -> PathBuf {
@@ -3004,12 +5847,28 @@ fn resolve_example_dir(ctx: &Context, example: &str) -> PathBuf {
 
 const ENCODED_RUSTFLAGS_SEPARATOR: char = '\u{1f}';
 
+/// Profile-related rustc flags owned by cuda-oxide.
+///
+/// Backend selection and MIR/symbol invariants are always applied separately.
+/// `CargoSelected` deliberately adds no optimization, assertion, or debug-info
+/// flags so Cargo's chosen profile remains authoritative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodegenProfilePolicy {
+    CargoSelected,
+    ReleaseLike,
+    ReleaseLikeWithDebugInfo,
+}
+
 /// Construct boundary-preserving rustc flags for Cargo.
 ///
 /// `RUSTFLAGS` is whitespace-split by Cargo, which corrupts a single flag
 /// containing spaces. `CARGO_ENCODED_RUSTFLAGS` uses unit separators and keeps
 /// every configured array element and `--device-cfg` value intact.
-fn build_encoded_rustflags(ctx: &Context, debug: bool, device_cfgs: &[String]) -> String {
+fn build_encoded_rustflags(
+    ctx: &Context,
+    profile: CodegenProfilePolicy,
+    device_cfgs: &[String],
+) -> String {
     let existing_encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").ok();
     let existing = std::env::var("RUSTFLAGS").ok();
     let mut explicit_rustflags = Vec::new();
@@ -3019,7 +5878,7 @@ fn build_encoded_rustflags(ctx: &Context, debug: bool, device_cfgs: &[String]) -
     }
     build_encoded_rustflags_with_existing(
         &ctx.backend_so,
-        debug,
+        profile,
         &ctx.config.extra_rustflags,
         &explicit_rustflags,
         existing_encoded.as_deref(),
@@ -3029,7 +5888,7 @@ fn build_encoded_rustflags(ctx: &Context, debug: bool, device_cfgs: &[String]) -
 
 fn build_encoded_rustflags_with_existing(
     backend_so: &Path,
-    debug: bool,
+    profile: CodegenProfilePolicy,
     configured_rustflags: &[String],
     explicit_rustflags: &[String],
     existing_encoded_rustflags: Option<&str>,
@@ -3053,25 +5912,163 @@ fn build_encoded_rustflags_with_existing(
         flags.extend(existing.split_whitespace().map(str::to_string));
     }
     flags.extend(explicit_rustflags.iter().cloned());
+    strip_wrapper_owned_codegen_cfgs(&mut flags);
+    flags.push(format!("-Zcodegen-backend={}", backend_so.display()));
+    if matches!(
+        profile,
+        CodegenProfilePolicy::ReleaseLike | CodegenProfilePolicy::ReleaseLikeWithDebugInfo
+    ) {
+        flags.extend([
+            "-Copt-level=3".to_string(),
+            "-Cdebug-assertions=off".to_string(),
+        ]);
+    }
     flags.extend([
-        format!("-Zcodegen-backend={}", backend_so.display()),
-        "-Copt-level=3".to_string(),
-        "-Cdebug-assertions=off".to_string(),
         "-Zmir-enable-passes=-JumpThreading".to_string(),
+        // Device codegen is whole-program: `collector` walks the call graph from
+        // each `#[kernel]` and must emit every reachable dependency function into
+        // one module. rustc encodes cross-crate MIR only for `#[inline]`/generic
+        // items, so a non-`#[inline]`, non-generic dependency function that cannot
+        // be inlined away (canonically: a recursive one) would be *called* but
+        // never *defined* -> LLVM verification fails with "Symbol <crate>__<fn>
+        // not found". Encode all MIR so any reachable dependency function is
+        // device-compilable. This applies build-wide (like the other required
+        // flags), so it also encodes MIR for host-only deps — an intentional,
+        // interim trade (rmeta size) until a surgical device-dep-scoped or
+        // per-crate device-link path lands. It matches the established approach
+        // for whole-program-MIR tools (e.g. Miri).
+        "-Zalways-encode-mir".to_string(),
         "-Csymbol-mangling-version=v0".to_string(),
     ]);
-    if debug {
+    if profile == CodegenProfilePolicy::ReleaseLikeWithDebugInfo {
         flags.push("-Cdebuginfo=2".to_string());
     }
     flags.join(&ENCODED_RUSTFLAGS_SEPARATOR.to_string())
 }
 
-fn apply_codegen_rustflags(cmd: &mut Command, ctx: &Context, debug: bool, device_cfgs: &[String]) {
-    cmd.env(
-        "CARGO_ENCODED_RUSTFLAGS",
-        build_encoded_rustflags(ctx, debug, device_cfgs),
-    )
-    .env_remove("RUSTFLAGS");
+fn strip_wrapper_owned_codegen_cfgs(flags: &mut Vec<String>) {
+    fn is_wrapper_owned_cfg(value: &str) -> bool {
+        [
+            LEGACY_CODEGEN_FINGERPRINT_CFG,
+            LEGACY_MATERIALIZER_PROVENANCE_CFG,
+        ]
+        .iter()
+        .any(|name| {
+            value
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('='))
+        })
+    }
+
+    let mut retained = Vec::with_capacity(flags.len());
+    let mut index = 0;
+    while index < flags.len() {
+        let flag = &flags[index];
+        if flag == "--cfg"
+            && flags
+                .get(index + 1)
+                .is_some_and(|value| is_wrapper_owned_cfg(value))
+        {
+            index += 2;
+            continue;
+        }
+        if flag
+            .strip_prefix("--cfg=")
+            .is_some_and(is_wrapper_owned_cfg)
+        {
+            index += 1;
+            continue;
+        }
+        retained.push(flag.clone());
+        index += 1;
+    }
+    *flags = retained;
+}
+
+fn command_requests_full_device_debug_with_env(
+    cmd: &Command,
+    inherited_debug: Option<&str>,
+) -> bool {
+    let effective_debug = match cmd
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("CUDA_OXIDE_DEBUG"))
+    {
+        Some((_, Some(value))) => Some(value.to_string_lossy().into_owned()),
+        Some((_, None)) => None,
+        None => inherited_debug.map(str::to_owned),
+    };
+
+    // Shared alias table: the codegen backend parses `CUDA_OXIDE_DEBUG`
+    // with the same function, so every spelling the backend treats as
+    // full debug (including `2`) also disables MIR optimization here.
+    effective_debug.is_some_and(|value| {
+        cuda_artifact_finalizer::DebugPolicy::parse_env_override(&value)
+            == Some(cuda_artifact_finalizer::DebugPolicy::Full)
+    })
+}
+
+fn append_full_debug_mir_rustflag(
+    encoded: &mut String,
+    cmd: &Command,
+    inherited_debug: Option<&str>,
+) {
+    if !command_requests_full_device_debug_with_env(cmd, inherited_debug) {
+        return;
+    }
+    if !encoded.is_empty() {
+        encoded.push(ENCODED_RUSTFLAGS_SEPARATOR);
+    }
+    encoded.push_str("-Zmir-opt-level=0");
+}
+
+fn apply_codegen_rustflags(
+    cmd: &mut Command,
+    ctx: &Context,
+    profile: CodegenProfilePolicy,
+    device_cfgs: &[String],
+) {
+    let mut encoded = build_encoded_rustflags(ctx, profile, device_cfgs);
+    let inherited_debug = std::env::var("CUDA_OXIDE_DEBUG").ok();
+    append_full_debug_mir_rustflag(&mut encoded, cmd, inherited_debug.as_deref());
+
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded)
+        .env_remove("RUSTFLAGS");
+}
+
+/// Apply the two deliberately different Cargo cache boundaries:
+///
+/// - the exact backend binary is global because it compiles every crate;
+/// - mode/architecture/tool settings are an env dependency recorded only by
+///   CUDA macros in crates that can own or instantiate device code.
+fn apply_codegen_configuration(
+    cmd: &mut Command,
+    ctx: &Context,
+    profile: CodegenProfilePolicy,
+    user_device_cfgs: &[String],
+    codegen_fingerprint: &str,
+) -> Result<(), String> {
+    let backend_digest = backend_artifact_digest(&ctx.backend_so)?;
+    let mut global_cfgs = Vec::with_capacity(user_device_cfgs.len() + 1);
+    global_cfgs.push(format!("{BACKEND_IDENTITY_CFG}=\"{backend_digest}\""));
+    global_cfgs.extend(user_device_cfgs.iter().cloned());
+
+    apply_codegen_rustflags(cmd, ctx, profile, &global_cfgs);
+    cmd.env(CODEGEN_FINGERPRINT_ENV, codegen_fingerprint);
+    Ok(())
+}
+
+fn apply_codegen_configuration_or_exit(
+    cmd: &mut Command,
+    ctx: &Context,
+    profile: CodegenProfilePolicy,
+    user_device_cfgs: &[String],
+    codegen_fingerprint: &str,
+) {
+    apply_codegen_configuration(cmd, ctx, profile, user_device_cfgs, codegen_fingerprint)
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
 }
 
 /// Set environment variables for the codegen backend.
@@ -3079,13 +6076,19 @@ fn apply_codegen_rustflags(cmd: &mut Command, ctx: &Context, debug: bool, device
 /// `arch` is an explicit pin (`--arch`); it becomes `CUDA_OXIDE_TARGET`, the
 /// hard override the backend honors as-is. The auto-detected GPU arch is *not*
 /// routed here -- see [`apply_device_arch_hint`].
-fn apply_output_mode(cmd: &mut Command, emit_nvvm_ir: bool, arch: Option<&str>) {
+fn apply_output_mode(
+    cmd: &mut Command,
+    emit_nvvm_ir: bool,
+    arch: Option<&str>,
+    materialization: &MaterializationMode,
+) {
     if let Some(target_arch) = arch {
         cmd.env("CUDA_OXIDE_TARGET", target_arch);
     }
-    if emit_nvvm_ir {
+    if emit_nvvm_ir || materialization.enabled() {
         cmd.env("CUDA_OXIDE_EMIT_NVVM_IR", "1");
     }
+    materialization.apply(cmd);
 }
 
 /// Pin the target GPU backend without changing the codegen shared-object path.
@@ -3133,7 +6136,14 @@ fn apply_config_env(cmd: &mut Command, ctx: &Context) {
     }
 }
 
-fn apply_common_codegen_env(cmd: &mut Command, ctx: &Context, verbose: bool, no_fmad: bool) {
+fn apply_common_codegen_env(
+    cmd: &mut Command,
+    ctx: &Context,
+    verbose: bool,
+    no_fmad: bool,
+    unchecked_indexing: bool,
+    device_debug: DeviceDebug,
+) {
     apply_config_env(cmd, ctx);
     if verbose {
         cmd.env("CUDA_OXIDE_VERBOSE", "1");
@@ -3141,14 +6151,54 @@ fn apply_common_codegen_env(cmd: &mut Command, ctx: &Context, verbose: bool, no_
     if no_fmad {
         cmd.env("CUDA_OXIDE_NO_FMA", "1");
     }
+    if unchecked_indexing {
+        cmd.env("CUDA_OXIDE_UNCHECKED_INDEXING", "1");
+    }
+    // An explicit flag outranks an ambient `CUDA_OXIDE_DEBUG`, matching how
+    // `--no-fmad` outranks `CUDA_OXIDE_NO_FMA`. `DeviceDebug::Off` exports
+    // nothing rather than `off`, so omitting the flag cannot silently cancel a
+    // debug level the environment or project config already asked for.
+    if let Some(level) = device_debug.env_value() {
+        cmd.env("CUDA_OXIDE_DEBUG", level);
+    }
     apply_ld_library_path(cmd, ctx);
 }
 
 /// Give Compute Sanitizer source line attribution without disabling normal
 /// device optimization. An explicit process or project setting remains
-/// authoritative, including an intentional `CUDA_OXIDE_DEBUG=off`.
-fn apply_default_sanitizer_line_tables(cmd: &mut Command, ctx: &Context) {
-    if std::env::var_os("CUDA_OXIDE_DEBUG").is_none()
+/// authoritative, including an intentional `CUDA_OXIDE_DEBUG=off`. So does an
+/// explicit `--lineinfo` / `--device-debug` flag: `apply_common_codegen_env`
+/// has already exported its level onto `cmd`, and the default must not
+/// overwrite it.
+fn apply_default_sanitizer_line_tables(
+    cmd: &mut Command,
+    ctx: &Context,
+    device_debug: DeviceDebug,
+) {
+    apply_default_sanitizer_line_tables_with_env(
+        cmd,
+        ctx,
+        std::env::var_os("CUDA_OXIDE_DEBUG").is_some(),
+        device_debug,
+    );
+}
+
+/// `apply_default_sanitizer_line_tables` with the `CUDA_OXIDE_DEBUG` probe
+/// injected.
+///
+/// `env_debug_set` is presence-only, matching the `var_os` check it replaces.
+/// Injected so a unit test can assert the defaulting without an exported
+/// `CUDA_OXIDE_DEBUG` suppressing it. `device_debug` carries the CLI flag:
+/// any level other than [`DeviceDebug::Off`] is an explicit request that
+/// outranks the line-tables default.
+fn apply_default_sanitizer_line_tables_with_env(
+    cmd: &mut Command,
+    ctx: &Context,
+    env_debug_set: bool,
+    device_debug: DeviceDebug,
+) {
+    if device_debug == DeviceDebug::Off
+        && !env_debug_set
         && project_config_env(ctx, "CUDA_OXIDE_DEBUG").is_none()
     {
         cmd.env("CUDA_OXIDE_DEBUG", "line-tables");
@@ -3161,9 +6211,34 @@ fn apply_interop_device_codegen_options(
     verbose: bool,
     options: InteropDeviceBuildOptions,
 ) {
-    apply_common_codegen_env(cmd, ctx, verbose, options.no_fmad);
+    apply_interop_device_codegen_options_with_env(
+        cmd,
+        ctx,
+        verbose,
+        options,
+        std::env::var_os("CUDA_OXIDE_DEBUG").is_some(),
+    );
+}
+
+/// `apply_interop_device_codegen_options` with the `CUDA_OXIDE_DEBUG` probe
+/// injected, forwarded to `apply_default_sanitizer_line_tables_with_env`.
+fn apply_interop_device_codegen_options_with_env(
+    cmd: &mut Command,
+    ctx: &Context,
+    verbose: bool,
+    options: InteropDeviceBuildOptions,
+    env_debug_set: bool,
+) {
+    apply_common_codegen_env(
+        cmd,
+        ctx,
+        verbose,
+        options.no_fmad,
+        options.unchecked_indexing,
+        DeviceDebug::Off,
+    );
     if options.sanitizer_line_tables {
-        apply_default_sanitizer_line_tables(cmd, ctx);
+        apply_default_sanitizer_line_tables_with_env(cmd, ctx, env_debug_set, DeviceDebug::Off);
     }
 }
 
@@ -3237,7 +6312,25 @@ fn apply_device_arch_hint(
 ///   caller falls through to slot 4 and the backend's feature-based default
 ///   applies.
 fn detect_run_target_arch(arch: Option<&str>, emit_nvvm_ir: bool) -> Option<String> {
-    if arch.is_some() || emit_nvvm_ir || std::env::var_os("CUDA_OXIDE_TARGET").is_some() {
+    detect_run_target_arch_with_env(
+        arch,
+        emit_nvvm_ir,
+        std::env::var_os("CUDA_OXIDE_TARGET").is_some(),
+    )
+}
+
+/// `detect_run_target_arch` with the `CUDA_OXIDE_TARGET` probe injected.
+///
+/// `env_target_set` is presence-only, matching the `var_os` check it replaces.
+/// Injected so a unit test can exercise the slot-2 skip without exporting the
+/// variable: `set_var` would be a data race against the `vars_os` reads the
+/// fingerprint helpers perform on other test threads.
+fn detect_run_target_arch_with_env(
+    arch: Option<&str>,
+    emit_nvvm_ir: bool,
+    env_target_set: bool,
+) -> Option<String> {
+    if arch.is_some() || emit_nvvm_ir || env_target_set {
         return None;
     }
 
@@ -3384,12 +6477,15 @@ fn touch_main_rs(example_dir: &Path) {
     // tests in `main.rs`, perf bench in `bin/<name>.rs`, etc.) all
     // re-codegen on every `cargo oxide run/build` invocation.
     for rel in ["src/main.rs", "src/lib.rs"] {
-        let path = example_dir.join(rel);
-        if path.exists()
-            && let Ok(content) = std::fs::read(&path)
-        {
-            let _ = std::fs::write(&path, content);
-        }
+        touch_source_file(&example_dir.join(rel));
+    }
+}
+
+fn touch_source_file(path: &Path) {
+    if path.exists()
+        && let Ok(content) = std::fs::read(path)
+    {
+        let _ = std::fs::write(path, content);
     }
 }
 
@@ -3402,25 +6498,100 @@ fn artifact_stem(example: &str) -> String {
     example.replace('-', "_")
 }
 
-/// Remove stale generated artifacts (`.ptx`, `.ll`, `.ltoir`, `.cubin`,
-/// `.devbin`) from a previous run so we can verify the build produces fresh
-/// output.
-fn clean_generated_files(example_dir: &Path, example: &str) {
+/// Return the PTX artifacts generated for a regular or metadata-interop project.
+fn ptx_artifact_paths(example_dir: &Path, example: &str) -> Vec<PathBuf> {
+    if let Some(interop) =
+        load_interop_config(example_dir).filter(|config| !config.device_crates.is_empty())
+    {
+        return interop
+            .device_crates
+            .iter()
+            .filter(|device_crate| device_crate.artifact_kind == InteropArtifactKind::Ptx)
+            .map(|device_crate| {
+                let manifest_path = example_dir.join(&device_crate.manifest_path);
+                let artifact_name = interop_device_artifact_name(&manifest_path, device_crate);
+
+                interop_device_artifact_path(example_dir, device_crate, &artifact_name)
+            })
+            .collect();
+    }
+
     let stem = artifact_stem(example);
-    for ext in &[
-        "ptx",
-        "ll",
-        "opt.ll",
-        "ltoir",
-        "cubin",
-        "target",
-        "options",
-        "cubin.target",
-        "devbin",
-    ] {
-        let file = example_dir.join(format!("{}.{}", stem, ext));
+    vec![example_dir.join(format!("{stem}.ptx"))]
+}
+
+fn read_ptx_artifact(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read generated PTX {}: {error}", path.display()))
+}
+
+/// Print one generated PTX artifact.
+fn print_ptx_artifact(path: &Path) -> Result<(), String> {
+    let content = read_ptx_artifact(path)?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    println!();
+    println!("=========================================");
+    println!("PTX ({name})");
+    println!("=========================================");
+    print!("{content}");
+
+    if !content.ends_with('\n') {
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Path to the NVVM IR (`.ll`) the backend emits for `example`. Named after the
+/// Cargo-normalized crate stem, so a hyphenated example resolves to the
+/// underscore-spelled file the build actually wrote. Route `emit-ltoir` reads
+/// through here rather than deriving the name from the raw example.
+fn emitted_ll_path(example_dir: &Path, example: &str) -> PathBuf {
+    example_dir.join(format!("{}.ll", artifact_stem(example)))
+}
+
+/// Default LTOIR output path for `example` when no explicit `--output` is given.
+/// Uses the same Cargo-normalized crate stem as [`emitted_ll_path`] so reads and
+/// writes agree on hyphenated examples.
+fn default_ltoir_path(example_dir: &Path, example: &str) -> PathBuf {
+    example_dir.join(format!("{}.ltoir", artifact_stem(example)))
+}
+
+const GENERATED_ARTIFACT_SUFFIXES: &[&str] = &[
+    "ptx",
+    "ll",
+    "opt.ll",
+    "ltoir",
+    "cubin",
+    "cubin.tmp",
+    "cubin.identity",
+    "ptx.identity",
+    "target",
+    "options",
+    "cubin.target",
+    "devbin",
+];
+
+fn generated_artifact_paths(project_dir: &Path, package_name: &str) -> Vec<PathBuf> {
+    let stem = artifact_stem(package_name);
+
+    GENERATED_ARTIFACT_SUFFIXES
+        .iter()
+        .map(|suffix| project_dir.join(format!("{stem}.{suffix}")))
+        .collect()
+}
+
+/// Remove stale generated artifacts (`.ptx`, `.ll`, `.ltoir`, `.cubin`) from a
+/// previous run so we can verify the build produces fresh output.
+fn clean_generated_files(example_dir: &Path, example: &str) {
+    for file in generated_artifact_paths(example_dir, example) {
         if file.exists() {
-            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_file(file);
         }
     }
 }
@@ -3465,24 +6636,91 @@ const GIT_REPO: &str = "https://github.com/NVlabs/cuda-oxide.git";
 
 const RUST_TOOLCHAIN_TOML: &str = r#"[toolchain]
 channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "rustfmt", "llvm-tools"]
 "#;
 
-/// Scaffold a new standalone cuda-oxide project.
-pub fn scaffold_new(name: &str, async_mode: bool) {
-    let project_dir = PathBuf::from(name);
-    if project_dir.exists() {
-        eprintln!("Error: directory '{}' already exists.", name);
-        std::process::exit(1);
+const SCAFFOLD_GITIGNORE_EXTRA: &[&str] = &[
+    "/target/",
+    "**/*.bc", // bitcode leftovers not in the clean suffix list
+    ".DS_Store",
+];
+
+fn scaffold_gitignore() -> String {
+    let mut lines: Vec<String> = SCAFFOLD_GITIGNORE_EXTRA
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+    // Keep in lockstep with `GENERATED_ARTIFACT_SUFFIXES` so `cargo oxide new`
+    // ignores every artifact `cargo oxide clean` knows how to delete.
+    for suffix in GENERATED_ARTIFACT_SUFFIXES {
+        let pattern = format!("**/*.{suffix}");
+        if !lines.iter().any(|line| line == &pattern) {
+            lines.push(pattern);
+        }
     }
+    // Stable order for readable diffs: keep the three fixed entries first,
+    // then sort generated patterns.
+    let (fixed, rest) = lines.split_at(SCAFFOLD_GITIGNORE_EXTRA.len());
+    let mut rest = rest.to_vec();
+    rest.sort();
+    let mut out = fixed.to_vec();
+    out.append(&mut rest);
+    out.push(String::new());
+    out.join("\n")
+}
 
-    let src_dir = project_dir.join("src");
-    std::fs::create_dir_all(&src_dir).unwrap_or_else(|e| {
-        eprintln!("Error creating directory: {}", e);
-        std::process::exit(1);
-    });
+/// File contents produced by `cargo oxide new`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScaffoldFiles {
+    cargo_toml: String,
+    rust_toolchain_toml: String,
+    gitignore: String,
+    readme: String,
+    main_rs: String,
+}
 
-    let cargo_toml = if async_mode {
+fn scaffold_readme(name: &str, async_mode: bool) -> String {
+    let mode = if async_mode {
+        "async cuda-oxide"
+    } else {
+        "cuda-oxide"
+    };
+    let template_notes = if async_mode {
+        "The template is a vector-add kernel launched through `cuda-async`:\n\
+         `vecadd_async` returns a lazy `DeviceOperation` scheduled on the\n\
+         stream pool. See the cuda-oxide book getting-started chapter for the\n\
+         next steps."
+    } else {
+        "The template is a vector-add kernel. It uses `#[launch_contract]` and\n\
+         `PreparedLaunch` so geometry is checked before launch. See the\n\
+         cuda-oxide book getting-started chapter for the next steps."
+    };
+    format!(
+        r#"# {name}
+
+Scaffolded {mode} project.
+
+## Setup
+
+```bash
+cargo oxide doctor
+```
+
+Fix anything doctor reports before building.
+
+## Run
+
+```bash
+cargo oxide run
+```
+
+{template_notes}
+"#
+    )
+}
+
+fn scaffold_cargo_toml(name: &str, async_mode: bool) -> String {
+    if async_mode {
         format!(
             r#"[package]
 name = "{name}"
@@ -3515,9 +6753,11 @@ cuda-host = {{ git = "{GIT_REPO}" }}
 cuda-core = {{ git = "{GIT_REPO}" }}
 "#
         )
-    };
+    }
+}
 
-    let main_rs = if async_mode {
+fn scaffold_main_rs(async_mode: bool) -> String {
+    if async_mode {
         r#"use cuda_device::{kernel, thread, DisjointSlice};
 use cuda_host::cuda_module;
 use cuda_async::device_context::init_device_contexts;
@@ -3612,15 +6852,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 "#
         .to_string()
     } else {
-        r#"use cuda_device::{kernel, thread, DisjointSlice};
+        r#"use cuda_device::{kernel, launch_bounds, launch_contract, thread, DisjointSlice};
 use cuda_host::cuda_module;
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 
 #[cuda_module]
 mod kernels {
     use super::*;
 
     #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1))]
     pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let idx_raw = idx.get();
@@ -3629,34 +6871,26 @@ mod kernels {
         }
     }
 }
-fn main() {
-    let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
     const N: usize = 1024;
     let a_host: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let b_host: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
 
-    let a_dev = DeviceBuffer::from_host(&stream, &a_host).unwrap();
-    let b_dev = DeviceBuffer::from_host(&stream, &b_host).unwrap();
-    let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    let a_dev = DeviceBuffer::from_host(&stream, &a_host)?;
+    let b_dev = DeviceBuffer::from_host(&stream, &b_host)?;
+    let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N)?;
 
-    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
-    // SAFETY: this is a 1D launch and `vecadd` guards its index against the
-    // output length before writing.
-    unsafe {
-        module.vecadd(
-            &stream,
-            LaunchConfig::for_num_elems(N as u32),
-            &a_dev,
-            &b_dev,
-            &mut c_dev,
-        )
-    }
-    .expect("Kernel launch failed");
+    // SAFETY: this package owns the embedded device bundle produced for the
+    // kernels module above.
+    let module = unsafe { kernels::load(&ctx)? };
+    let prepared = module.prepare_vecadd(LaunchConfig1D::new((N as u32).div_ceil(256), 256, 0))?;
+    module.vecadd(&stream, &prepared, &a_dev, &b_dev, &mut c_dev)?;
 
-    let c_host = c_dev.to_host_vec(&stream).unwrap();
-
+    let c_host = c_dev.to_host_vec(&stream)?;
     let errors = (0..N)
         .filter(|&i| (c_host[i] - (a_host[i] + b_host[i])).abs() > 1e-5)
         .count();
@@ -3667,21 +6901,56 @@ fn main() {
         eprintln!("FAILED: {} errors", errors);
         std::process::exit(1);
     }
+    Ok(())
 }
 "#
         .to_string()
-    };
+    }
+}
 
-    std::fs::write(project_dir.join("Cargo.toml"), cargo_toml).expect("Failed to write Cargo.toml");
-    std::fs::write(project_dir.join("rust-toolchain.toml"), RUST_TOOLCHAIN_TOML)
-        .expect("Failed to write rust-toolchain.toml");
-    std::fs::write(src_dir.join("main.rs"), main_rs).expect("Failed to write src/main.rs");
+fn scaffold_files(name: &str, async_mode: bool) -> ScaffoldFiles {
+    ScaffoldFiles {
+        cargo_toml: scaffold_cargo_toml(name, async_mode),
+        rust_toolchain_toml: RUST_TOOLCHAIN_TOML.to_string(),
+        gitignore: scaffold_gitignore(),
+        readme: scaffold_readme(name, async_mode),
+        main_rs: scaffold_main_rs(async_mode),
+    }
+}
+
+/// Scaffold a new standalone cuda-oxide project.
+pub fn scaffold_new(name: &str, async_mode: bool) {
+    let project_dir = PathBuf::from(name);
+    if project_dir.exists() {
+        eprintln!("Error: directory '{}' already exists.", name);
+        std::process::exit(1);
+    }
+
+    let src_dir = project_dir.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap_or_else(|e| {
+        eprintln!("Error creating directory: {}", e);
+        std::process::exit(1);
+    });
+
+    let files = scaffold_files(name, async_mode);
+    std::fs::write(project_dir.join("Cargo.toml"), files.cargo_toml)
+        .expect("Failed to write Cargo.toml");
+    std::fs::write(
+        project_dir.join("rust-toolchain.toml"),
+        files.rust_toolchain_toml,
+    )
+    .expect("Failed to write rust-toolchain.toml");
+    std::fs::write(project_dir.join(".gitignore"), files.gitignore)
+        .expect("Failed to write .gitignore");
+    std::fs::write(project_dir.join("README.md"), files.readme).expect("Failed to write README.md");
+    std::fs::write(src_dir.join("main.rs"), files.main_rs).expect("Failed to write src/main.rs");
 
     let mode = if async_mode { " (async)" } else { "" };
     println!("✓ Created cuda-oxide project '{}'{}", name, mode);
     println!();
     println!("  cd {}", name);
-    println!("  cargo oxide run {}", name);
+    println!("  cargo oxide doctor");
+    println!("  cargo oxide run");
 }
 
 /// Locate an executable by name, first via `which` (PATH lookup), then by
@@ -3711,13 +6980,28 @@ fn find_cuda_toolkit_executable(
     name: &str,
     fallback_paths: &[&str],
 ) -> Option<PathBuf> {
+    find_cuda_toolkit_executable_with_env(ctx, name, fallback_paths, |key| std::env::var(key).ok())
+}
+
+/// `find_cuda_toolkit_executable` with the ambient environment injected.
+///
+/// The process environment takes precedence over `cuda-oxide.toml`'s `env`, so
+/// resolution has to be injectable for unit tests: a developer with a real
+/// `CUDA_TOOLKIT_PATH` (or `CUDA_HOME`) exported would otherwise shadow the
+/// configured root a test is trying to assert on. Same rationale as
+/// `cuda_toolkit_root` and `cuda_header_candidates`.
+fn find_cuda_toolkit_executable_with_env(
+    ctx: &Context,
+    name: &str,
+    fallback_paths: &[&str],
+    mut get_env: impl FnMut(&str) -> Option<String>,
+) -> Option<PathBuf> {
     if let Some(path) = find_executable(name, &[]) {
         return Some(path);
     }
 
     let toolkit = cuda_toolkit_root(|key| {
-        std::env::var(key)
-            .ok()
+        get_env(key)
             .filter(|value| !value.trim().is_empty())
             .or_else(|| project_config_env(ctx, key).map(str::to_owned))
     });
@@ -3750,12 +7034,76 @@ mod tests {
         encoded.split(ENCODED_RUSTFLAGS_SEPARATOR).collect()
     }
 
-    fn has_codegen_env_fingerprint(flags: &[&str]) -> bool {
+    fn has_backend_identity_cfg(flags: &[&str]) -> bool {
         flags.windows(2).any(|pair| {
             pair[0] == "--cfg"
-                && pair[1].starts_with("cuda_oxide_internal_codegen_env=\"")
+                && pair[1].starts_with("cuda_oxide_internal_backend_identity=\"")
                 && pair[1].ends_with('"')
         })
+    }
+
+    fn is_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    }
+
+    /// `cargo_passthrough_command` with an empty ambient
+    /// `CUDA_OXIDE_MATERIALIZE_CUBIN`.
+    ///
+    /// Every test builds the command through this. Reading the real variable
+    /// would let an exported value override `opts.materialize_cubin` and drive
+    /// the test into materializer discovery, which re-executes the libtest
+    /// binary and then exits the process -- aborting the whole suite instead of
+    /// failing one case.
+    fn passthrough_command_for_test(
+        ctx: &Context,
+        cargo_subcommand: CargoPassthroughSubcommand,
+        opts: &CargoPassthroughOptions<'_>,
+        cargo_args: &[String],
+    ) -> Result<Command, String> {
+        cargo_passthrough_command_with_env(ctx, cargo_subcommand, opts, cargo_args, None)
+    }
+
+    fn cargo_artifact_freshness(
+        ctx: &Context,
+        opts: &CargoPassthroughOptions<'_>,
+        materializer_provenance: Option<&str>,
+    ) -> BTreeMap<String, bool> {
+        let mut cmd = passthrough_command_for_test(
+            ctx,
+            CargoPassthroughSubcommand::Build,
+            opts,
+            &["--message-format=json-render-diagnostics".to_string()],
+        )
+        .unwrap();
+        if let Some(provenance) = materializer_provenance {
+            // Exercise a non-canonical spelling accepted by the backend. The
+            // macro must still track exact provenance rather than keying that
+            // dependency on the wrapper's canonical `1` spelling.
+            cmd.env(MATERIALIZE_ENV, "true");
+            cmd.env(EXPECTED_PROVENANCE_ENV, provenance);
+        }
+        let output = cmd.output().expect("failed to run Cargo cache probe");
+        assert!(
+            output.status.success(),
+            "Cargo cache probe failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8(output.stdout)
+            .expect("Cargo JSON must be UTF-8")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter_map(|message| {
+                Some((
+                    message["target"]["name"].as_str()?.to_string(),
+                    message["fresh"].as_bool()?,
+                ))
+            })
+            .collect()
     }
 
     fn test_context(config: OxideConfig) -> Context {
@@ -3763,7 +7111,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/cargo-oxide-test-workspace"),
             codegen_crate: PathBuf::from("/tmp/cargo-oxide-test-codegen"),
             examples_dir: PathBuf::from("/tmp/cargo-oxide-test-examples"),
-            backend_so: PathBuf::from("/tmp/backend path/librustc_codegen_cuda.so"),
+            backend_so: PathBuf::from("llvm"),
             is_workspace: false,
             config,
         }
@@ -3778,9 +7126,106 @@ mod tests {
     }
 
     #[test]
+    fn strict_materialization_boolean_rejects_presence_only_values() {
+        for value in ["1", "true", " YES ", "on"] {
+            assert!(parse_strict_bool(MATERIALIZE_ENV, value).unwrap());
+        }
+        for value in ["0", "false", " NO ", "off"] {
+            assert!(!parse_strict_bool(MATERIALIZE_ENV, value).unwrap());
+        }
+        for value in ["", "enabled", "2"] {
+            let error = parse_strict_bool(MATERIALIZE_ENV, value).unwrap_err();
+            assert!(error.contains("must be a boolean"), "{error}");
+        }
+    }
+
+    #[test]
+    fn materialization_rejects_nvvm_ir_as_a_competing_final_output() {
+        let error = prepare_materialization_result(
+            &test_context(OxideConfig::default()),
+            true,
+            Some("sm_90"),
+            true,
+        )
+        .expect_err("the two user-facing final output modes must conflict");
+
+        assert!(error.contains("cannot be combined with --emit-nvvm-ir"));
+    }
+
+    #[test]
+    fn materializer_discovery_uses_the_same_project_tool_environment_as_rustc() {
+        let configured_libdevice = "/configured/cuda/nvvm/libdevice/libdevice.10.bc";
+        let ctx = test_context(OxideConfig {
+            env: vec![
+                (
+                    "CUDA_OXIDE_LIBDEVICE".to_string(),
+                    configured_libdevice.to_string(),
+                ),
+                (
+                    "CUDA_TOOLKIT_PATH".to_string(),
+                    "/configured/cuda".to_string(),
+                ),
+                (
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/configured/cuda/lib64".to_string(),
+                ),
+            ],
+            ..OxideConfig::default()
+        });
+        let discovery = materializer_discovery_command(&ctx, Path::new("/fake/cargo-oxide"));
+        let mut rustc_child = Command::new("cargo");
+        apply_common_codegen_env(
+            &mut rustc_child,
+            &ctx,
+            false,
+            false,
+            false,
+            DeviceDebug::Off,
+        );
+
+        for key in [
+            "CUDA_OXIDE_LIBDEVICE",
+            "CUDA_TOOLKIT_PATH",
+            "LD_LIBRARY_PATH",
+        ] {
+            assert_eq!(
+                command_env(&discovery, key),
+                command_env(&rustc_child, key),
+                "discovery and rustc must see the same {key}"
+            );
+        }
+        if std::env::var_os("CUDA_OXIDE_LIBDEVICE").is_none() {
+            assert_eq!(
+                command_env(&discovery, "CUDA_OXIDE_LIBDEVICE").as_deref(),
+                Some(configured_libdevice)
+            );
+        }
+    }
+
+    #[test]
     fn artifact_stem_normalizes_hyphens_like_cargo() {
         assert_eq!(artifact_stem("rustlantis-smoke"), "rustlantis_smoke");
         assert_eq!(artifact_stem("vecadd"), "vecadd");
+    }
+
+    #[test]
+    fn emit_ltoir_paths_use_normalized_crate_stem() {
+        // Regression for the emit-ltoir read/write mismatch on hyphenated
+        // crates: the backend writes `rustlantis_smoke.{ll,ltoir}`, so both the
+        // NVVM IR read and the default LTOIR write must resolve to the
+        // underscore stem rather than the raw example name.
+        let dir = Path::new("/tmp/cargo-oxide-emit-ltoir");
+        assert_eq!(
+            emitted_ll_path(dir, "rustlantis-smoke"),
+            dir.join("rustlantis_smoke.ll")
+        );
+        assert_eq!(
+            default_ltoir_path(dir, "rustlantis-smoke"),
+            dir.join("rustlantis_smoke.ltoir")
+        );
+        // A non-hyphenated example is unaffected.
+        assert_eq!(emitted_ll_path(dir, "vecadd"), dir.join("vecadd.ll"));
+        assert_eq!(default_ltoir_path(dir, "vecadd"), dir.join("vecadd.ltoir"));
     }
 
     #[test]
@@ -3813,6 +7258,154 @@ mod tests {
             b"persistent cache entry"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_removes_only_local_target_and_matching_artifacts() {
+        let root = unique_temp_dir("cargo_oxide_clean_standalone");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[package]
+name = "my-kernel"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        for suffix in GENERATED_ARTIFACT_SUFFIXES {
+            std::fs::write(root.join(format!("my_kernel.{suffix}")), b"generated").unwrap();
+        }
+
+        let unrelated_artifact = root.join("other_kernel.ptx");
+        std::fs::write(&unrelated_artifact, b"preserve").unwrap();
+
+        let cached_cubin =
+            root.join(".oxide-artifacts/ltoir-cubin-cache/v1/entries/key/image.cubin");
+        std::fs::create_dir_all(cached_cubin.parent().unwrap()).unwrap();
+        std::fs::write(&cached_cubin, b"persistent cache").unwrap();
+
+        let ctx = Context {
+            workspace_root: root.clone(),
+            codegen_crate: root.clone(),
+            examples_dir: root.clone(),
+            backend_so: root.join("unused-backend.so"),
+            is_workspace: false,
+            config: OxideConfig::default(),
+        };
+
+        let summary = clean_context(&ctx).unwrap();
+
+        assert_eq!(summary.removed_directories, 1);
+        assert_eq!(summary.removed_files, GENERATED_ARTIFACT_SUFFIXES.len());
+        assert!(!root.join("target").exists());
+
+        for suffix in GENERATED_ARTIFACT_SUFFIXES {
+            assert!(!root.join(format!("my_kernel.{suffix}")).exists());
+        }
+
+        assert_eq!(std::fs::read(&unrelated_artifact).unwrap(), b"preserve");
+        assert_eq!(std::fs::read(&cached_cubin).unwrap(), b"persistent cache");
+
+        let second_summary = clean_context(&ctx).unwrap();
+
+        assert_eq!(second_summary, CleanSummary::default());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_clean_removes_root_backend_and_example_targets() {
+        let root = unique_temp_dir("cargo_oxide_clean_workspace");
+        let codegen_crate = root.join("crates/rustc-codegen-cuda");
+        let examples_dir = codegen_crate.join("examples");
+        let example_dir = examples_dir.join("demo");
+
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(codegen_crate.join("target/debug")).unwrap();
+        std::fs::create_dir_all(example_dir.join("target/debug")).unwrap();
+
+        std::fs::write(
+            example_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(example_dir.join("demo.ptx"), b"generated").unwrap();
+
+        let ctx = Context {
+            workspace_root: root.clone(),
+            codegen_crate: codegen_crate.clone(),
+            examples_dir,
+            backend_so: root.join("unused-backend.so"),
+            is_workspace: true,
+            config: OxideConfig::default(),
+        };
+
+        let summary = clean_context(&ctx).unwrap();
+
+        assert_eq!(summary.removed_directories, 3);
+        assert_eq!(summary.removed_files, 1);
+        assert!(!root.join("target").exists());
+        assert!(!codegen_crate.join("target").exists());
+        assert!(!example_dir.join("target").exists());
+        assert!(!example_dir.join("demo.ptx").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_refuses_symlinked_target_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("cargo_oxide_clean_symlink");
+        let external = unique_temp_dir("cargo_oxide_clean_external");
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("sentinel"), b"preserve").unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[package]
+name = "symlink-test"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        symlink(&external, root.join("target")).unwrap();
+
+        let ctx = Context {
+            workspace_root: root.clone(),
+            codegen_crate: root.clone(),
+            examples_dir: root.clone(),
+            backend_so: root.join("unused-backend.so"),
+            is_workspace: false,
+            config: OxideConfig::default(),
+        };
+
+        let error = clean_context(&ctx).unwrap_err();
+
+        assert!(error.contains("symlinked target directory"), "{error}");
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(external).unwrap();
     }
 
     #[test]
@@ -4394,14 +7987,16 @@ path = "src/other.rs"
         let ctx = test_context(OxideConfig::default());
         let mut cmd = Command::new("cargo");
 
-        apply_interop_device_codegen_options(
+        apply_interop_device_codegen_options_with_env(
             &mut cmd,
             &ctx,
             false,
             InteropDeviceBuildOptions {
                 no_fmad: true,
+                unchecked_indexing: false,
                 sanitizer_line_tables: true,
             },
+            false,
         );
 
         assert_eq!(command_env(&cmd, "CUDA_OXIDE_NO_FMA").as_deref(), Some("1"));
@@ -4410,17 +8005,49 @@ path = "src/other.rs"
             Some("line-tables")
         );
 
-        let fingerprint = sanitize_codegen_fingerprint_cfg(
+        let fingerprint = sanitize_codegen_fingerprint(
             &ctx,
             false,
             true,
+            false,
+            DeviceDebug::Off,
             Some("sm_80"),
             None,
             Some(Path::new("/tmp/generated-ptx")),
+            &MaterializationMode::default(),
         );
-        apply_codegen_rustflags(&mut cmd, &ctx, false, &[fingerprint]);
+        apply_codegen_configuration(
+            &mut cmd,
+            &ctx,
+            CodegenProfilePolicy::ReleaseLike,
+            &[],
+            &fingerprint,
+        )
+        .unwrap();
         let encoded = command_env(&cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
-        assert!(has_codegen_env_fingerprint(&decoded_rustflags(&encoded)));
+        assert!(has_backend_identity_cfg(&decoded_rustflags(&encoded)));
+        assert_eq!(
+            command_env(&cmd, CODEGEN_FINGERPRINT_ENV).as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn sanitize_device_debug_flag_overrides_the_line_tables_default() {
+        let ctx = test_context(OxideConfig::default());
+        let mut cmd = Command::new("cargo");
+
+        // Mirror codegen_build_host_binary's ordering: the flag's level lands
+        // on `cmd` first, then the sanitizer default runs. `env_debug_set` is
+        // injected as false, so with no ambient CUDA_OXIDE_DEBUG the explicit
+        // flag alone must suppress the line-tables default.
+        apply_common_codegen_env(&mut cmd, &ctx, false, false, false, DeviceDebug::Full);
+        apply_default_sanitizer_line_tables_with_env(&mut cmd, &ctx, false, DeviceDebug::Full);
+
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_DEBUG").as_deref(),
+            Some("full")
+        );
     }
 
     #[test]
@@ -4428,11 +8055,12 @@ path = "src/other.rs"
         let ctx = test_context(OxideConfig::default());
         let mut cmd = Command::new("cargo");
 
-        apply_interop_device_codegen_options(
+        apply_interop_device_codegen_options_with_env(
             &mut cmd,
             &ctx,
             false,
-            InteropDeviceBuildOptions::standard(true),
+            InteropDeviceBuildOptions::standard(true, false),
+            false,
         );
 
         assert_eq!(command_env(&cmd, "CUDA_OXIDE_NO_FMA").as_deref(), Some("1"));
@@ -4440,16 +8068,89 @@ path = "src/other.rs"
     }
 
     #[test]
+    fn interop_fingerprint_tracks_artifact_mode_and_device_features() {
+        let ctx = test_context(OxideConfig::default());
+        let fingerprint = |emit_nvvm_ir: bool, device_features: Option<&str>| {
+            interop_codegen_fingerprint(
+                &ctx,
+                false,
+                false,
+                false,
+                DeviceDebug::Off,
+                Some("sm_120a"),
+                None,
+                Path::new("/tmp/cuda-oxide-artifacts"),
+                emit_nvvm_ir,
+                device_features,
+                false,
+                &MaterializationMode::default(),
+            )
+        };
+
+        assert_ne!(fingerprint(false, None), fingerprint(true, None));
+        assert_ne!(
+            fingerprint(true, None),
+            fingerprint(true, Some("tensor-cores"))
+        );
+    }
+
+    #[test]
+    fn interop_codegen_forwards_unchecked_indexing() {
+        let ctx = test_context(OxideConfig::default());
+        let mut cmd = Command::new("cargo");
+
+        apply_interop_device_codegen_options_with_env(
+            &mut cmd,
+            &ctx,
+            false,
+            InteropDeviceBuildOptions::standard(false, true),
+            false,
+        );
+
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_UNCHECKED_INDEXING").as_deref(),
+            Some("1")
+        );
+        assert_eq!(command_env(&cmd, "CUDA_OXIDE_NO_FMA"), None);
+    }
+
+    #[test]
     fn sanitize_fingerprint_tracks_output_affecting_settings() {
         let ctx = test_context(OxideConfig::default());
-        let base = sanitize_codegen_fingerprint_cfg(&ctx, false, false, None, Some("sm_80"), None);
+        // Empty inherited environment, matching
+        // `passthrough_fingerprint_tracks_output_affecting_settings`. An
+        // ambient CUDA_OXIDE_NO_FMA / CUDA_OXIDE_UNCHECKED_INDEXING is folded
+        // into the digest on its own, so reading the real environment would
+        // make toggling the corresponding argument a no-op and collapse these
+        // fingerprints onto the base.
+        let inherited_env = BTreeMap::new();
+        let fingerprint = |no_fmad: bool,
+                           unchecked_indexing: bool,
+                           target_arch: Option<&str>,
+                           detected_device_arch: Option<&str>,
+                           ptx_dir: Option<&Path>| {
+            sanitize_codegen_fingerprint_with_env(
+                &ctx,
+                false,
+                no_fmad,
+                unchecked_indexing,
+                DeviceDebug::Off,
+                target_arch,
+                detected_device_arch,
+                ptx_dir,
+                &MaterializationMode::default(),
+                &inherited_env,
+            )
+        };
+
+        let base = fingerprint(false, false, None, Some("sm_80"), None);
 
         for changed in [
-            sanitize_codegen_fingerprint_cfg(&ctx, false, true, None, Some("sm_80"), None),
-            sanitize_codegen_fingerprint_cfg(&ctx, false, false, None, Some("sm_90"), None),
-            sanitize_codegen_fingerprint_cfg(&ctx, false, false, Some("sm_80"), None, None),
-            sanitize_codegen_fingerprint_cfg(
-                &ctx,
+            fingerprint(true, false, None, Some("sm_80"), None),
+            fingerprint(false, true, None, Some("sm_80"), None),
+            fingerprint(false, false, None, Some("sm_90"), None),
+            fingerprint(false, false, Some("sm_80"), None, None),
+            fingerprint(
                 false,
                 false,
                 None,
@@ -4462,17 +8163,38 @@ path = "src/other.rs"
     }
 
     #[test]
-    fn sanitizer_tool_lookup_uses_project_cuda_toolkit_root() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cargo_oxide_sanitizer_tool_{}_{}",
-            std::process::id(),
-            unique
-        ));
-        let tool = root.join("bin/cuda-oxide-test-sanitizer");
+    fn pipeline_diagnostics_have_a_distinct_device_fingerprint() {
+        let ctx = test_context(OxideConfig::default());
+        let materialization = MaterializationMode::default();
+        let standard = standard_codegen_fingerprint(
+            &ctx,
+            true,
+            false,
+            false,
+            DeviceDebug::Off,
+            false,
+            Some("sm_86"),
+            None,
+            "cuda",
+            &materialization,
+        );
+        let pipeline = pipeline_codegen_fingerprint(
+            &ctx,
+            false,
+            false,
+            DeviceDebug::Off,
+            false,
+            Some("sm_86"),
+            &materialization,
+        );
+
+        assert_ne!(standard, pipeline);
+    }
+
+    /// A `Context` whose `cuda-oxide.toml` points `CUDA_TOOLKIT_PATH` at
+    /// `root`, alongside a fake executable named `name` under `root/bin`.
+    fn toolkit_context_with_tool(root: &Path, name: &str) -> (Context, PathBuf) {
+        let tool = root.join("bin").join(name);
         std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
         std::fs::write(&tool, b"fake tool").unwrap();
         let ctx = test_context(OxideConfig {
@@ -4482,19 +8204,141 @@ path = "src/other.rs"
             )],
             ..OxideConfig::default()
         });
+        (ctx, tool)
+    }
 
+    #[test]
+    fn sanitizer_tool_lookup_uses_project_cuda_toolkit_root() {
+        let root = unique_temp_dir("cargo_oxide_sanitizer_tool");
+        let (ctx, tool) = toolkit_context_with_tool(&root, "cuda-oxide-test-sanitizer");
+
+        // `|_| None` stands in for an empty ambient environment. Reading the
+        // real one would let an exported CUDA_TOOLKIT_PATH/CUDA_HOME shadow the
+        // configured root this test asserts on.
         assert_eq!(
-            find_cuda_toolkit_executable(&ctx, "cuda-oxide-test-sanitizer", &[]),
+            find_cuda_toolkit_executable_with_env(&ctx, "cuda-oxide-test-sanitizer", &[], |_| None),
             Some(tool)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn encoded_rustflags_preserve_inherited_flags_but_required_flags_win() {
+    fn doctor_compute_sanitizer_lookup_matches_sanitize_discovery() {
+        // Hermetic: a fake tool name keeps the user's real PATH (and any
+        // installed compute-sanitizer) out of the lookup, the injected empty
+        // environment keeps an exported toolkit root out of it, and the shared
+        // fallback const exercises the exact argument both `doctor` and
+        // `sanitize` pass. The configured toolkit root wins before any
+        // fallback path is consulted.
+        let root = unique_temp_dir("cargo_oxide_doctor_sanitizer");
+        let (ctx, tool) = toolkit_context_with_tool(&root, "cuda-oxide-test-doctor-sanitizer");
+
+        assert_eq!(
+            find_cuda_toolkit_executable_with_env(
+                &ctx,
+                "cuda-oxide-test-doctor-sanitizer",
+                COMPUTE_SANITIZER_FALLBACK_PATHS,
+                |_| None,
+            ),
+            Some(tool)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambient_cuda_toolkit_path_shadows_the_project_configured_root() {
+        // The precedence the two lookups above have to be insulated from: an
+        // exported CUDA_TOOLKIT_PATH outranks `cuda-oxide.toml`, so a tool
+        // present only under the configured root is not found.
+        let root = unique_temp_dir("cargo_oxide_ambient_shadow");
+        let (ctx, _tool) = toolkit_context_with_tool(&root, "cuda-oxide-test-shadowed-sanitizer");
+        let ambient = unique_temp_dir("cargo_oxide_ambient_root");
+
+        assert_eq!(
+            find_cuda_toolkit_executable_with_env(
+                &ctx,
+                "cuda-oxide-test-shadowed-sanitizer",
+                &[],
+                |key| (key == "CUDA_TOOLKIT_PATH").then(|| ambient.to_string_lossy().into_owned()),
+            ),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_passthrough_defers_profile_flags_to_cargo_and_keeps_invariants() {
         let rustflags = build_encoded_rustflags_with_existing(
             Path::new("/tmp/librustc_codegen_cuda.so"),
-            false,
+            CargoPassthroughSubcommand::Test.codegen_profile(),
+            &[],
+            &["--cfg".to_string(), "device_test".to_string()],
+            None,
+            None,
+        );
+        let flags = decoded_rustflags(&rustflags);
+
+        assert_eq!(
+            flags,
+            [
+                "--cfg",
+                "device_test",
+                "-Zcodegen-backend=/tmp/librustc_codegen_cuda.so",
+                "-Zmir-enable-passes=-JumpThreading",
+                "-Zalways-encode-mir",
+                "-Csymbol-mangling-version=v0",
+            ]
+        );
+        assert!(!flags.iter().any(|flag| flag.starts_with("-Copt-level")));
+        assert!(
+            !flags
+                .iter()
+                .any(|flag| flag.starts_with("-Cdebug-assertions"))
+        );
+        assert!(!flags.iter().any(|flag| flag.starts_with("-Cdebuginfo")));
+
+        let ctx = test_context(OxideConfig::default());
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: None,
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+        for cargo_args in [
+            vec!["--release".to_string()],
+            vec!["--profile".to_string(), "ci".to_string()],
+        ] {
+            let cmd = passthrough_command_for_test(
+                &ctx,
+                CargoPassthroughSubcommand::Test,
+                &opts,
+                &cargo_args,
+            )
+            .unwrap();
+            let mut expected = vec!["test".to_string()];
+            expected.extend(cargo_args);
+            assert_eq!(
+                cmd.get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn build_passthrough_retains_release_profile_and_required_flags() {
+        let rustflags = build_encoded_rustflags_with_existing(
+            Path::new("/tmp/librustc_codegen_cuda.so"),
+            CargoPassthroughSubcommand::Build.codegen_profile(),
             &[],
             &[],
             Some(
@@ -4508,12 +8352,13 @@ path = "src/other.rs"
         assert!(flags.contains(&"-Copt-level=0"));
         assert!(flags.contains(&"-Zcodegen-backend=llvm"));
         assert_eq!(
-            &flags[flags.len() - 5..],
+            &flags[flags.len() - 6..],
             [
                 "-Zcodegen-backend=/tmp/librustc_codegen_cuda.so",
                 "-Copt-level=3",
                 "-Cdebug-assertions=off",
                 "-Zmir-enable-passes=-JumpThreading",
+                "-Zalways-encode-mir",
                 "-Csymbol-mangling-version=v0",
             ]
         );
@@ -4524,7 +8369,7 @@ path = "src/other.rs"
     fn encoded_rustflags_preserve_configured_flag_boundaries_and_spaces() {
         let rustflags = build_encoded_rustflags_with_existing(
             Path::new("/tmp/backend path/librustc_codegen_cuda.so"),
-            false,
+            CodegenProfilePolicy::ReleaseLike,
             &["--cfg".to_string(), "model=\"alpha beta\"".to_string()],
             &[],
             None,
@@ -4539,16 +8384,55 @@ path = "src/other.rs"
         );
         assert_eq!(&flags[2..4], ["-L", "native=/nix/store/cuda-cudart/lib"]);
         assert_eq!(
-            flags[flags.len() - 5],
+            flags[flags.len() - 6],
             "-Zcodegen-backend=/tmp/backend path/librustc_codegen_cuda.so"
         );
     }
 
     #[test]
-    fn encoded_rustflags_ignore_empty_existing_flags() {
+    fn encoded_rustflags_remove_legacy_global_codegen_fingerprints() {
+        let encoded = [
+            "--cfg",
+            "cuda_oxide_internal_codegen_env=\"inherited\"",
+            "--cfg=cuda_oxide_internal_materializer_provenance=\"inherited\"",
+            "--cfg",
+            "keep_inherited",
+        ]
+        .join(&ENCODED_RUSTFLAGS_SEPARATOR.to_string());
         let rustflags = build_encoded_rustflags_with_existing(
             Path::new("/tmp/librustc_codegen_cuda.so"),
-            true,
+            CodegenProfilePolicy::ReleaseLike,
+            &[
+                "--cfg".to_string(),
+                "cuda_oxide_internal_codegen_env=\"configured\"".to_string(),
+                "--cfg".to_string(),
+                "keep_configured".to_string(),
+            ],
+            &[
+                "--cfg".to_string(),
+                "cuda_oxide_internal_materializer_provenance=\"explicit\"".to_string(),
+                "--cfg".to_string(),
+                "keep_explicit".to_string(),
+            ],
+            Some(&encoded),
+            None,
+        );
+        let flags = decoded_rustflags(&rustflags);
+
+        assert!(!flags.iter().any(|flag| {
+            flag.contains(LEGACY_CODEGEN_FINGERPRINT_CFG)
+                || flag.contains(LEGACY_MATERIALIZER_PROVENANCE_CFG)
+        }));
+        for retained in ["keep_configured", "keep_inherited", "keep_explicit"] {
+            assert!(flags.contains(&retained));
+        }
+    }
+
+    #[test]
+    fn debug_profile_retains_release_defaults_and_adds_debuginfo() {
+        let rustflags = build_encoded_rustflags_with_existing(
+            Path::new("/tmp/librustc_codegen_cuda.so"),
+            CodegenProfilePolicy::ReleaseLikeWithDebugInfo,
             &[],
             &[],
             None,
@@ -4556,7 +8440,12 @@ path = "src/other.rs"
         );
         let flags = decoded_rustflags(&rustflags);
 
+        assert!(flags.contains(&"-Copt-level=3"));
+        assert!(flags.contains(&"-Cdebug-assertions=off"));
         assert!(flags.contains(&"-Cdebuginfo=2"));
+        assert!(flags.contains(&"-Zmir-enable-passes=-JumpThreading"));
+        assert!(flags.contains(&"-Zalways-encode-mir"));
+        assert!(flags.contains(&"-Csymbol-mangling-version=v0"));
         assert!(!flags.contains(&""));
     }
 
@@ -4601,6 +8490,257 @@ MY_BUILD_FLAG = "configured"
     }
 
     #[test]
+    fn inspect_oxide_config_missing_is_informational() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_config_missing_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(matches!(
+            inspect_oxide_config(&root),
+            OxideConfigInspection::Missing
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_oxide_config_rejects_bad_toml_and_arch() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_config_bad_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(cargo_dir.join("cuda-oxide.toml"), "default-arch = [\n").unwrap();
+        match inspect_oxide_config(&root) {
+            OxideConfigInspection::Invalid { errors, .. } => {
+                assert!(errors.iter().any(|e| e.contains("could not parse")));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        std::fs::write(
+            cargo_dir.join("cuda-oxide.toml"),
+            "default-arch = \"sm_9x\"\n",
+        )
+        .unwrap();
+        match inspect_oxide_config(&root) {
+            OxideConfigInspection::Invalid { errors, .. } => {
+                assert!(errors.iter().any(|e| e.contains("default-arch")));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `default-arch` load-time validation must be exactly as permissive as
+    /// the consumers: `parse_nvvm_arch` (NVVM path) accepts `sm_XX`,
+    /// `compute_XX`, and bare `XX`, so none of those may fail the load.
+    /// Non-`sm_XX` spellings only earn an advisory warning.
+    #[test]
+    fn default_arch_validation_matches_the_real_arch_parser() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_config_arch_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        let config_path = cargo_dir.join("cuda-oxide.toml");
+
+        for accepted in ["sm_80", "sm_90a", "sm_100f", "sm_120"] {
+            std::fs::write(&config_path, format!("default-arch = \"{accepted}\"\n")).unwrap();
+            match inspect_oxide_config(&root) {
+                OxideConfigInspection::Valid { warnings, .. } => {
+                    assert!(warnings.is_empty(), "unexpected warnings for {accepted}");
+                }
+                other => panic!("expected {accepted} to be Valid, got {other:?}"),
+            }
+        }
+
+        // Spellings that genuinely work today (the NVVM path normalizes
+        // them) load fine but get the preferred-spelling advice.
+        for (works_with_warning, preferred) in [("compute_90", "sm_90"), ("90", "sm_90")] {
+            std::fs::write(
+                &config_path,
+                format!("default-arch = \"{works_with_warning}\"\n"),
+            )
+            .unwrap();
+            match inspect_oxide_config(&root) {
+                OxideConfigInspection::Valid { config, warnings } => {
+                    assert_eq!(config.default_arch.as_deref(), Some(works_with_warning));
+                    assert!(
+                        warnings.iter().any(|w| w.contains(preferred)),
+                        "expected a `{preferred}` spelling advisory for \
+                         {works_with_warning}, got {warnings:?}"
+                    );
+                }
+                other => panic!("expected {works_with_warning} to be Valid, got {other:?}"),
+            }
+        }
+
+        for rejected in ["sm_9", "sm_90x", "hopper"] {
+            std::fs::write(&config_path, format!("default-arch = \"{rejected}\"\n")).unwrap();
+            match inspect_oxide_config(&root) {
+                OxideConfigInspection::Invalid { errors, .. } => {
+                    assert!(
+                        errors.iter().any(|e| e.contains("default-arch")),
+                        "expected a default-arch error for {rejected}, got {errors:?}"
+                    );
+                }
+                other => panic!("expected {rejected} to be Invalid, got {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_oxide_config_warns_on_forbidden_env_keys() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_config_warn_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("cuda-oxide.toml"),
+            r#"
+default-arch = "sm_90a"
+
+[env]
+RUSTFLAGS = "-C opt-level=3"
+CARGO_ENCODED_RUSTFLAGS = "legacy"
+MY_OK = "1"
+"#,
+        )
+        .unwrap();
+
+        match inspect_oxide_config(&root) {
+            OxideConfigInspection::Valid { config, warnings } => {
+                assert_eq!(config.default_arch.as_deref(), Some("sm_90a"));
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.contains("RUSTFLAGS") && w.contains("ignored"))
+                );
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.contains("CARGO_ENCODED_RUSTFLAGS") && w.contains("ignored"))
+                );
+            }
+            other => panic!("expected Valid with warnings, got {other:?}"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_survives_malformed_config_and_reports_the_failed_check() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_doctor_config_bad_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(cargo_dir.join("cuda-oxide.toml"), "default-arch = [\n").unwrap();
+
+        // Passive context resolution must not exit: it degrades to defaults
+        // so the doctor scan can start at all.
+        assert_eq!(load_oxide_config_lenient(&root), OxideConfig::default());
+
+        // Doctor's own check re-inspects the file and fails.
+        let check = check_oxide_config(&root);
+        assert!(check.failed);
+        assert!(check.headline.starts_with('✗'), "{}", check.headline);
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|line| line.contains("could not parse")),
+            "{:?}",
+            check.details
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_env_rustflags_warning_without_failing_the_check() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_doctor_config_warn_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let cargo_dir = root.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).unwrap();
+        std::fs::write(
+            cargo_dir.join("cuda-oxide.toml"),
+            "default-arch = \"sm_90a\"\n\n[env]\nRUSTFLAGS = \"-C opt-level=3\"\n",
+        )
+        .unwrap();
+
+        let check = check_oxide_config(&root);
+        assert!(!check.failed);
+        assert!(check.headline.contains("default-arch = sm_90a"));
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|line| line.contains("RUSTFLAGS") && line.contains("ignored")),
+            "{:?}",
+            check.details
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_reports_missing_config_as_informational() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo_oxide_doctor_config_missing_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let check = check_oxide_config(&root);
+        assert!(!check.failed);
+        assert_eq!(check.headline, "- not present (using defaults)");
+        assert!(check.details.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn passthrough_command_preserves_argv_and_cli_overrides_config_defaults() {
         let config = OxideConfig {
             extra_rustflags: vec!["--cfg".to_string(), "from_config".to_string()],
@@ -4626,6 +8766,9 @@ MY_BUILD_FLAG = "configured"
             device_cfgs: &device_cfgs,
             no_fmad: false,
             target_backend: Some("maca"),
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
         };
         let cargo_args = vec![
             "-p".to_string(),
@@ -4634,7 +8777,13 @@ MY_BUILD_FLAG = "configured"
             "--nocapture".to_string(),
         ];
 
-        let cmd = cargo_passthrough_command(&ctx, "test", &opts, &cargo_args).unwrap();
+        let cmd = passthrough_command_for_test(
+            &ctx,
+            CargoPassthroughSubcommand::Test,
+            &opts,
+            &cargo_args,
+        )
+        .unwrap();
         assert_eq!(
             cmd.get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
@@ -4682,7 +8831,14 @@ MY_BUILD_FLAG = "configured"
                 .windows(2)
                 .any(|pair| pair == ["--cfg", "model=\"alpha beta\""])
         );
-        assert!(has_codegen_env_fingerprint(&flags));
+        assert!(has_backend_identity_cfg(&flags));
+        assert!(!flags.iter().any(|flag| {
+            flag.contains("cuda_oxide_internal_codegen_env")
+                || flag.contains("cuda_oxide_internal_materializer_provenance")
+        }));
+        assert!(is_sha256(
+            &command_env(&cmd, CODEGEN_FINGERPRINT_ENV).unwrap()
+        ));
         assert!(
             cmd.get_envs()
                 .any(|(key, value)| key == OsStr::new("RUSTFLAGS") && value.is_none())
@@ -4702,15 +8858,247 @@ MY_BUILD_FLAG = "configured"
             device_cfgs: &[],
             no_fmad: false,
             target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
         };
 
-        let cmd = cargo_passthrough_command(&ctx, "test", &opts, &[]).unwrap();
+        let cmd = passthrough_command_for_test(&ctx, CargoPassthroughSubcommand::Test, &opts, &[])
+            .unwrap();
         assert_eq!(
             cmd.get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             ["test"]
         );
+    }
+
+    #[test]
+    fn architecture_and_output_mode_do_not_change_global_rustflags() {
+        let ctx = test_context(OxideConfig::default());
+        let base = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+        let base_cmd =
+            passthrough_command_for_test(&ctx, CargoPassthroughSubcommand::Build, &base, &[])
+                .unwrap();
+        let different_mode = CargoPassthroughOptions {
+            emit_nvvm_ir: true,
+            arch: Some("sm_90"),
+            ..base
+        };
+        let different_cmd = passthrough_command_for_test(
+            &ctx,
+            CargoPassthroughSubcommand::Build,
+            &different_mode,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_env(&base_cmd, "CARGO_ENCODED_RUSTFLAGS"),
+            command_env(&different_cmd, "CARGO_ENCODED_RUSTFLAGS"),
+            "architecture/output switches must not invalidate every dependency"
+        );
+        assert_ne!(
+            command_env(&base_cmd, CODEGEN_FINGERPRINT_ENV),
+            command_env(&different_cmd, CODEGEN_FINGERPRINT_ENV),
+            "device owners still need a distinct Cargo identity"
+        );
+    }
+
+    #[test]
+    fn codegen_mode_changes_rebuild_only_the_tracked_device_owner() {
+        let root = unique_temp_dir("cargo_oxide_scoped_codegen_fingerprint");
+        let target = root.join("target");
+        for path in [
+            root.join("shared-dep/src"),
+            root.join("tracked-macro/src"),
+            root.join("device-owner/src"),
+            root.join("device-consumer/src"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+resolver = "3"
+members = ["shared-dep", "tracked-macro", "device-owner", "device-consumer"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared-dep/Cargo.toml"),
+            r#"[package]
+name = "shared-dep"
+version = "0.0.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared-dep/src/lib.rs"),
+            "pub fn shared_value() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tracked-macro/Cargo.toml"),
+            r#"[package]
+name = "tracked-macro"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tracked-macro/src/lib.rs"),
+            format!(
+                r#"#![feature(proc_macro_tracked_env)]
+extern crate proc_macro;
+
+#[proc_macro]
+pub fn track_codegen(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {{
+    let _ = proc_macro::tracked::env_var({CODEGEN_FINGERPRINT_ENV:?});
+    let _ = proc_macro::tracked::env_var({MATERIALIZE_ENV:?});
+    let _ = proc_macro::tracked::env_var({EXPECTED_PROVENANCE_ENV:?});
+    "()".parse().unwrap()
+}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-owner/Cargo.toml"),
+            r#"[package]
+name = "device-owner"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+shared-dep = { path = "../shared-dep" }
+tracked-macro = { path = "../tracked-macro" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-owner/src/lib.rs"),
+            "const _: () = tracked_macro::track_codegen!();\npub fn device_value() -> u32 { shared_dep::shared_value() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-consumer/Cargo.toml"),
+            r#"[package]
+name = "device-consumer"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+device-owner = { path = "../device-owner" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("device-consumer/src/main.rs"),
+            "fn main() { assert_eq!(device_owner::device_value(), 42); }\n",
+        )
+        .unwrap();
+
+        let ctx = Context {
+            workspace_root: root.clone(),
+            codegen_crate: root.join("unused-codegen-source"),
+            examples_dir: root.join("unused-examples"),
+            backend_so: PathBuf::from("llvm"),
+            is_workspace: false,
+            config: OxideConfig::default(),
+        };
+        let base = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: Some(&target),
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+
+        let cold = cargo_artifact_freshness(&ctx, &base, None);
+        assert_eq!(cold.get("shared_dep"), Some(&false));
+        assert_eq!(cold.get("tracked_macro"), Some(&false));
+        assert_eq!(cold.get("device_owner"), Some(&false));
+        assert_eq!(cold.get("device-consumer"), Some(&false));
+
+        let warm = cargo_artifact_freshness(&ctx, &base, None);
+        assert_eq!(warm.get("shared_dep"), Some(&true));
+        assert_eq!(warm.get("tracked_macro"), Some(&true));
+        assert_eq!(warm.get("device_owner"), Some(&true));
+        assert_eq!(warm.get("device-consumer"), Some(&true));
+
+        let different_arch = CargoPassthroughOptions {
+            arch: Some("sm_90"),
+            ..base
+        };
+        let arch_switch = cargo_artifact_freshness(&ctx, &different_arch, None);
+        assert_eq!(arch_switch.get("shared_dep"), Some(&true));
+        assert_eq!(arch_switch.get("tracked_macro"), Some(&true));
+        assert_eq!(arch_switch.get("device_owner"), Some(&false));
+        assert_eq!(arch_switch.get("device-consumer"), Some(&false));
+
+        let different_output = CargoPassthroughOptions {
+            emit_nvvm_ir: true,
+            ..different_arch
+        };
+        let output_switch = cargo_artifact_freshness(&ctx, &different_output, None);
+        assert_eq!(output_switch.get("shared_dep"), Some(&true));
+        assert_eq!(output_switch.get("tracked_macro"), Some(&true));
+        assert_eq!(output_switch.get("device_owner"), Some(&false));
+        assert_eq!(output_switch.get("device-consumer"), Some(&false));
+
+        let repeated_output = cargo_artifact_freshness(&ctx, &different_output, None);
+        assert_eq!(repeated_output.get("shared_dep"), Some(&true));
+        assert_eq!(repeated_output.get("tracked_macro"), Some(&true));
+        assert_eq!(repeated_output.get("device_owner"), Some(&true));
+        assert_eq!(repeated_output.get("device-consumer"), Some(&true));
+
+        let provenance_switch = cargo_artifact_freshness(
+            &ctx,
+            &different_output,
+            Some("11d91fbe164094f6242d44103d0fb01968b96c6d8f48f124eac8fa73a307a657"),
+        );
+        assert_eq!(provenance_switch.get("shared_dep"), Some(&true));
+        assert_eq!(provenance_switch.get("tracked_macro"), Some(&true));
+        assert_eq!(provenance_switch.get("device_owner"), Some(&false));
+        assert_eq!(provenance_switch.get("device-consumer"), Some(&false));
+
+        let changed_provenance = cargo_artifact_freshness(
+            &ctx,
+            &different_output,
+            Some("5b11618c2e44027877d0cd4d0cfd10afed5ef262876791e483ec58f4c5569139"),
+        );
+        assert_eq!(changed_provenance.get("shared_dep"), Some(&true));
+        assert_eq!(changed_provenance.get("tracked_macro"), Some(&true));
+        assert_eq!(changed_provenance.get("device_owner"), Some(&false));
+        assert_eq!(changed_provenance.get("device-consumer"), Some(&false));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4792,6 +9180,9 @@ MY_BUILD_FLAG = "configured"
             device_cfgs: &[],
             no_fmad: false,
             target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
         };
         let inherited_env = BTreeMap::new();
         let base_hash = passthrough_codegen_fingerprint_with_env(
@@ -4800,6 +9191,7 @@ MY_BUILD_FLAG = "configured"
             None,
             Some("sm_80"),
             "cuda",
+            &MaterializationMode::default(),
             &inherited_env,
         );
 
@@ -4813,6 +9205,10 @@ MY_BUILD_FLAG = "configured"
         };
         let no_fmad = CargoPassthroughOptions {
             no_fmad: true,
+            ..base
+        };
+        let unchecked_indexing = CargoPassthroughOptions {
+            unchecked_indexing: true,
             ..base
         };
         let configured_ptx = test_context(OxideConfig {
@@ -4831,6 +9227,7 @@ MY_BUILD_FLAG = "configured"
                 None,
                 Some("sm_90"),
                 "cuda",
+                &MaterializationMode::default(),
                 &inherited_env,
             )
         );
@@ -4842,6 +9239,7 @@ MY_BUILD_FLAG = "configured"
                 None,
                 Some("sm_80"),
                 "cuda",
+                &MaterializationMode::default(),
                 &inherited_env,
             )
         );
@@ -4853,6 +9251,19 @@ MY_BUILD_FLAG = "configured"
                 None,
                 Some("sm_80"),
                 "cuda",
+                &MaterializationMode::default(),
+                &inherited_env,
+            )
+        );
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &unchecked_indexing,
+                None,
+                Some("sm_80"),
+                "cuda",
+                &MaterializationMode::default(),
                 &inherited_env,
             )
         );
@@ -4864,6 +9275,7 @@ MY_BUILD_FLAG = "configured"
                 Some("gpu_kernel"),
                 Some("sm_80"),
                 "cuda",
+                &MaterializationMode::default(),
                 &inherited_env,
             )
         );
@@ -4875,7 +9287,48 @@ MY_BUILD_FLAG = "configured"
                 None,
                 Some("sm_80"),
                 "cuda",
+                &MaterializationMode::default(),
                 &inherited_env,
+            )
+        );
+        let materialized = MaterializationMode {
+            provenance: Some("ab".repeat(32)),
+        };
+        assert_ne!(
+            base_hash,
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("sm_80"),
+                "maca",
+                &MaterializationMode::default(),
+                &inherited_env,
+            )
+        );
+
+        let mut sdk_a = inherited_env.clone();
+        sdk_a.insert("MACA_PATH".to_string(), b"/opt/maca-a".to_vec());
+        let mut sdk_b = inherited_env.clone();
+        sdk_b.insert("MACA_PATH".to_string(), b"/opt/maca-b".to_vec());
+        assert_ne!(
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("xcore1000"),
+                "maca",
+                &MaterializationMode::default(),
+                &sdk_a,
+            ),
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &base,
+                None,
+                Some("xcore1000"),
+                "maca",
+                &MaterializationMode::default(),
+                &sdk_b,
             )
         );
         assert_ne!(
@@ -4885,32 +9338,11 @@ MY_BUILD_FLAG = "configured"
                 &base,
                 None,
                 Some("sm_80"),
-                "maca",
+                "cuda",
+                &materialized,
                 &inherited_env,
-            )
-        );
-
-        let mut sdk_a = inherited_env.clone();
-        sdk_a.insert("MACA_PATH".to_string(), Some("/opt/maca-a".to_string()));
-        let mut sdk_b = inherited_env.clone();
-        sdk_b.insert("MACA_PATH".to_string(), Some("/opt/maca-b".to_string()));
-        assert_ne!(
-            passthrough_codegen_fingerprint_with_env(
-                &ctx,
-                &base,
-                None,
-                Some("xcore1000"),
-                "maca",
-                &sdk_a,
             ),
-            passthrough_codegen_fingerprint_with_env(
-                &ctx,
-                &base,
-                None,
-                Some("xcore1000"),
-                "maca",
-                &sdk_b,
-            )
+            "exact CUDA-tool provenance must change Cargo's rustc fingerprint"
         );
     }
 
@@ -4939,11 +9371,14 @@ MY_BUILD_FLAG = "configured"
             device_codegen_crate: None,
             device_cfgs: &[],
             no_fmad: false,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
             target_backend: Some("maca"),
         };
         let inherited_env = BTreeMap::from([(
             "MACA_PATH".to_string(),
-            Some(root.to_string_lossy().into_owned()),
+            root.to_string_lossy().into_owned().into_bytes(),
         )]);
         let before = passthrough_codegen_fingerprint_with_env(
             &ctx,
@@ -4951,6 +9386,7 @@ MY_BUILD_FLAG = "configured"
             None,
             Some("xcore1000"),
             "maca",
+            &MaterializationMode::default(),
             &inherited_env,
         );
         std::fs::write(&mxcc, b"second-build-is-larger").unwrap();
@@ -4960,6 +9396,7 @@ MY_BUILD_FLAG = "configured"
             None,
             Some("xcore1000"),
             "maca",
+            &MaterializationMode::default(),
             &inherited_env,
         );
 
@@ -4968,7 +9405,43 @@ MY_BUILD_FLAG = "configured"
     }
 
     #[test]
-    fn passthrough_fingerprint_tracks_backend_rebuild_at_same_path() {
+    fn passthrough_fingerprint_tracks_non_unicode_presence_switch_bytes() {
+        let ctx = test_context(OxideConfig::default());
+        let opts = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: Some("sm_80"),
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+        let fingerprint = |inherited_env: &BTreeMap<String, Vec<u8>>| {
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                &opts,
+                None,
+                Some("sm_80"),
+                "cuda",
+                &MaterializationMode::default(),
+                inherited_env,
+            )
+        };
+        let absent = BTreeMap::new();
+        let first = BTreeMap::from([("CUDA_OXIDE_NO_FMA".to_string(), vec![0xff])]);
+        let second = BTreeMap::from([("CUDA_OXIDE_NO_FMA".to_string(), vec![0xfe])]);
+
+        assert_ne!(fingerprint(&absent), fingerprint(&first));
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[test]
+    fn global_backend_identity_tracks_rebuild_at_same_path() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before unix epoch")
@@ -4981,40 +9454,50 @@ MY_BUILD_FLAG = "configured"
         std::fs::create_dir_all(&root).unwrap();
         let backend = root.join("librustc_codegen_cuda.so");
         std::fs::write(&backend, b"first").unwrap();
+        let original = std::fs::metadata(&backend).unwrap();
+        let original_modified = original.modified().unwrap();
 
         let mut ctx = test_context(OxideConfig::default());
         ctx.backend_so = backend.clone();
-        let opts = CargoPassthroughOptions {
-            verbose: false,
-            emit_nvvm_ir: false,
-            arch: None,
-            features: None,
-            cargo_target_dir: None,
-            device_codegen_crate: None,
-            device_cfgs: &[],
-            no_fmad: false,
-            target_backend: None,
-        };
-        let inherited_env = BTreeMap::new();
-        let before = passthrough_codegen_fingerprint_with_env(
+        let fingerprint = "42".repeat(32);
+        let mut before_cmd = Command::new("cargo");
+        apply_codegen_configuration(
+            &mut before_cmd,
             &ctx,
-            &opts,
-            None,
-            None,
-            "cuda",
-            &inherited_env,
-        );
-        std::fs::write(&backend, b"second-build-is-larger").unwrap();
-        let after = passthrough_codegen_fingerprint_with_env(
+            CodegenProfilePolicy::ReleaseLike,
+            &[],
+            &fingerprint,
+        )
+        .unwrap();
+        let before = command_env(&before_cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
+        // Preserve the weak metadata identity that used to be fingerprinted:
+        // only the bytes differ.
+        std::fs::write(&backend, b"other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&backend)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let replacement = std::fs::metadata(&backend).unwrap();
+        assert_eq!(replacement.len(), original.len());
+        assert_eq!(replacement.modified().unwrap(), original_modified);
+        let mut after_cmd = Command::new("cargo");
+        apply_codegen_configuration(
+            &mut after_cmd,
             &ctx,
-            &opts,
-            None,
-            None,
-            "cuda",
-            &inherited_env,
-        );
+            CodegenProfilePolicy::ReleaseLike,
+            &[],
+            &fingerprint,
+        )
+        .unwrap();
+        let after = command_env(&after_cmd, "CARGO_ENCODED_RUSTFLAGS").unwrap();
 
         assert_ne!(before, after);
+        assert_eq!(
+            command_env(&before_cmd, CODEGEN_FINGERPRINT_ENV),
+            command_env(&after_cmd, CODEGEN_FINGERPRINT_ENV)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5040,7 +9523,7 @@ MY_BUILD_FLAG = "configured"
             ..OxideConfig::default()
         });
         let mut cmd = Command::new("cargo");
-        apply_common_codegen_env(&mut cmd, &ctx, false, false);
+        apply_common_codegen_env(&mut cmd, &ctx, false, false, false, DeviceDebug::Off);
         cmd.env("CUDA_OXIDE_PTX_DIR", "internal-ptx");
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_PTX_DIR").as_deref(),
@@ -5064,10 +9547,43 @@ MY_BUILD_FLAG = "configured"
     }
 
     #[test]
+    fn emit_ltoir_preserves_fma_and_debug_policy_for_libnvvm() {
+        let arch = parse_nvvm_arch("sm_90").unwrap();
+        for (artifact_debug, finalizer_debug) in [
+            (
+                oxide_artifacts::ArtifactDebugPolicy::None,
+                cuda_artifact_finalizer::DebugPolicy::None,
+            ),
+            (
+                oxide_artifacts::ArtifactDebugPolicy::LineTables,
+                cuda_artifact_finalizer::DebugPolicy::LineTables,
+            ),
+            (
+                oxide_artifacts::ArtifactDebugPolicy::Full,
+                cuda_artifact_finalizer::DebugPolicy::Full,
+            ),
+        ] {
+            let artifact_options = oxide_artifacts::ArtifactCompileOptions::new()
+                .with_fma_contraction(false)
+                .with_debug_policy(artifact_debug);
+            let finalizer_options = finalization_options_from_artifact(&arch, artifact_options);
+
+            assert_eq!(finalizer_options.target(), &arch);
+            assert!(!finalizer_options.allow_fma_contraction());
+            assert_eq!(finalizer_options.debug_policy(), finalizer_debug);
+        }
+    }
+
+    #[test]
     fn apply_output_mode_sets_target_for_arch_override() {
         let mut cmd = Command::new("cargo");
 
-        apply_output_mode(&mut cmd, false, Some("sm_120"));
+        apply_output_mode(
+            &mut cmd,
+            false,
+            Some("sm_120"),
+            &MaterializationMode::default(),
+        );
 
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
@@ -5080,7 +9596,12 @@ MY_BUILD_FLAG = "configured"
     fn apply_output_mode_sets_nvvm_ir_flag_and_target() {
         let mut cmd = Command::new("cargo");
 
-        apply_output_mode(&mut cmd, true, Some("sm_100a"));
+        apply_output_mode(
+            &mut cmd,
+            true,
+            Some("sm_100a"),
+            &MaterializationMode::default(),
+        );
 
         assert_eq!(
             command_env(&cmd, "CUDA_OXIDE_TARGET").as_deref(),
@@ -5093,10 +9614,30 @@ MY_BUILD_FLAG = "configured"
     }
 
     #[test]
+    fn materialization_forces_nvvm_ir_and_exact_provenance_handshake() {
+        let mut cmd = Command::new("cargo");
+        let materialization = MaterializationMode {
+            provenance: Some("42".repeat(32)),
+        };
+
+        apply_output_mode(&mut cmd, false, Some("sm_90"), &materialization);
+
+        assert_eq!(
+            command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR").as_deref(),
+            Some("1")
+        );
+        assert_eq!(command_env(&cmd, MATERIALIZE_ENV).as_deref(), Some("1"));
+        assert_eq!(
+            command_env(&cmd, EXPECTED_PROVENANCE_ENV).as_deref(),
+            Some("4242424242424242424242424242424242424242424242424242424242424242")
+        );
+    }
+
+    #[test]
     fn apply_output_mode_leaves_auto_detect_ptx_unset() {
         let mut cmd = Command::new("cargo");
 
-        apply_output_mode(&mut cmd, false, None);
+        apply_output_mode(&mut cmd, false, None, &MaterializationMode::default());
 
         assert_eq!(command_env(&cmd, "CUDA_OXIDE_TARGET"), None);
         assert_eq!(command_env(&cmd, "CUDA_OXIDE_EMIT_NVVM_IR"), None);
@@ -5140,7 +9681,7 @@ MY_BUILD_FLAG = "configured"
     fn debug_output_mode_forwards_detected_gpu_hint() {
         let mut cmd = Command::new("cargo");
 
-        apply_output_mode(&mut cmd, false, None);
+        apply_output_mode(&mut cmd, false, None, &MaterializationMode::default());
         apply_device_arch_hint(&mut cmd, None, Some("sm_120a"));
 
         assert_eq!(
@@ -5155,7 +9696,12 @@ MY_BUILD_FLAG = "configured"
     fn debug_output_mode_honors_explicit_arch_override() {
         let mut cmd = Command::new("cargo");
 
-        apply_output_mode(&mut cmd, false, Some("sm_90"));
+        apply_output_mode(
+            &mut cmd,
+            false,
+            Some("sm_90"),
+            &MaterializationMode::default(),
+        );
         apply_device_arch_hint(&mut cmd, Some("sm_90"), Some("sm_120a"));
 
         assert_eq!(
@@ -5248,25 +9794,193 @@ MY_BUILD_FLAG = "configured"
     fn cuda_header_candidates_cover_standard_and_redistributable_layouts() {
         // Standard install layout first, then the matching targets/ layout.
         assert_eq!(
-            cuda_header_candidates("/usr/local/cuda", "x86_64"),
+            cuda_header_candidates("/usr/local/cuda", None, "x86_64", "linux"),
             vec![
                 PathBuf::from("/usr/local/cuda/include/cuda.h"),
                 PathBuf::from("/usr/local/cuda/targets/x86_64-linux/include/cuda.h"),
             ]
         );
-        // aarch64 servers use the sbsa-linux target dir.
+        // aarch64 Linux is ambiguous between servers (sbsa-linux) and Tegra
+        // (aarch64-linux), so both are probed, servers first.
         assert_eq!(
-            cuda_header_candidates("/opt/ctk", "aarch64"),
+            cuda_header_candidates("/opt/ctk", None, "aarch64", "linux"),
             vec![
                 PathBuf::from("/opt/ctk/include/cuda.h"),
                 PathBuf::from("/opt/ctk/targets/sbsa-linux/include/cuda.h"),
+                PathBuf::from("/opt/ctk/targets/aarch64-linux/include/cuda.h"),
             ]
         );
-        // Unknown host arch: only the standard layout is probed.
+        // Unknown host arch or non-Linux OS: only the standard layout.
         assert_eq!(
-            cuda_header_candidates("/opt/ctk", "riscv64"),
+            cuda_header_candidates("/opt/ctk", None, "riscv64", "linux"),
             vec![PathBuf::from("/opt/ctk/include/cuda.h")]
         );
+        assert_eq!(
+            cuda_header_candidates("/opt/ctk", None, "aarch64", "macos"),
+            vec![PathBuf::from("/opt/ctk/include/cuda.h")]
+        );
+        // CUDA_TOOLKIT_TARGET_DIR replaces the table with one directory;
+        // a blank value means "unset".
+        assert_eq!(
+            cuda_header_candidates("/opt/ctk", Some("aarch64-linux"), "aarch64", "linux"),
+            vec![
+                PathBuf::from("/opt/ctk/include/cuda.h"),
+                PathBuf::from("/opt/ctk/targets/aarch64-linux/include/cuda.h"),
+            ]
+        );
+        assert_eq!(
+            cuda_header_candidates("/opt/ctk", Some("  "), "x86_64", "linux"),
+            vec![
+                PathBuf::from("/opt/ctk/include/cuda.h"),
+                PathBuf::from("/opt/ctk/targets/x86_64-linux/include/cuda.h"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rust_toolchain_toml_reads_channel_and_components() {
+        let pin = parse_rust_toolchain_toml(
+            r#"[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "llvm-tools"]
+"#,
+        )
+        .expect("pin should parse");
+        assert_eq!(pin.channel, "nightly-2026-04-03");
+        assert_eq!(
+            pin.components,
+            vec![
+                "rust-src".to_string(),
+                "rustc-dev".to_string(),
+                "llvm-tools".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rust_toolchain_toml_rejects_missing_channel() {
+        let error = parse_rust_toolchain_toml("[toolchain]\ncomponents = [\"rust-src\"]\n")
+            .expect_err("channel is required");
+        assert!(error.contains("channel"), "{error}");
+    }
+
+    #[test]
+    fn active_toolchain_matches_channel_accepts_target_triple_suffix() {
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-aarch64-apple-darwin (default)",
+            "nightly-2026-04-03"
+        ));
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03",
+            "nightly-2026-04-03"
+        ));
+        assert!(!active_toolchain_matches_channel(
+            "nightly-2026-01-01-x86_64-unknown-linux-gnu (default)",
+            "nightly-2026-04-03"
+        ));
+    }
+
+    #[test]
+    fn active_toolchain_matches_channel_accepts_rustup_128_and_129_formats() {
+        // rustup 1.29 single-line form with an override annotation, as
+        // observed verbatim on a workspace with rust-toolchain.toml.
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-x86_64-unknown-linux-gnu (overridden by \
+             '/home/user/cuda-oxide/rust-toolchain.toml')",
+            "nightly-2026-04-03"
+        ));
+        // rustup 1.28 two-line form: bare name, then the reason line.
+        assert!(active_toolchain_matches_channel(
+            "nightly-2026-04-03-x86_64-unknown-linux-gnu\nactive because: \
+             overridden by '/home/user/cuda-oxide/rust-toolchain.toml'",
+            "nightly-2026-04-03"
+        ));
+        // A mismatched pin must not be rescued by later lines.
+        assert!(!active_toolchain_matches_channel(
+            "stable-x86_64-unknown-linux-gnu\nactive because: default",
+            "nightly-2026-04-03"
+        ));
+    }
+
+    #[test]
+    fn plan_update_selects_advise_setup_or_cache_refresh() {
+        assert_eq!(plan_update(true, false), UpdatePlan::AdviseSetup);
+        assert_eq!(plan_update(true, true), UpdatePlan::RunSetup);
+        assert_eq!(plan_update(false, false), UpdatePlan::RefreshCache);
+        assert_eq!(plan_update(false, true), UpdatePlan::RefreshCache);
+    }
+
+    /// A `.cargo/cuda-oxide.toml` backend pin outranks the shared cache, so
+    /// `update` must refuse just like it does for `CUDA_OXIDE_BACKEND`.
+    #[test]
+    fn update_refuses_when_the_config_pins_a_backend() {
+        let pinned = test_context(OxideConfig {
+            backend: Some(PathBuf::from("/tmp/pinned-backend.so")),
+            ..OxideConfig::default()
+        });
+        // `None` stands in for an unset ambient `CUDA_OXIDE_BACKEND`. Reading
+        // the real one would let an exported value produce the env refusal for
+        // both inputs, including the unpinned case asserted to be `None`.
+        let refusal =
+            update_pin_refusal_with_env(&pinned, None).expect("config pin must refuse update");
+        assert!(refusal.contains("pins the backend"), "{refusal}");
+        assert!(refusal.contains("/tmp/pinned-backend.so"), "{refusal}");
+
+        let unpinned = test_context(OxideConfig::default());
+        assert_eq!(update_pin_refusal_with_env(&unpinned, None), None);
+
+        // The env var outranks the project pin: set, it refuses even unpinned.
+        let from_env = update_pin_refusal_with_env(&unpinned, Some("/tmp/env-backend.so".into()))
+            .expect("exported CUDA_OXIDE_BACKEND must refuse update");
+        assert!(from_env.contains("CUDA_OXIDE_BACKEND is set"), "{from_env}");
+    }
+
+    #[test]
+    fn doctor_verified_components_unions_pin_list_with_required_floor() {
+        // Pin lists everything: order preserved, no duplicates appended.
+        let pin = RustToolchainPin {
+            channel: "nightly-2026-04-03".to_string(),
+            components: vec![
+                "rust-src".to_string(),
+                "rustc-dev".to_string(),
+                "rust-analyzer".to_string(),
+                "clippy".to_string(),
+                "llvm-tools".to_string(),
+            ],
+        };
+        assert_eq!(
+            doctor_verified_components(&pin),
+            vec![
+                "rust-src",
+                "rustc-dev",
+                "rust-analyzer",
+                "clippy",
+                "llvm-tools"
+            ]
+        );
+
+        // A trimmed pin still gets the hard floor appended.
+        let trimmed = RustToolchainPin {
+            channel: "nightly-2026-04-03".to_string(),
+            components: vec!["clippy".to_string()],
+        };
+        assert_eq!(
+            doctor_verified_components(&trimmed),
+            vec!["clippy", "rust-src", "rustc-dev", "llvm-tools"]
+        );
+    }
+
+    #[test]
+    fn missing_rustup_components_detects_host_triple_suffixes() {
+        let installed = "\
+rust-src-aarch64-apple-darwin
+clippy-aarch64-apple-darwin
+";
+        assert_eq!(
+            missing_rustup_components(installed, &["rust-src", "llvm-tools"]),
+            vec!["llvm-tools".to_string()]
+        );
+        assert!(missing_rustup_components(installed, &["rust-src"]).is_empty());
     }
 
     #[test]
@@ -5288,29 +10002,1100 @@ MY_BUILD_FLAG = "configured"
         assert_eq!(parse_compute_cap("12.0.1\n"), None);
     }
 
+    // All three skip cases inject the `CUDA_OXIDE_TARGET` probe rather than
+    // reading the ambient one, so each asserts the slot it names instead of
+    // passing because the developer happens to have the variable exported.
+
     #[test]
     fn detect_run_target_arch_skips_when_arch_explicit() {
         // --arch wins; never query the GPU.
-        assert_eq!(detect_run_target_arch(Some("sm_120"), false), None);
+        assert_eq!(
+            detect_run_target_arch_with_env(Some("sm_120"), false, false),
+            None
+        );
     }
 
     #[test]
     fn detect_run_target_arch_skips_when_emit_nvvm_ir() {
         // NVVM IR mode requires explicit --arch; auto-detect must not run.
-        assert_eq!(detect_run_target_arch(None, true), None);
+        assert_eq!(detect_run_target_arch_with_env(None, true, false), None);
     }
 
     #[test]
     fn detect_run_target_arch_skips_when_env_target_set() {
-        // Test in isolation; the `CUDA_OXIDE_TARGET` env handle is process-wide.
-        // SAFETY: single-threaded test serialised by the cargo test harness.
-        unsafe {
-            std::env::set_var("CUDA_OXIDE_TARGET", "sm_75");
+        // Slot 2 wins; never query the GPU. Injected rather than exported:
+        // `set_var` is a data race against the `vars_os` reads the fingerprint
+        // helpers perform on other test threads, which the cargo test harness
+        // runs concurrently by default.
+        assert_eq!(detect_run_target_arch_with_env(None, false, true), None);
+    }
+
+    fn write_list_example(
+        examples_dir: &Path,
+        name: &str,
+        manifest_description: Option<&str>,
+        readme: Option<&str>,
+    ) {
+        let example_dir = examples_dir.join(name);
+        std::fs::create_dir_all(&example_dir).unwrap();
+
+        let description = manifest_description
+            .map(|value| format!("description = {value:?}\n"))
+            .unwrap_or_default();
+
+        std::fs::write(
+            example_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n{description}"
+            ),
+        )
+        .unwrap();
+
+        if let Some(readme) = readme {
+            std::fs::write(example_dir.join("README.md"), readme).unwrap();
         }
-        let result = detect_run_target_arch(None, false);
-        unsafe {
-            std::env::remove_var("CUDA_OXIDE_TARGET");
+    }
+
+    #[test]
+    fn readme_parser_extracts_title_description_and_requirements() {
+        let parsed = parse_example_readme(
+            "vecadd",
+            r#"
+# vecadd
+
+## Vector Addition
+
+Adds two vectors using one CUDA thread per element.
+
+## Hardware Requirements
+
+- **Minimum GPU**: sm_70+
+- **CUDA Toolkit**: 12.x+
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Vector Addition"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Adds two vectors using one CUDA thread per element.")
+        );
+        assert_eq!(
+            parsed.requirements,
+            ["Minimum GPU: sm_70+", "CUDA Toolkit: 12.x+"]
+        );
+    }
+
+    #[test]
+    fn readme_parser_does_not_use_run_as_title() {
+        let parsed = parse_example_readme(
+            "cuda_module_nested",
+            r#"
+# cuda_module_nested
+
+## Run
+
+Expected output:
+
+```text
+PASS
+```
+
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("cuda_module_nested"));
+        assert_eq!(parsed.description, None);
+    }
+
+    #[test]
+    fn readme_parser_does_not_scan_later_headings_for_title() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+
+# example
+
+Introductory description.
+
+## Build
+
+Build instructions.
+
+## Advanced Implementation Details
+
+Internal details.
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("example"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Introductory description.")
+        );
+    }
+
+    #[test]
+    fn readme_parser_stops_description_at_next_heading() {
+        let parsed = parse_example_readme(
+            "vecadd",
+            r#"
+
+# vecadd
+
+## Vector Addition
+
+Adds two vectors on the GPU.
+
+## Run
+
+Run the example with cargo oxide.
+"#,
+        );
+
+        assert_eq!(parsed.title.as_deref(), Some("Vector Addition"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Adds two vectors on the GPU.")
+        );
+    }
+
+    #[test]
+    fn requirement_parser_joins_wrapped_list_items() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+
+# example
+
+## Requirements
+
+* CUDA Toolkit 13.1+ with nvcc and tileiras available. This example
+  also requires the CUDA development libraries.
+* Blackwell GPU with sm_100+ support.
+  "#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit 13.1+ with nvcc and tileiras available. This example also requires the CUDA development libraries.",
+                "Blackwell GPU with sm_100+ support.",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_does_not_absorb_paragraph_after_blank_line() {
+        // Modeled on the cpp_consumes_rust_device README: a bullet list under
+        // the requirements heading, then a blank line, then a follow-up
+        // paragraph and a code fence. The paragraph is a new paragraph, not a
+        // wrapped continuation of the last bullet.
+        let parsed = parse_example_readme(
+            "cpp_consumes_rust_device",
+            r#"
+# cpp_consumes_rust_device
+
+## Prerequisites
+
+- CUDA Toolkit (nvcc, libNVVM, nvJitLink)
+- Blackwell+ GPU (sm_100+) — LTOIR requires NVVM 20 dialect
+
+If your default host compiler is newer than the CUDA Toolkit supports, set
+`NVCC_CCBIN` or `CUDAHOSTCXX` before running the example:
+
+```bash
+NVCC_CCBIN=/usr/bin/g++-15 cargo oxide run cpp_consumes_rust_device
+```
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit (nvcc, libNVVM, nvJitLink)",
+                "Blackwell+ GPU (sm_100+) — LTOIR requires NVVM 20 dialect",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_joins_wrapped_items_but_not_following_paragraphs() {
+        // Modeled on the cutile_inter_kernel README: the last bullet wraps
+        // across indented lines (joined), and the paragraph after the blank
+        // line must not be glued onto it.
+        let parsed = parse_example_readme(
+            "cutile_inter_kernel",
+            r#"
+# cutile_inter_kernel
+
+## Requirements
+
+- cuda-oxide from this repository.
+- CUDA Toolkit 13.1+ with `nvcc` and `tileiras` available. This example
+  defaults `CUDA_TOOLKIT_PATH` to `/usr/local/cuda` through its local Cargo
+  config; set `CUDA_TOOLKIT_PATH` yourself if your toolkit lives elsewhere.
+
+`cargo oxide run` targets explicit `--arch` first, then `CUDA_OXIDE_TARGET`,
+then auto-detects the local GPU.
+
+## Run
+
+Run instructions.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "cuda-oxide from this repository.",
+                "CUDA Toolkit 13.1+ with nvcc and tileiras available. This example \
+                 defaults CUDA_TOOLKIT_PATH to /usr/local/cuda through its local Cargo \
+                 config; set CUDA_TOOLKIT_PATH yourself if your toolkit lives elsewhere.",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_captures_ordered_list_items() {
+        // Modeled on the mathdx_ffi_test README: prerequisites written as an
+        // ordered list, followed by a paragraph that is not part of the list.
+        let parsed = parse_example_readme(
+            "mathdx_ffi_test",
+            r#"
+# mathdx_ffi_test
+
+## Prerequisites
+
+1. **CUDA Toolkit 12.x+** with nvcc
+2. **MathDx Library** - Download from: https://developer.nvidia.com/cublasdx-downloads
+3. **cuda-oxide compiler** toolchain
+
+If your default host compiler is newer than the CUDA Toolkit supports, set
+`NVCC_CCBIN` or `CUDAHOSTCXX` before running the example.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "CUDA Toolkit 12.x+ with nvcc",
+                "MathDx Library - Download from: https://developer.nvidia.com/cublasdx-downloads",
+                "cuda-oxide compiler toolchain",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_recognizes_build_requirements_heading() {
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+# example
+
+## Build Requirements
+
+- nvcc with `--expt-relaxed-constexpr`
+"#,
+        );
+
+        assert_eq!(parsed.requirements, ["nvcc with --expt-relaxed-constexpr"]);
+    }
+
+    #[test]
+    fn requirement_parser_parses_two_column_requirement_tables() {
+        // Modeled on the abi_hmm README: requirements in a two-column table,
+        // including an escaped pipe inside a cell.
+        let parsed = parse_example_readme(
+            "abi_hmm",
+            r#"
+# abi_hmm
+
+## Requirements
+
+| Requirement   | Minimum                                           |
+|---------------|---------------------------------------------------|
+| GPU           | Turing or newer (RTX 20xx+)                       |
+| Linux Kernel  | 6.1.24+                                           |
+| HMM Support   | `nvidia-smi -q \| grep Addressing` shows "HMM"    |
+
+## Build and Run
+
+Instructions.
+"#,
+        );
+
+        assert_eq!(
+            parsed.requirements,
+            [
+                "GPU: Turing or newer (RTX 20xx+)",
+                "Linux Kernel: 6.1.24+",
+                "HMM Support: nvidia-smi -q | grep Addressing shows \"HMM\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn requirement_parser_skips_tables_that_are_not_two_columns() {
+        // A three-column table has no unambiguous name/value mapping, so it
+        // must be skipped whole instead of half-parsed.
+        let parsed = parse_example_readme(
+            "example",
+            r#"
+# example
+
+## Requirements
+
+| Test  | Status | Description |
+|-------|--------|-------------|
+| alpha | Pass   | First test  |
+| beta  | Pass   | Second test |
+"#,
+        );
+
+        assert_eq!(parsed.requirements, Vec::<String>::new());
+    }
+
+    #[test]
+    fn example_discovery_is_sorted_and_uses_manifest_fallback() {
+        let root = unique_temp_dir("cargo_oxide_list_examples");
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_list_example(&root, "zeta", Some("Manifest fallback description"), None);
+
+        write_list_example(
+            &root,
+            "alpha",
+            None,
+            Some("# alpha\n\n## Alpha Example\n\nREADME description.\n"),
+        );
+
+        let examples = discover_examples(&root).unwrap();
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(examples[0].description, "README description.");
+        assert_eq!(examples[1].description, "Manifest fallback description");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn example_discovery_keeps_examples_without_readmes() {
+        let root = unique_temp_dir("cargo_oxide_list_missing_readme");
+        std::fs::create_dir_all(&root).unwrap();
+
+        write_list_example(&root, "minimal", None, None);
+
+        let examples = discover_examples(&root).unwrap();
+
+        assert_eq!(examples.len(), 1);
+        assert_eq!(examples[0].name, "minimal");
+        assert_eq!(examples[0].description, "No description documented.");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn example_discovery_skips_directory_without_manifest() {
+        let root = unique_temp_dir("cargo_oxide_list_missing_manifest");
+        std::fs::create_dir_all(root.join("scratch")).unwrap();
+
+        write_list_example(&root, "real", Some("A real example"), None);
+
+        let examples =
+            discover_examples(&root).expect("manifest-less directories must not abort listing");
+
+        assert_eq!(
+            examples
+                .iter()
+                .map(|example| example.name.as_str())
+                .collect::<Vec<_>>(),
+            ["real"]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interop_metadata_selects_named_binary_artifact() {
+        let root = unique_temp_dir("cargo_oxide_named_bin_interop");
+        let device_dir = root.join("device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "host-app"
+version = "0.1.0"
+edition = "2024"
+
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "device/Cargo.toml"
+bin = "secondary-device"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            device_dir.join("Cargo.toml"),
+            r#"[package]
+name = "kernel-package"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        let config = load_interop_config(&root).expect("interop metadata should load");
+        let device = &config.device_crates[0];
+        assert_eq!(device.bin.as_deref(), Some("secondary-device"));
+        assert_eq!(
+            interop_device_cargo_target_name(&device_dir.join("Cargo.toml"), device),
+            "secondary-device"
+        );
+        assert_eq!(
+            interop_device_artifact_name(&device_dir.join("Cargo.toml"), device),
+            "secondary_device"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interop_binary_target_uses_cargo_source_path() {
+        let manifest = Path::new("/workspace/kernels/Cargo.toml");
+        let metadata = serde_json::json!({
+            "packages": [{
+                "manifest_path": "/workspace/kernels/Cargo.toml",
+                "targets": [
+                    {
+                        "name": "kernel-package",
+                        "kind": ["lib"],
+                        "src_path": "/workspace/kernels/src/lib.rs"
+                    },
+                    {
+                        "name": "secondary-device",
+                        "kind": ["bin"],
+                        "src_path": "/workspace/kernels/src/device_secondary.rs"
+                    }
+                ]
+            }]
+        });
+
+        assert_eq!(
+            interop_binary_target_from_metadata(&metadata, manifest, "secondary-device").unwrap(),
+            InteropBinaryTarget {
+                source_path: PathBuf::from("/workspace/kernels/src/device_secondary.rs"),
+            }
+        );
+    }
+
+    #[test]
+    fn interop_binary_target_rejects_unknown_name_with_available_targets() {
+        let manifest = Path::new("/workspace/kernels/Cargo.toml");
+        let metadata = serde_json::json!({
+            "packages": [{
+                "manifest_path": "/workspace/kernels/Cargo.toml",
+                "targets": [{
+                    "name": "main-device",
+                    "kind": ["bin"],
+                    "src_path": "/workspace/kernels/src/device_main.rs"
+                }]
+            }]
+        });
+
+        let error =
+            interop_binary_target_from_metadata(&metadata, manifest, "missing-device").unwrap_err();
+        assert!(error.contains("no binary target \"missing-device\""));
+        assert!(error.contains("available binary targets: main-device"));
+    }
+
+    #[test]
+    fn release_depfile_stem_preserves_hyphens_like_cargo_uplift() {
+        let target_dir = Path::new("/workspace/device/target");
+        // Regression: the stem was normalize_crate_name'd (hyphen -> underscore),
+        // but cargo uplifts dep-info named after the bin target verbatim, so
+        // every hyphenated bin/package with source-identity aborted with
+        // "did not produce dependency file".
+        assert_eq!(
+            release_depfile_path(target_dir, "simt-device"),
+            PathBuf::from("/workspace/device/target/release/simt-device.d")
+        );
+        assert_eq!(
+            release_depfile_path(target_dir, "kernels"),
+            PathBuf::from("/workspace/device/target/release/kernels.d")
+        );
+    }
+
+    /// The load-bearing claim behind `release_depfile_path` is cargo's own
+    /// uplift naming, so assert it against a real `cargo build` of a
+    /// hyphenated package with a hyphenated bin target rather than against
+    /// our expectations of it.
+    #[test]
+    fn release_depfile_path_matches_real_cargo_uplift_for_hyphenated_bin() {
+        let root = unique_temp_dir("cargo_oxide_hyphen_depfile");
+        std::fs::create_dir_all(root.join("src/bin")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "probe-device"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hyphen-device"
+path = "src/bin/hyphen_device.rs"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/bin/hyphen_device.rs"), "fn main() {}\n").unwrap();
+        // Pin the probe's target dir inside the temp root so an ambient
+        // CARGO_TARGET_DIR (shared CI caches) cannot collide across tests.
+        let target_dir = root.join("target");
+
+        let build = Command::new("cargo")
+            .args(["build", "--release", "--bin", "hyphen-device"])
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .current_dir(&root)
+            .output()
+            .expect("failed to run cargo build for the depfile probe");
+        assert!(
+            build.status.success(),
+            "depfile probe build failed:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let metadata = Command::new("cargo")
+            .args(["metadata", "--format-version=1", "--no-deps"])
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .current_dir(&root)
+            .output()
+            .expect("failed to run cargo metadata for the depfile probe");
+        assert!(
+            metadata.status.success(),
+            "depfile probe metadata failed:\n{}",
+            String::from_utf8_lossy(&metadata.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+
+        let depfile =
+            release_depfile_path(&cargo_target_directory(&metadata).unwrap(), "hyphen-device");
+        assert!(
+            depfile.is_file(),
+            "cargo did not uplift the dep-info where we derive it: {}",
+            depfile.display()
+        );
+        // The underscore-normalized twin must NOT be where we look.
+        assert!(
+            !depfile.with_file_name("hyphen_device.d").exists(),
+            "cargo unexpectedly uplifted an underscore-normalized dep-info file"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ptx_artifact_paths_normalize_hyphenated_example_names() {
+        let root = unique_temp_dir("cargo_oxide_inspect_regular");
+        std::fs::create_dir_all(&root).unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "demo-app"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ptx_artifact_paths(&root, "demo-app"),
+            vec![root.join("demo_app.ptx")]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ptx_artifact_paths_resolve_interop_device_artifacts() {
+        let root = unique_temp_dir("cargo_oxide_inspect_interop");
+        let device_dir = root.join("device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "host-app"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.cuda-oxide]
+interop = "device"
+
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "device/Cargo.toml"
+ptx-dir = "generated"
+artifact-name = "custom-device"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            device_dir.join("Cargo.toml"),
+            r#"[package]
+name = "device-app"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ptx_artifact_paths(&root, "host-app"),
+            vec![root.join("generated/custom_device.ptx")]
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interop_metadata_declares_cubin_and_source_identity() {
+        let root = unique_temp_dir("cargo_oxide_cubin_interop");
+        let device_dir = root.join("device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "host-app"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.cuda-oxide]
+interop = "device"
+
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "device/Cargo.toml"
+artifact-dir = "device"
+artifact-name = "custom-device"
+artifact-kind = "cubin"
+source-identity = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            device_dir.join("Cargo.toml"),
+            r#"[package]
+name = "device-app"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        let config = load_interop_config(&root).expect("interop metadata should load");
+        assert_eq!(config.device_crates.len(), 1);
+        let device = &config.device_crates[0];
+        assert_eq!(device.artifact_kind, InteropArtifactKind::Cubin);
+        assert!(device.source_identity);
+        assert_eq!(
+            interop_device_artifact_path(&root, device, "custom-device"),
+            root.join("device/custom_device.cubin")
+        );
+        assert_eq!(
+            interop_cubin_target(Some("sm_120a"), None).unwrap().sm(),
+            "sm_120a"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_target_sidecar_is_the_completion_marker() {
+        let root = unique_temp_dir("cargo_oxide_recorded_target");
+        std::fs::create_dir_all(&root).unwrap();
+        let ir_path = root.join("device_kernels.ll");
+
+        // No sidecar: the backend never completed its artifact contract.
+        let error = read_interop_recorded_target(&ir_path).unwrap_err();
+        assert!(error.contains("completion marker"), "{error}");
+
+        // Bare target line (pre-versioned contract) is accepted.
+        std::fs::write(root.join("device_kernels.target"), "sm_90a\n").unwrap();
+        assert_eq!(read_interop_recorded_target(&ir_path).unwrap(), "sm_90a");
+
+        // The versioned marker says the sibling .options file is required...
+        std::fs::write(
+            root.join("device_kernels.target"),
+            format!(
+                "sm_120a\n{}\n",
+                oxide_artifacts::COMPILE_OPTIONS_TARGET_MARKER
+            ),
+        )
+        .unwrap();
+        let error = read_interop_recorded_target(&ir_path).unwrap_err();
+        assert!(error.contains("compile options"), "{error}");
+
+        // ...and the record is trusted once it exists.
+        std::fs::write(root.join("device_kernels.options"), "fma=on\ndebug=none\n").unwrap();
+        assert_eq!(read_interop_recorded_target(&ir_path).unwrap(), "sm_120a");
+
+        // Unknown trailing content is rejected, not half-trusted.
+        std::fs::write(
+            root.join("device_kernels.target"),
+            "sm_120a\nmystery-marker\nrest\n",
+        )
+        .unwrap();
+        assert!(read_interop_recorded_target(&ir_path).is_err());
+        std::fs::write(root.join("device_kernels.target"), "\n").unwrap();
+        assert!(read_interop_recorded_target(&ir_path).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ptx_recorded_target_reads_the_target_directive() {
+        let root = unique_temp_dir("cargo_oxide_ptx_target");
+        std::fs::create_dir_all(&root).unwrap();
+        let ptx_path = root.join("kernels.ptx");
+
+        std::fs::write(
+            &ptx_path,
+            "// comment\n.version 8.7\n.target sm_120a\n.address_size 64\n",
+        )
+        .unwrap();
+        assert_eq!(ptx_recorded_target(&ptx_path).unwrap(), "sm_120a");
+
+        // Device-debug builds record `.target sm_90, debug`.
+        std::fs::write(&ptx_path, ".version 8.3\n.target sm_90, debug\n").unwrap();
+        assert_eq!(ptx_recorded_target(&ptx_path).unwrap(), "sm_90");
+
+        std::fs::write(&ptx_path, ".version 8.3\n").unwrap();
+        assert!(ptx_recorded_target(&ptx_path).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interop_identity_target_is_read_from_the_emitted_artifact() {
+        let root = unique_temp_dir("cargo_oxide_identity_target");
+        std::fs::create_dir_all(root.join("device")).unwrap();
+
+        let ptx_crate = DeviceCrateConfig {
+            manifest_path: PathBuf::from("device/Cargo.toml"),
+            artifact_dir: PathBuf::from("device"),
+            artifact_name: Some("kernels".to_string()),
+            artifact_kind: InteropArtifactKind::Ptx,
+            source_identity: true,
+            bin: None,
+        };
+        // Whatever the request hint said, the emitted PTX is the record.
+        std::fs::write(
+            root.join("device/kernels.ptx"),
+            ".version 8.7\n.target sm_90a\n",
+        )
+        .unwrap();
+        assert_eq!(
+            interop_artifact_recorded_target(&root, &ptx_crate, "kernels").unwrap(),
+            "sm_90a"
+        );
+
+        // Cubin identity reads the backend sidecar the finalizer compiled
+        // with, not the PTX and not any hint.
+        let cubin_crate = DeviceCrateConfig {
+            artifact_kind: InteropArtifactKind::Cubin,
+            ..ptx_crate
+        };
+        std::fs::write(root.join("device/kernels.target"), "sm_100a\n").unwrap();
+        assert_eq!(
+            interop_artifact_recorded_target(&root, &cubin_crate, "kernels").unwrap(),
+            "sm_100a"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_ptx_artifact_returns_exact_contents() {
+        let root = unique_temp_dir("cargo_oxide_read_ptx");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let path = root.join("demo.ptx");
+        std::fs::write(&path, ".version 8.0\n.target sm_90\n").unwrap();
+
+        assert_eq!(
+            read_ptx_artifact(&path).unwrap(),
+            ".version 8.0\n.target sm_90\n"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_json_has_versioned_stable_shape() {
+        let examples = vec![ExampleInfo {
+            name: "vecadd".to_string(),
+            title: "Vector Addition".to_string(),
+            description: "Adds two vectors.".to_string(),
+            requirements: vec!["Minimum GPU: sm_70+".to_string()],
+        }];
+
+        let output = format_examples_json(&examples).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["examples"][0]["name"], "vecadd");
+        assert_eq!(
+            value["examples"][0]["requirements"][0],
+            "Minimum GPU: sm_70+"
+        );
+        assert!(output.ends_with('\n'));
+    }
+
+    #[test]
+    fn read_ptx_artifact_reports_missing_file() {
+        let root = unique_temp_dir("cargo_oxide_missing_ptx");
+        let path = root.join("missing.ptx");
+
+        let error = read_ptx_artifact(&path).unwrap_err();
+
+        assert!(error.contains("could not read generated PTX"));
+        assert!(error.contains("missing.ptx"));
+    }
+
+    #[test]
+    fn nvvm_ir_requested_reads_project_configuration() {
+        let ctx = Context {
+            workspace_root: PathBuf::from("/tmp/project"),
+            codegen_crate: PathBuf::from("/tmp/project"),
+            examples_dir: PathBuf::from("/tmp/project"),
+            backend_so: PathBuf::from("/tmp/backend.so"),
+            is_workspace: false,
+            config: OxideConfig {
+                env: vec![("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), "true".to_string())],
+                ..OxideConfig::default()
+            },
+        };
+
+        assert_eq!(nvvm_ir_requested_with_env(&ctx, None), Ok(true));
+    }
+
+    #[test]
+    fn nvvm_ir_requested_accepts_disabled_project_configuration() {
+        let ctx = Context {
+            workspace_root: PathBuf::from("/tmp/project"),
+            codegen_crate: PathBuf::from("/tmp/project"),
+            examples_dir: PathBuf::from("/tmp/project"),
+            backend_so: PathBuf::from("/tmp/backend.so"),
+            is_workspace: false,
+            config: OxideConfig {
+                env: vec![("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), "false".to_string())],
+                ..OxideConfig::default()
+            },
+        };
+
+        assert_eq!(nvvm_ir_requested_with_env(&ctx, None), Ok(false));
+    }
+
+    #[test]
+    fn nvvm_ir_requested_env_disable_overrides_enabled_project_configuration() {
+        let ctx = Context {
+            workspace_root: PathBuf::from("/tmp/project"),
+            codegen_crate: PathBuf::from("/tmp/project"),
+            examples_dir: PathBuf::from("/tmp/project"),
+            backend_so: PathBuf::from("/tmp/backend.so"),
+            is_workspace: false,
+            config: OxideConfig {
+                env: vec![("CUDA_OXIDE_EMIT_NVVM_IR".to_string(), "true".to_string())],
+                ..OxideConfig::default()
+            },
+        };
+
+        // The process environment outranks `cuda-oxide.toml`: an explicit
+        // false in the environment wins over the project's `true`, in either
+        // accepted spelling.
+        for disabled in ["false", "0"] {
+            assert_eq!(
+                nvvm_ir_requested_with_env(&ctx, Some(disabled.into())),
+                Ok(false)
+            );
         }
-        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn scaffold_sync_template_uses_launch_contract_and_docs() {
+        let files = scaffold_files("demo_kernel", false);
+        assert!(files.cargo_toml.contains("name = \"demo_kernel\""));
+        assert!(files.readme.contains("cargo oxide doctor"));
+        assert!(files.readme.contains("cargo oxide run"));
+        assert!(files.gitignore.contains("/target/"));
+        // The template uses the launch_bounds / launch_contract attribute
+        // macros, so the cuda_device import must bring them in; a scaffolded
+        // project fails to compile without this exact line.
+        assert!(files.main_rs.starts_with(
+            "use cuda_device::{kernel, launch_bounds, launch_contract, thread, DisjointSlice};"
+        ));
+        assert!(
+            files
+                .main_rs
+                .contains("#[launch_contract(domain = 1, block = (256, 1, 1))]")
+        );
+        assert!(files.main_rs.contains("prepare_vecadd"));
+        assert!(files.main_rs.contains("LaunchConfig1D"));
+        assert!(!files.main_rs.contains("LaunchConfig::for_num_elems"));
+    }
+
+    #[test]
+    fn scaffold_async_template_keeps_async_deps_and_docs() {
+        let files = scaffold_files("async_demo", true);
+        assert!(files.cargo_toml.contains("cuda-async"));
+        assert!(files.cargo_toml.contains("tokio"));
+        assert!(files.readme.contains("async cuda-oxide"));
+        assert!(files.readme.contains("cargo oxide doctor"));
+        // The async README must stand alone: it describes the async launch
+        // path and never talks about "the sync template".
+        assert!(files.readme.contains("DeviceOperation"));
+        assert!(!files.readme.contains("sync template"));
+        assert!(files.gitignore.contains("**/*.ptx"));
+        assert!(files.main_rs.contains("vecadd_async"));
+        assert!(files.main_rs.contains("use cuda_host::cuda_module;"));
+        assert!(!files.main_rs.contains("use cuda_device::{cuda_module"));
+    }
+
+    #[test]
+    fn scaffold_gitignore_covers_every_clean_artifact_suffix() {
+        let gitignore = scaffold_gitignore();
+        assert!(gitignore.contains("/target/"));
+        assert!(gitignore.contains("**/*.bc"));
+        for suffix in GENERATED_ARTIFACT_SUFFIXES {
+            // Match whole lines, not substrings: `**/*.cubin.target` contains
+            // `**/*.cubin` as a substring, so `contains()` would keep passing
+            // even if the `cubin` pattern itself were dropped.
+            let pattern = format!("**/*.{suffix}");
+            assert!(
+                gitignore.lines().any(|line| line == pattern),
+                "scaffold .gitignore must ignore clean suffix `{suffix}`"
+            );
+        }
+    }
+
+    #[test]
+    fn device_debug_env_value_matches_the_backend_parser() {
+        // The exported strings must round-trip through the shared
+        // `CUDA_OXIDE_DEBUG` parser (the same one the codegen backend uses);
+        // a typo would silently fall through to the profile-derived default
+        // instead of failing, so check the actual parse.
+        assert_eq!(DeviceDebug::Off.env_value(), None);
+        assert_eq!(DeviceDebug::LineTables.env_value(), Some("line"));
+        assert_eq!(DeviceDebug::Full.env_value(), Some("full"));
+        assert_eq!(
+            cuda_artifact_finalizer::DebugPolicy::parse_env_override("line"),
+            Some(cuda_artifact_finalizer::DebugPolicy::LineTables)
+        );
+        assert_eq!(
+            cuda_artifact_finalizer::DebugPolicy::parse_env_override("full"),
+            Some(cuda_artifact_finalizer::DebugPolicy::Full)
+        );
+    }
+
+    #[test]
+    fn passthrough_fingerprint_separates_the_device_debug_policies() {
+        let ctx = test_context(OxideConfig::default());
+        let base = CargoPassthroughOptions {
+            verbose: false,
+            emit_nvvm_ir: false,
+            arch: None,
+            features: None,
+            cargo_target_dir: None,
+            device_codegen_crate: None,
+            device_cfgs: &[],
+            no_fmad: false,
+            target_backend: None,
+            unchecked_indexing: false,
+            materialize_cubin: false,
+            device_debug: DeviceDebug::Off,
+        };
+        let line_tables = CargoPassthroughOptions {
+            device_debug: DeviceDebug::LineTables,
+            ..base
+        };
+        let full = CargoPassthroughOptions {
+            device_debug: DeviceDebug::Full,
+            ..base
+        };
+        let materialization = MaterializationMode::default();
+        // Empty inherited env, for the same reason as the sibling fingerprint
+        // tests: an ambient CUDA_OXIDE_DEBUG is folded in on its own, which would
+        // collapse these onto the base.
+        let inherited_env = BTreeMap::new();
+        let fp = |opts: &CargoPassthroughOptions<'_>| {
+            passthrough_codegen_fingerprint_with_env(
+                &ctx,
+                opts,
+                None,
+                None,
+                "cuda",
+                &materialization,
+                &inherited_env,
+            )
+        };
+        // The policy changes what libNVVM and nvJitLink are asked to do (`-g`,
+        // `-opt=0`, `-lineinfo`), so it must not share a fingerprint with the
+        // default -- otherwise Cargo reuses artifacts built without it.
+        let off = fp(&base);
+        assert_ne!(off, fp(&line_tables));
+        assert_ne!(off, fp(&full));
+        assert_ne!(fp(&line_tables), fp(&full));
+    }
+
+    #[test]
+    fn full_device_debug_disables_mir_optimization() {
+        let cmd = Command::new("cargo");
+        let mut encoded = "base".to_string();
+
+        append_full_debug_mir_rustflag(&mut encoded, &cmd, Some("full"));
+
+        assert_eq!(decoded_rustflags(&encoded), ["base", "-Zmir-opt-level=0"]);
+    }
+
+    #[test]
+    fn numeric_full_debug_alias_disables_mir_optimization() {
+        // The backend accepts `CUDA_OXIDE_DEBUG=2` as full debug; the shared
+        // parser guarantees the build policy agrees, so `2` must disable MIR
+        // optimization exactly like `full`.
+        let mut cmd = Command::new("cargo");
+        cmd.env("CUDA_OXIDE_DEBUG", "2");
+        let mut encoded = "base".to_string();
+
+        append_full_debug_mir_rustflag(&mut encoded, &cmd, None);
+
+        assert_eq!(decoded_rustflags(&encoded), ["base", "-Zmir-opt-level=0"]);
+    }
+
+    #[test]
+    fn line_tables_keep_normal_mir_optimization() {
+        let mut cmd = Command::new("cargo");
+        cmd.env("CUDA_OXIDE_DEBUG", "line");
+        let mut encoded = "base".to_string();
+
+        append_full_debug_mir_rustflag(&mut encoded, &cmd, None);
+
+        assert_eq!(decoded_rustflags(&encoded), ["base"]);
+    }
+
+    #[test]
+    fn explicit_line_tables_override_inherited_full_debug_for_mir_optimization() {
+        let mut cmd = Command::new("cargo");
+        cmd.env("CUDA_OXIDE_DEBUG", "line");
+        let mut encoded = "base".to_string();
+
+        append_full_debug_mir_rustflag(&mut encoded, &cmd, Some("full"));
+
+        assert_eq!(decoded_rustflags(&encoded), ["base"]);
     }
 }

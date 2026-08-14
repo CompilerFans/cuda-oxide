@@ -34,11 +34,13 @@ pub fn lower_to_llvm(
     ctx: &mut Context,
     module_op_ptr: Ptr<Operation>,
     allow_fma_contraction: bool,
+    intrinsic_backend: mir_lower::IntrinsicBackend,
 ) -> Result<(), PipelineError> {
     lower_to_llvm_with_backend(
         ctx,
         module_op_ptr,
         allow_fma_contraction,
+        intrinsic_backend,
         crate::options::TargetBackend::Cuda,
     )
 }
@@ -50,6 +52,7 @@ pub fn lower_to_llvm_with_backend(
     ctx: &mut Context,
     module_op_ptr: Ptr<Operation>,
     allow_fma_contraction: bool,
+    intrinsic_backend: mir_lower::IntrinsicBackend,
     backend: crate::options::TargetBackend,
 ) -> Result<(), PipelineError> {
     mir_lower::register(ctx);
@@ -65,6 +68,7 @@ pub fn lower_to_llvm_with_backend(
         mir_lower::LoweringOptions {
             allow_fma_contraction,
             backend: mir_backend,
+            intrinsic_backend,
         },
     ) {
         Ok(()) => Ok(()),
@@ -181,10 +185,16 @@ fn device_extern_type_to_pliron(
                 "device-extern parameters and aggregate elements cannot be `void`".to_string(),
             ));
         }
-        DeviceExternType::Integer(bits) if *bits > 0 => {
+        DeviceExternType::Integer(bits)
+        | DeviceExternType::SignExtInteger(bits)
+        | DeviceExternType::ZeroExtInteger(bits)
+            if *bits > 0 =>
+        {
             IntegerType::get(ctx, *bits, Signedness::Signless).into()
         }
-        DeviceExternType::Integer(_) => {
+        DeviceExternType::Integer(_)
+        | DeviceExternType::SignExtInteger(_)
+        | DeviceExternType::ZeroExtInteger(_) => {
             return Err(PipelineError::Export(
                 "device-extern integer width must be non-zero".to_string(),
             ));

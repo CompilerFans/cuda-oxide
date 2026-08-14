@@ -16,6 +16,51 @@ pub type CUdeviceptr = crate::mcDrvDeviceptr_t;
 
 // Enum and aggregate types used by cuda-core.
 pub type CUdevice_attribute = crate::mcDrvDeviceAttribute_t;
+
+pub use crate::wcuStreamCreateWithPriority as cuStreamCreateWithPriority;
+
+pub use crate::wcuCtxSetLimit as cuCtxSetLimit;
+
+pub use crate::mcDrvError_enum_MC_ERROR_INVALID_CONTEXT as cudaError_enum_CUDA_ERROR_INVALID_CONTEXT;
+pub use crate::mcDrvError_enum_MC_ERROR_ILLEGAL_ADDRESS as cudaError_enum_CUDA_ERROR_ILLEGAL_ADDRESS;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_NUM_REGS as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NUM_REGS;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_CONST_SIZE_BYTES as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_BINARY_VERSION as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_BINARY_VERSION;
+pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_PTX_VERSION as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PTX_VERSION;
+pub use crate::wcuStreamGetPriority as cuStreamGetPriority;
+pub use crate::wcuStreamQuery as cuStreamQuery;
+pub use crate::wcuMemGetAddressRange as cuMemGetAddressRange_v2;
+pub use crate::mcDrvError_enum_MC_ERROR_NOT_FOUND as cudaError_enum_CUDA_ERROR_NOT_FOUND;
+pub use crate::mcDrvError_enum_MC_ERROR_UNSUPPORTED_LIMIT as cudaError_enum_CUDA_ERROR_UNSUPPORTED_LIMIT;
+pub use crate::wcuDevicePrimaryCtxGetState as cuDevicePrimaryCtxGetState;
+pub use crate::wcuDevicePrimaryCtxSetFlags as cuDevicePrimaryCtxSetFlags_v2;
+pub use crate::wcuCtxGetStreamPriorityRange as cuCtxGetStreamPriorityRange;
+pub use crate::wcuCtxGetLimit as cuCtxGetLimit;
+pub use crate::mcDrvDeviceAttribute_enum_MC_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR as CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR;
+
+// Context creation flags (`cuCtxCreate` scheduling policy).
+pub type CUctx_flags_enum = crate::mcDrvCtxFlags_enum;
+pub use crate::mcDrvCtxFlags_enum_MC_CTX_SCHED_AUTO as CUctx_flags_enum_CU_CTX_SCHED_AUTO;
+pub use crate::mcDrvCtxFlags_enum_MC_CTX_SCHED_SPIN as CUctx_flags_enum_CU_CTX_SCHED_SPIN;
+pub use crate::mcDrvCtxFlags_enum_MC_CTX_SCHED_YIELD as CUctx_flags_enum_CU_CTX_SCHED_YIELD;
+pub use crate::mcDrvCtxFlags_enum_MC_CTX_SCHED_BLOCKING_SYNC as CUctx_flags_enum_CU_CTX_SCHED_BLOCKING_SYNC;
+pub use crate::mcDrvCtxFlags_enum_MC_CTX_SCHED_MASK as CUctx_flags_enum_CU_CTX_SCHED_MASK;
+// Limits cu-bridge does not expose; map to the closest MC limit constant so
+// the exhaustive match in cuda-core still compiles (cuda-core never requests
+// these on the cu-bridge backend).
+pub use crate::mcDrvlimit_enum_MC_LIMIT_MAX as CUlimit_enum_CU_LIMIT_PERSISTING_L2_CACHE_SIZE;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_MAX as CUlimit_enum_CU_LIMIT_MAX_L2_FETCH_GRANULARITY;
+
+// Context limits (`cuCtxSetLimit` family).
+pub type CUlimit = crate::mcDrvlimit_t;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_STACK_SIZE as CUlimit_enum_CU_LIMIT_STACK_SIZE;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_PRINTF_FIFO_SIZE as CUlimit_enum_CU_LIMIT_PRINTF_FIFO_SIZE;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_MALLOC_HEAP_SIZE as CUlimit_enum_CU_LIMIT_MALLOC_HEAP_SIZE;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT as CUlimit_enum_CU_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT;
+pub use crate::mcDrvlimit_enum_MC_LIMIT_DEV_RUNTIME_SYNC_DEPTH as CUlimit_enum_CU_LIMIT_DEV_RUNTIME_SYNC_DEPTH;
 pub type CUevent_flags = crate::mcDrvEventFlags;
 pub type CUfunction_attribute = crate::mcDrvFunction_attribute;
 pub type CUlaunchAttribute_st = crate::mcDrvlaunchAttribute_st;
@@ -85,8 +130,6 @@ pub use crate::mcDrvDeviceAttribute_enum_MC_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUN
 
 // Function attributes. cu-bridge exposes CUDA's original attributes by name.
 pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK;
-pub use crate::mcFunctionAttribute_enum_MC_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES as CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES;
 
 // Extended-launch attributes and VMM constants.
 pub use crate::mcLaunchAttributeID_mcLaunchAttributeClusterDimension as CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;

@@ -5,17 +5,13 @@
 
 //! Hopper WGMMA (Warpgroup Matrix Multiply-Accumulate) intrinsics.
 //!
-//! Handles SM90 (Hopper) asynchronous warpgroup matrix operations.
+//! Handles Hopper `sm_90a` asynchronous warpgroup matrix operations.
 
 use super::super::helpers::{emit_goto, emit_store_result_and_goto};
 use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
-use dialect_mir::ops::MirConstantOp;
-use dialect_nvvm::ops::{
-    WgmmaCommitGroupSyncAlignedOp, WgmmaFenceSyncAlignedOp, WgmmaMakeSmemDescOp,
-    WgmmaMmaM64N64K16F32Bf16Op, WgmmaWaitGroupSyncAlignedOp,
-};
+use dialect_nvvm::ops::{WgmmaMakeSmemDescOp, WgmmaMmaM64N64K16F32Bf16Op};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -24,200 +20,28 @@ use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use rustc_public::mir;
-/// Emits `wgmma_fence()`: WGMMA input fence.
-///
-/// Establishes ordering between shared memory writes and subsequent WGMMA
-/// operations. Must be called before WGMMA to ensure input data is visible.
-///
-/// # Generated Operation
-///
-/// `nvvm.wgmma.fence.sync.aligned` - Maps to PTX `wgmma.fence.sync.aligned`
-///
-/// # Hopper+ Only
-///
-/// This instruction is only available on SM90 (Hopper) and later.
-pub fn emit_wgmma_fence(
-    ctx: &mut Context,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if !args.is_empty() {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "wgmma_fence expects 0 arguments, got {}",
-                args.len()
-            ))
-        );
-    }
 
-    // Create the fence operation (void return, no operands)
-    let fence_op = Operation::new(
-        ctx,
-        WgmmaFenceSyncAlignedOp::get_concrete_op_info(),
-        vec![], // No results
-        vec![], // No operands
-        vec![],
-        0,
-    );
-    fence_op.deref_mut(ctx).set_loc(loc.clone());
+const CUSTOM_DESCRIPTOR_UNSUPPORTED: &str = "custom WGMMA descriptor encoding is not yet supported";
+const MMA_UNSUPPORTED: &str = "this WGMMA MMA variant is not yet supported; only m64n64k16.f32.bf16.bf16 has deferred accumulator lowering";
 
-    if let Some(prev) = prev_op {
-        fence_op.insert_after(ctx, prev);
-    } else {
-        fence_op.insert_at_front(block_ptr, ctx);
-    }
-
-    // Emit goto to target block
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, fence_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported("wgmma_fence call without target block".to_string())
-        )
+fn unsupported_diagnostic(path: &str) -> Option<&'static str> {
+    match path {
+        "cuda_device::wgmma::make_smem_desc_custom" => Some(CUSTOM_DESCRIPTOR_UNSUPPORTED),
+        "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_f16"
+        | "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_tf32" => Some(MMA_UNSUPPORTED),
+        _ => None,
     }
 }
 
-/// Emit wgmma_commit_group: Commit pending WGMMA operations to a group.
-///
-/// Args: none
-/// Returns: void
-pub fn emit_wgmma_commit_group(
-    ctx: &mut Context,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-) -> TranslationResult<Ptr<Operation>> {
-    if !args.is_empty() {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "wgmma_commit_group expects 0 arguments, got {}",
-                args.len()
-            ))
-        );
-    }
-
-    // Create the commit operation (void return, no operands)
-    let commit_op = Operation::new(
-        ctx,
-        WgmmaCommitGroupSyncAlignedOp::get_concrete_op_info(),
-        vec![], // No results
-        vec![], // No operands
-        vec![],
-        0,
-    );
-    commit_op.deref_mut(ctx).set_loc(loc.clone());
-
-    if let Some(prev) = prev_op {
-        commit_op.insert_after(ctx, prev);
-    } else {
-        commit_op.insert_at_front(block_ptr, ctx);
-    }
-
-    // Emit goto to target block
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, commit_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported("wgmma_commit_group call without target block".to_string())
-        )
-    }
-}
-
-/// Emit wgmma_wait_group: Wait for N groups to complete.
-///
-/// This is a const generic function, so N is extracted from the function path.
-///
-/// Args: none (N comes from const generic)
-/// Returns: void
-pub fn emit_wgmma_wait_group(
-    ctx: &mut Context,
-    args: &[mir::Operand],
-    target: &Option<usize>,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    block_map: &[Ptr<BasicBlock>],
-    loc: Location,
-    n: u64,
-) -> TranslationResult<Ptr<Operation>> {
-    if !args.is_empty() {
-        return input_err!(
-            loc.clone(),
-            TranslationErr::unsupported(format!(
-                "wgmma_wait_group expects 0 arguments, got {}",
-                args.len()
-            ))
-        );
-    }
-
-    // Create constant for N
-    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let apint = pliron::utils::apint::APInt::from_u64(n, std::num::NonZeroUsize::new(64).unwrap());
-    let int_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, apint);
-    let const_raw_op = Operation::new(
-        ctx,
-        MirConstantOp::get_concrete_op_info(),
-        vec![i64_ty.into()],
-        vec![],
-        vec![],
-        0,
-    );
-    const_raw_op.deref_mut(ctx).set_loc(loc.clone());
-    let n_const = MirConstantOp::new(const_raw_op);
-    n_const.set_attr_value(ctx, int_attr);
-
-    let last_op = if let Some(prev) = prev_op {
-        n_const.get_operation().insert_after(ctx, prev);
-        n_const.get_operation()
-    } else {
-        n_const.get_operation().insert_at_front(block_ptr, ctx);
-        n_const.get_operation()
+/// Reject public WGMMA entries that do not have a sound lowering yet.
+pub(crate) fn reject_unsupported(path: &str, loc: Location) -> TranslationResult<()> {
+    let Some(diagnostic) = unsupported_diagnostic(path) else {
+        return Ok(());
     };
-
-    let n_value = n_const.get_operation().deref(ctx).get_result(0);
-
-    // Create the wait operation (void return, 1 operand for N)
-    let wait_op = Operation::new(
-        ctx,
-        WgmmaWaitGroupSyncAlignedOp::get_concrete_op_info(),
-        vec![],        // No results
-        vec![n_value], // N operand
-        vec![],
-        0,
-    );
-    wait_op.deref_mut(ctx).set_loc(loc.clone());
-    wait_op.insert_after(ctx, last_op);
-
-    // Emit goto to target block
-    if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, wait_op, block_map, loc);
-        Ok(goto_op)
-    } else {
-        input_err!(
-            loc.clone(),
-            TranslationErr::unsupported("wgmma_wait_group call without target block".to_string())
-        )
-    }
+    input_err!(loc, TranslationErr::unsupported(diagnostic))
 }
 
 /// Emit make_smem_desc: Create SMEM descriptor for WGMMA.
-///
-/// Args:
-/// - `args[0]`: *const u8 (pointer to shared memory)
-///
-/// Returns: u64 (64-bit descriptor)
 pub fn emit_wgmma_make_smem_desc(
     ctx: &mut Context,
     body: &mir::Body,
@@ -240,7 +64,6 @@ pub fn emit_wgmma_make_smem_desc(
         );
     }
 
-    // Translate the pointer argument
     let (ptr_val, last_op) = rvalue::translate_operand(
         ctx,
         body,
@@ -251,14 +74,12 @@ pub fn emit_wgmma_make_smem_desc(
         loc.clone(),
     )?;
 
-    // Create the make_smem_desc operation (returns u64)
-    // Use Unsigned signedness to match Rust's u64 type
     let u64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
     let desc_op = Operation::new(
         ctx,
         WgmmaMakeSmemDescOp::get_concrete_op_info(),
-        vec![u64_ty.into()], // Result: u64
-        vec![ptr_val],       // Operand: ptr
+        vec![u64_ty.into()],
+        vec![ptr_val],
         vec![],
         0,
     );
@@ -270,7 +91,6 @@ pub fn emit_wgmma_make_smem_desc(
         desc_op.insert_at_front(block_ptr, ctx);
     }
 
-    // Map the result
     let result_value = desc_op.deref(ctx).get_result(0);
     emit_store_result_and_goto(
         ctx,
@@ -286,19 +106,12 @@ pub fn emit_wgmma_make_smem_desc(
     )
 }
 
-/// Emit wgmma_mma_m64n64k16_f32_bf16: WGMMA matrix multiply-accumulate.
+/// Emit BF16 m64n64k16 WGMMA pointer form.
 ///
-/// Performs D = A × B + D where:
-/// - A: 64×16 (from SMEM descriptor)
-/// - B: 16×64 (from SMEM descriptor)
-/// - D: 64×64 accumulator (32 f32 values per thread, passed by pointer)
-///
-/// Args:
-/// - `args[0]`: &mut [[f32; 8]; 4] (accumulator pointer, read-modify-write)
-/// - `args[1]`: u64 (desc_a - SMEM descriptor for A)
-/// - `args[2]`: u64 (desc_b - SMEM descriptor for B)
-///
-/// Returns: void (accumulator updated in-place)
+/// `mir-lower` later selects a proven-safe enclosing region: a linear full
+/// drain, a static partial-wait pipeline, or the canonical counted K-loop.
+/// The selected region is fused so LLVM cannot observe an accumulator while a
+/// WGMMA group that references it is still pending.
 pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
     ctx: &mut Context,
     body: &mir::Body,
@@ -320,11 +133,8 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
         );
     }
 
-    // Translate arguments
     let mut last_op = prev_op;
-
-    // arg[0]: acc_ptr (pointer to accumulator array)
-    let (acc_ptr, last_op_after) = rvalue::translate_operand(
+    let (acc_ptr, next) = rvalue::translate_operand(
         ctx,
         body,
         &args[0],
@@ -333,10 +143,8 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
         last_op,
         loc.clone(),
     )?;
-    last_op = last_op_after;
-
-    // arg[1]: desc_a (u64 descriptor)
-    let (desc_a, last_op_after) = rvalue::translate_operand(
+    last_op = next;
+    let (desc_a, next) = rvalue::translate_operand(
         ctx,
         body,
         &args[1],
@@ -345,10 +153,8 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
         last_op,
         loc.clone(),
     )?;
-    last_op = last_op_after;
-
-    // arg[2]: desc_b (u64 descriptor)
-    let (desc_b, last_op_after) = rvalue::translate_operand(
+    last_op = next;
+    let (desc_b, next) = rvalue::translate_operand(
         ctx,
         body,
         &args[2],
@@ -357,14 +163,13 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
         last_op,
         loc.clone(),
     )?;
-    last_op = last_op_after;
+    last_op = next;
 
-    // Create the WGMMA MMA operation
     let mma_op = Operation::new(
         ctx,
         WgmmaMmaM64N64K16F32Bf16Op::get_concrete_op_info(),
-        vec![],                        // No results (void)
-        vec![acc_ptr, desc_a, desc_b], // Operands
+        vec![],
+        vec![acc_ptr, desc_a, desc_b],
         vec![],
         0,
     );
@@ -376,16 +181,46 @@ pub fn emit_wgmma_mma_m64n64k16_f32_bf16(
         mma_op.insert_at_front(block_ptr, ctx);
     }
 
-    // Emit goto to target block
     if let Some(target_idx) = target {
-        let goto_op = emit_goto(ctx, *target_idx, mma_op, block_map, loc);
-        Ok(goto_op)
+        Ok(emit_goto(ctx, *target_idx, mma_op, block_map, loc))
     } else {
         input_err!(
-            loc.clone(),
+            loc,
             TranslationErr::unsupported(
                 "wgmma_mma_m64n64k16_f32_bf16 call without target block".to_string()
             )
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CUSTOM_DESCRIPTOR_UNSUPPORTED, MMA_UNSUPPORTED, unsupported_diagnostic};
+
+    #[test]
+    fn unsupported_wgmma_paths_are_exact() {
+        assert_eq!(
+            unsupported_diagnostic("cuda_device::wgmma::make_smem_desc_custom"),
+            Some(CUSTOM_DESCRIPTOR_UNSUPPORTED)
+        );
+        assert_eq!(
+            unsupported_diagnostic("cuda_device::wgmma::wgmma_mma_m64n64k16_f32_bf16"),
+            None
+        );
+        for path in [
+            "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_f16",
+            "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_tf32",
+        ] {
+            assert_eq!(unsupported_diagnostic(path), Some(MMA_UNSUPPORTED));
+        }
+
+        for path in [
+            "cuda_device::wgmma::make_smem_desc",
+            "cuda_device::wgmma::wgmma_fence",
+            "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_bf16_extra",
+            "other_crate::wgmma::wgmma_mma_m64n64k16_f32_bf16",
+        ] {
+            assert_eq!(unsupported_diagnostic(path), None);
+        }
     }
 }

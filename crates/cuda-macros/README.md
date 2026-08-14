@@ -86,13 +86,27 @@ extern "C" {
 
 Occupancy hints for register allocation. It may appear before or after
 `#[kernel]`; generic kernels forward its compiler marker to every generated
-entry.
+entry. The first value is a maximum, not an exact block size.
 
 ```rust
 #[kernel]
 #[launch_bounds(256, 2)]  // max 256 threads, min 2 blocks per SM
 pub fn optimized(out: DisjointSlice<f32>) { ... }
 // PTX: .entry optimized .maxntid 256 .minnctapersm 2 { ... }
+```
+
+The values may come from a policy type. With a launch contract, the host checks
+the concrete maximum for the selected policy before launching:
+
+```rust
+#[kernel]
+#[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+#[launch_contract(domain = 1)]
+pub fn transform<P: TransformPolicy>(out: DisjointSlice<f32>) { ... }
+
+let prepared = module.prepare_transform::<SmallPolicy>(
+    LaunchConfig1D::new(blocks, 64, 0),
+)?;
 ```
 
 ### `#[launch_contract(...)]`
@@ -129,13 +143,25 @@ reduce_unchecked: raw LaunchConfig             -> unsafe expert path
 
 `block` is exact. If it is omitted, `#[launch_bounds]` supplies the compiled
 maximum total threads per block. For example, a limit of 256 accepts both
-`(256, 1, 1)` and `(16, 16, 1)`. Dynamic shared memory is either exact
+`(256, 1, 1)` and `(16, 16, 1)`.
+
+An exact `block` also reaches the device compiler, which emits
+`.reqntid x, y, z` in place of `.maxntid`. The CUDA driver enforces that per
+axis, so a launch whose block differs is refused even when it never passed
+through preparation. Preparation and the driver therefore check the same
+requirement on independent paths, and the raw `_unchecked` path is covered by
+the second. The two directives cannot coexist on one entry, so a kernel
+declaring both `#[launch_bounds]` and an exact `block` emits `.reqntid` alone.
+The occupancy hint `.minnctapersm` is unaffected.
+
+Dynamic shared memory is either exact
 (`dynamic_shared = BYTES`) or an inclusive range. The byte extent is an author
 promise; the alignment is a compiler-visible minimum and is merged with any
 higher `DynamicSharedArray<T, ALIGN>` request in the body or a reachable local
 helper. Prelinked external helpers retain their separately compiled alignment.
-Contract values are integer literals in this initial API; specialization const
-expressions are not accepted yet.
+Launch-contract fields remain integer literals. The maximum supplied by
+`#[launch_bounds]` may be a generic const expression and is evaluated for each
+kernel specialization.
 
 `domain` is deliberately explicit because calls through device helpers defeat
 AST inference. `#[cuda_module]` adds a sealed trait bound to the complete
@@ -165,9 +191,12 @@ module. Generic loading also merges all PTX bundles, so those specializations
 must match and have no conflicting entry definitions. Preparation and launch
 are safe after this one-time binding.
 
-Cluster and cooperative requirements are each checked against the live device.
-Combining them currently fails preparation because cuda-oxide cannot yet prove
-the combined residency limit with the available occupancy query.
+Cluster and cooperative requirements are each checked against the live device,
+and they may be combined. For a clustered cooperative kernel, preparation first
+proves the cluster shape with `cuOccupancyMaxActiveClusters`, then requires the
+whole grid to fit in that concurrent cluster capacity so a cooperative
+`grid::sync()` cannot hang on non-resident blocks. Oversized grids fail
+preparation with `LaunchContractError::CooperativeGridTooLarge`.
 
 ### `#[cluster_launch(x, y, z)]`
 
@@ -358,17 +387,18 @@ gpu_printf!("thread %d: val = %f\n", tid as i32, val as f64);
 
 ## `ptx_asm!` -- Inline PTX
 
-Supports CUDA inline PTX with `%0` operands, `in` / `out` operands, CUDA
-register constraints `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and `"d"`, and
-immediate integer constraint `"n"`. The template follows CUDA's `%` convention
-(`%0` operands, `%%laneid` literal registers), and `$` labels can be written
-normally. For the source syntax, see CUDA's
+Supports CUDA inline PTX with `%0` operands, `in`, `out`, and `inout`
+operands, CUDA register constraints `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and
+`"d"`, immediate integer constraint `"n"`, and compile-time string constraint
+`"C"`. The template follows CUDA's `%` convention (`%0` operands, `%%laneid`
+literal registers), and `$` labels can be written normally. For the source
+syntax, see CUDA's
 [Inline PTX Assembly](https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html)
 reference.
 
 By default, snippets are treated as side-effecting and stay inside their current
 control flow. For snippets that only read explicit operands and write the
-explicit output, add `options(register_only)`.
+explicit outputs, add `options(register_only)`.
 
 Use `options(register_only, may_diverge)` only for pure snippets that are safe
 to move across divergent control flow. **Never** use it for `.sync` instructions,
@@ -387,11 +417,72 @@ unsafe {
 }
 ```
 
-The initial surface supports zero or one `out`, up to 16 `in` operands, and
-`clobber("memory")`. `options(register_only)` requires an `out` operand and
-cannot be combined with clobbers. `options(may_diverge)` must be paired with
-`register_only`. Multiple outputs, read-write operands, and the `"C"`
-constraint are not implemented yet.
+The surface supports up to 16 output operands across `out` and `inout`, up to
+16 explicit `in` operands, and `clobber("memory")`. Every `out` constraint must
+be `=`-prefixed, such as `"=r"`. Every `inout` constraint must be `+`-prefixed,
+such as `"+r"`; its current value initializes the PTX output register and the
+final register value is written back to the same Rust place. All `out` and
+`inout` operands must appear before explicit `in` operands.
+
+With two or more output operands, including any mixture of `out` and `inout`,
+the marker returns a tuple under the hood and the macro writes its elements
+back to the output places in declaration order:
+
+```rust
+let sum: u32;
+let prod: u32;
+unsafe {
+    ptx_asm!(
+        "add.u32 %0, %2, %3; mul.lo.u32 %1, %2, %3;",
+        out("=r") sum,
+        out("=r") prod,
+        in("r") x,
+        in("r") y,
+        options(register_only),
+    );
+}
+```
+
+Read-write operands use `inout`:
+
+```rust
+let mut accumulator = initial;
+unsafe {
+    ptx_asm!(
+        "add.u32 %0, %0, %1;",
+        inout("+r") accumulator,
+        in("r") increment,
+        options(register_only),
+    );
+}
+```
+
+```rust
+const MUL_MODE: &[u8; 6] = b".wide\0";
+
+let product: u64;
+
+unsafe {
+    ptx_asm!(
+        "mul%1.u32 %0, %2, %3;",
+        out("=l") product,
+        in("C") MUL_MODE,
+        in("r") lhs,
+        in("r") rhs,
+        options(register_only),
+    );
+}
+```
+
+`in("C")` requires a compile-time byte string containing valid UTF-8. The
+referenced operand is substituted directly into the PTX template and does not
+become a runtime LLVM inline-assembly operand. One trailing zero byte is
+removed when present. Constraint modifiers such as `"=C"` and `"+C"` are not
+supported. `"C"` operands count toward the 16-input limit.
+
+`options(register_only)` requires an `out` or `inout` operand and cannot be
+combined with clobbers. `options(may_diverge)` must be paired with
+`register_only`. More than 16 output operands are not implemented yet.
 
 ## Source Layout
 

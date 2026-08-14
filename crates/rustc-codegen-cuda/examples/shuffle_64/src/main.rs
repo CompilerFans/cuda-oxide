@@ -11,13 +11,15 @@
 //! value into low/high halves (`mov.b64 {lo, hi}, x`), shuffles each half, and
 //! reassembles the result. `f64` shuffles reuse the `u64` path via a bitcast.
 //!
-//! Three kernels, one per shuffle mode family:
+//! Four kernels cover the shuffle modes and masked participation:
 //!   1. `shuffle_u64_broadcast` — `idx`: broadcast one lane's `u64` to the warp.
 //!      The value has distinct high/low 32-bit halves so a reassembly bug shows.
 //!   2. `shuffle_f64_butterfly_sum` — `bfly`: full-warp `f64` reduction; every
 //!      lane ends with the warp sum.
 //!   3. `shuffle_u64_neighbor` — `down`/`up`: read the next / previous lane,
 //!      with edge lanes keeping their own value (the PTX out-of-range rule).
+//!   4. `shuffle_u64_halfwarp` — `idx`: two masked half-warps broadcast their
+//!      own leaders without crossing the member-mask boundary.
 //!
 //! Build and run with:
 //!   cargo oxide run shuffle_64
@@ -136,11 +138,7 @@ fn main() {
     let (major, minor) = ctx.compute_capability().expect("compute capability");
     println!("GPU Compute Capability: sm_{}{}", major, minor);
 
-    let module = ctx
-        .load_module_from_file("shuffle_64.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     // A single warp is enough to demonstrate the shuffle semantics.
     let cfg = LaunchConfig {
         block_dim: (WARP as u32, 1, 1),

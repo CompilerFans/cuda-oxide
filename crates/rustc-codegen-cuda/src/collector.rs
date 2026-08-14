@@ -124,13 +124,98 @@
 //! Kernel export names are separate — they use `compute_kernel_export_name`
 //! with human-readable base names derived from the `#[kernel]` macro.
 
+use mir_importer::is_panic_entry_path;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_index::{Idx, bit_set::DenseBitSet};
 use rustc_middle::mir::mono::{CodegenUnit, MonoItem};
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{ConstOperand, ConstValue, Location, TerminatorKind};
+use rustc_middle::mir::{
+    BasicBlock, ConstOperand, ConstValue, Location, START_BLOCK, TerminatorKind,
+};
 use rustc_middle::ty::{Instance, InstanceKind, Ty, TyCtxt, TyKind, TypeVisitableExt, TypingEnv};
 use rustc_span::Span;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Blocks reachable under the values CUDA Oxide emits for device-only runtime
+/// checks.
+///
+/// rustc's `mono_reachable_as_bitset` is the right semantic source for
+/// monomorphized constants, but it evaluates `Operand::RuntimeChecks` from the
+/// host compilation session. The MIR importer deliberately emits every such
+/// query as `false` on device. Override only that operand shape here so call
+/// collection and MIR import cannot choose different switch arms.
+fn device_mono_reachable_as_bitset<'tcx>(
+    body: &rustc_middle::mir::Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> DenseBitSet<BasicBlock> {
+    let mut reachable = DenseBitSet::new_empty(body.basic_blocks.len());
+    let mut worklist = vec![START_BLOCK];
+
+    while let Some(bb) = worklist.pop() {
+        if !reachable.insert(bb) {
+            continue;
+        }
+
+        worklist.extend(device_mono_successors(
+            &body.basic_blocks[bb],
+            tcx,
+            instance,
+        ));
+    }
+
+    reachable
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceMonoReachability {
+    pub(crate) block_count: usize,
+    pub(crate) successors: Vec<Vec<usize>>,
+}
+
+fn device_mono_successors<'tcx>(
+    block: &rustc_middle::mir::BasicBlockData<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> Vec<BasicBlock> {
+    if let TerminatorKind::SwitchInt {
+        discr: rustc_middle::mir::Operand::RuntimeChecks(_),
+        targets,
+    } = &block.terminator().kind
+    {
+        vec![device_runtime_checks_target(targets)]
+    } else {
+        block.mono_successors(tcx, instance).collect()
+    }
+}
+
+/// Compute the exact per-block successor edges that collection used, for the
+/// MIR importer. `rustc_public_bridge::BodyBuilder` monomorphizes the same body
+/// in place, so block indices must remain stable; the importer also receives
+/// and verifies `block_count` and every edge before trusting them.
+pub(crate) fn device_mono_reachability<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+) -> DeviceMonoReachability {
+    let body = tcx.instance_mir(instance.def);
+    DeviceMonoReachability {
+        block_count: body.basic_blocks.len(),
+        successors: body
+            .basic_blocks
+            .iter()
+            .map(|block| {
+                device_mono_successors(block, tcx, instance)
+                    .into_iter()
+                    .map(Idx::index)
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+fn device_runtime_checks_target(targets: &rustc_middle::mir::SwitchTargets) -> BasicBlock {
+    targets.target_for_value(u128::from(mir_importer::DEVICE_RUNTIME_CHECKS_VALUE))
+}
 
 /// Result of checking if a function should be collected for device compilation.
 #[derive(Debug)]
@@ -152,14 +237,15 @@ enum CollectDecision {
 // single source of truth for the cuda_oxide_* naming contract; see its
 // crate-level docs for the layered API and the hash-suffix rationale.
 //
-// Each prefix ends with the magic suffix `246e25db_`, which makes a
+// Each prefix contains the magic component `246e25db_`, which makes a
 // substring like "cuda_oxide_kernel_" — without the hash — never falsely
 // match. The mutual-exclusion guarantee between `DEVICE_PREFIX` and
 // `DEVICE_EXTERN_PREFIX` means we no longer need the historical
 // "test extern first" ordering dance that lived here previously.
 use reserved_oxide_symbols::{
-    device_extern_base_name, is_device_extern_symbol, is_device_symbol, is_kernel_symbol,
-    kernel_base_name,
+    device_extern_base_name, is_current_device_symbol, is_current_kernel_symbol,
+    is_device_extern_symbol, is_device_symbol, is_kernel_symbol, is_legacy_kernel_symbol,
+    is_ptx_merge_required_marker, kernel_base_name,
 };
 
 /// Sanitize a symbol name for use as a PTX identifier.
@@ -298,6 +384,14 @@ pub struct CollectionResult<'tcx> {
 
     /// External device function declarations (no MIR, emit as `declare`).
     pub device_externs: Vec<DeviceExternDecl>,
+
+    /// Whether this crate needs the run-time loader to merge PTX bundles.
+    ///
+    /// This is true for a `#[cuda_module]` containing a generic kernel and
+    /// for a concrete specialization of a generic kernel imported from a
+    /// dependency. Cubin materialization must reject this case until it can
+    /// reproduce the same cross-crate linking semantics.
+    pub requires_ptx_bundle_merge: bool,
 }
 
 /// Counts kernel functions across all codegen units.
@@ -341,21 +435,69 @@ pub fn count_device_fns_in_cgus<'tcx>(tcx: TyCtxt<'tcx>, cgus: &[CodegenUnit<'tc
     count
 }
 
+/// Find a device-code root emitted before the scoped Cargo cache protocol.
+///
+/// This deliberately inspects both local and external `DefId`s. A generic
+/// kernel defined by an older macro may have no monomorphized root in its
+/// defining crate; its first concrete `MonoItem` then appears only in a
+/// downstream consumer. Recognizing the legacy name there prevents that
+/// consumer from seeding a cache entry that would stay fresh across device
+/// output or architecture changes.
+pub fn unsupported_codegen_protocol_root_in_cgus<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cgus: &[CodegenUnit<'tcx>],
+) -> Option<String> {
+    cgus.iter().find_map(|cgu| {
+        cgu.items().iter().find_map(|(item, _data)| {
+            let MonoItem::Fn(instance) = item else {
+                return None;
+            };
+            let def_id = instance.def_id();
+            let item_name = tcx.opt_item_name(def_id)?;
+            unsupported_codegen_protocol_root(item_name.as_str()).then(|| tcx.def_path_str(def_id))
+        })
+    })
+}
+
+fn unsupported_codegen_protocol_root(name: &str) -> bool {
+    (is_kernel_symbol(name) && !is_current_kernel_symbol(name))
+        || (is_device_symbol(name) && !is_current_device_symbol(name))
+}
+
 /// Checks if a function is a kernel entry point.
 ///
-/// Detection is based on the `KERNEL_PREFIX` substring (currently
-/// `cuda_oxide_kernel_246e25db_`) which the `#[kernel]` macro adds to
-/// renamed functions:
+/// Detection is based on the generated namespace in the *final* def-path
+/// segment: it must start with `KERNEL_PREFIX` (currently
+/// `cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_`) or, for roots emitted
+/// before the scoped Cargo cache protocol, `LEGACY_KERNEL_PREFIX`. Legacy
+/// roots stay classified so the protocol handshake can reject them with an
+/// explicit diagnostic instead of silently skipping device codegen. The
+/// final-segment check matters because a named item nested inside a kernel
+/// has the kernel symbol as an earlier path segment, but is a device helper
+/// rather than another entry point.
 ///
 /// ```text
 /// User writes:        Macro expands to:
 /// ┌─────────────────┐  ┌────────────────────────────────────────────────┐
 /// │ #[kernel]       │  │ #[no_mangle]                                   │
-/// │ fn add_one(...) │ ⇒│ pub fn cuda_oxide_kernel_246e25db_add_one(...) │
+/// │ fn add_one(...) │ ⇒│ pub fn cuda_oxide_codegen_v1_cuda_oxide_kernel_246e25db_add_one(...) │
 /// └─────────────────┘  └────────────────────────────────────────────────┘
 /// ```
 pub fn is_kernel_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    is_kernel_symbol(&tcx.def_path_str(def_id))
+    is_kernel_entry_def_path(&tcx.def_path_str(def_id))
+}
+
+/// Returns `true` when `def_path` names a kernel entry point *itself*, as
+/// opposed to an item nested inside a kernel body.
+///
+/// A closure or named `fn` defined inside a `#[kernel]` has the kernel's name
+/// as an earlier path segment (`...::cuda_oxide_kernel_<hash>_k::helper`).
+/// Nested items are plain device functions, exported under their canonical
+/// mangled symbol by the call-graph walk. Rooting them as kernels would give
+/// generic nested fns a `_TID_<hash>` export name that no call site references,
+/// failing module verification with "Symbol ... not found".
+pub(crate) fn is_kernel_entry_def_path(def_path: &str) -> bool {
+    is_current_kernel_symbol(def_path) || is_legacy_kernel_symbol(def_path)
 }
 
 /// Checks if a function is a standalone device function definition.
@@ -479,6 +621,36 @@ fn is_unroll_marker_path(fn_path: &str) -> bool {
     fn_path.contains("::__unroll_config")
 }
 
+/// Returns true for zero-cost compile-time configuration markers planted by
+/// proc macros (launch metadata and the unchecked-indexing flag).
+///
+/// The MIR importer consumes these calls while translating their containing
+/// function. Their own empty bodies are not device functions and must not be
+/// collected into the output module. Match both the defining `thread` path and
+/// cuda-device's root re-export spelling used by rustc's path printer.
+fn is_launch_metadata_marker_path(fn_path: &str) -> bool {
+    matches!(
+        fn_path,
+        "cuda_device::__launch_bounds_config"
+            | "cuda_device::thread::__launch_bounds_config"
+            | "cuda_device::__launch_contract_config"
+            | "cuda_device::thread::__launch_contract_config"
+            | "cuda_device::__launch_contract_block_config"
+            | "cuda_device::thread::__launch_contract_block_config"
+            | "cuda_device::__unchecked_indexing_config"
+            | "cuda_device::thread::__unchecked_indexing_config"
+    ) || fn_path.strip_prefix("cuda_device::").is_some_and(|path| {
+        path.starts_with("__launch_bounds_config::<")
+            || path.starts_with("thread::__launch_bounds_config::<")
+            || path.starts_with("__launch_contract_config::<")
+            || path.starts_with("thread::__launch_contract_config::<")
+            || path.starts_with("__launch_contract_block_config::<")
+            || path.starts_with("thread::__launch_contract_block_config::<")
+            || path.starts_with("__unchecked_indexing_config::<")
+            || path.starts_with("thread::__unchecked_indexing_config::<")
+    })
+}
+
 /// Marker substring of the panic message used by the public
 /// `cuda_device::thread::index_*` stubs (see `cuda-device/src/thread.rs`).
 ///
@@ -488,15 +660,6 @@ fn is_unroll_marker_path(fn_path: &str) -> bool {
 /// device-reachable MIR, a stub was reached through code that the macros
 /// never rewrote, which means a helper function is missing `#[device]`.
 const MISSING_DEVICE_STUB_MARKER: &str = "called outside #[kernel] / #[device]";
-
-/// Returns true for the panic entry points in `core` (and the `std`
-/// re-export) that mark a basic block as a panic path.
-///
-/// Kept in sync with `is_unreachable_body`, which uses the same test to
-/// recognize intrinsic placeholder bodies.
-fn is_panic_entry_path(fn_path: &str) -> bool {
-    fn_path.contains("::panicking::") || fn_path.contains("::rt::panic")
-}
 
 /// If `fn_path` names one of the Rust global-allocator entry points,
 /// returns the bare shim name (for use in the diagnostic), else `None`.
@@ -658,6 +821,12 @@ pub fn collect_device_functions<'tcx>(
     verbose: bool,
 ) -> CollectionResult<'tcx> {
     let mut collector = DeviceCollector::new(tcx, verbose);
+    let mut requires_ptx_bundle_merge = cgus.iter().any(|cgu| {
+        cgu.items().iter().any(|(item, _data)| match item {
+            MonoItem::Static(def_id) => is_ptx_merge_required_marker(&tcx.def_path_str(*def_id)),
+            _ => false,
+        })
+    });
 
     // Find all kernel entry points
     for cgu in cgus {
@@ -665,20 +834,6 @@ pub fn collect_device_functions<'tcx>(
             if let MonoItem::Fn(instance) = item
                 && is_kernel_function(tcx, instance.def_id())
             {
-                // Skip closures inside kernels - they are device functions, not kernels.
-                // Closures have names like "cuda_oxide_kernel_<hash>_foo::{closure#0}" but
-                // only "cuda_oxide_kernel_<hash>_foo" is the actual kernel entry point.
-                let name = tcx.def_path_str(instance.def_id());
-                if name.contains("{closure") || name.contains("::closure") {
-                    if verbose {
-                        eprintln!(
-                            "[collector] Skipping closure inside kernel (not an entry point): {}",
-                            name
-                        );
-                    }
-                    continue;
-                }
-
                 // Skip generic (non-monomorphized) instances.
                 // For generic kernels like scale<T>, the CGU contains both:
                 // - The generic definition (scale<T>) - skip this
@@ -693,6 +848,15 @@ pub fn collect_device_functions<'tcx>(
                     }
                     continue;
                 }
+
+                // A downstream monomorphization of a generic kernel may be
+                // present even when the defining crate's private module
+                // marker is not. Such modules use the all-PTX-bundles loader,
+                // so strict ahead-of-time cubin materialization cannot safely
+                // compile only this crate's artifact.
+                requires_ptx_bundle_merge |= tcx
+                    .generics_of(instance.def_id())
+                    .requires_monomorphization(tcx);
 
                 let name = tcx.def_path_str(instance.def_id());
                 // Extract the kernel base name by stripping the reserved
@@ -759,7 +923,9 @@ pub fn collect_device_functions<'tcx>(
     }
 
     // Process the worklist to collect all reachable functions
-    collector.collect()
+    let mut result = collector.collect();
+    result.requires_ptx_bundle_merge = requires_ptx_bundle_merge;
+    result
 }
 
 /// Worklist-based collector for device-reachable functions.
@@ -880,8 +1046,13 @@ impl<'tcx> DeviceCollector<'tcx> {
                     user_span: self.tcx.def_span(def_id),
                 });
 
-            // Get MIR body if available
-            if self.tcx.is_mir_available(def_id) {
+            // Get MIR body if available. For drop glue shims
+            // (InstanceKind::DropGlue), `is_mir_available` may return false
+            // because the shim is compiler-generated, but `instance_mir`
+            // still provides the body.
+            let has_mir = self.tcx.is_mir_available(def_id)
+                || matches!(func.instance.def, InstanceKind::DropGlue(..));
+            if has_mir {
                 // Use instance_mir for monomorphized MIR.
                 // This returns OPTIMIZED MIR (post -C opt-level passes).
                 let mir = self.tcx.instance_mir(func.instance.def);
@@ -894,15 +1065,36 @@ impl<'tcx> DeviceCollector<'tcx> {
                     );
                 }
 
+                // Skip blocks that are unreachable after monomorphization —
+                // e.g. the const-false arm of `if S::CONST_FLAG` in a generic
+                // fn. rustc's own collector walks only mono-reachable blocks
+                // (see `Body::mono_successors`), so dead-arm callees are never
+                // instantiated anywhere else; collecting them here would
+                // demand symbols that can never resolve, and reject panic-only
+                // hooks that are never actually called. This exact set is
+                // also carried across the rustc_public bridge to the MIR
+                // importer, so collection and translation have one semantic
+                // owner instead of two constant evaluators.
+                let reachable = device_mono_reachable_as_bitset(mir, self.tcx, func.instance);
+
                 // Fail fast with an actionable diagnostic when this body
                 // contains panic-formatting machinery the device pipeline
-                // cannot compile (issue #76).
-                self.check_panic_machinery(mir, &func, &ctx);
+                // cannot compile (issue #76). Skip for drop glue shims:
+                // their MIR is compiler-generated and may contain panic
+                // paths (e.g. for assertion failures) that are unreachable
+                // in practice; the mir-importer handles these via its
+                // existing unreachable-block patching.
+                if !matches!(func.instance.def, InstanceKind::DropGlue(..)) {
+                    self.check_panic_machinery(mir, &func, &ctx, &reachable);
+                }
 
-                // Walk all basic blocks looking for calls.
+                // Walk the reachable basic blocks looking for calls.
                 // Pass the caller so we can substitute its args into callees
                 // and attribute diagnostics to the right discovery path.
-                for bb_data in mir.basic_blocks.iter() {
+                for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
+                    if !reachable.contains(bb) {
+                        continue;
+                    }
                     if let Some(ref terminator) = bb_data.terminator {
                         self.process_terminator(terminator, mir, &func, &ctx);
                     }
@@ -915,6 +1107,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         CollectionResult {
             functions: self.result,
             device_externs: self.device_externs,
+            requires_ptx_bundle_merge: false,
         }
     }
 
@@ -981,14 +1174,154 @@ impl<'tcx> DeviceCollector<'tcx> {
         caller: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
     ) {
-        if let TerminatorKind::Call { func, .. } = &terminator.kind {
-            // The span of the whole call expression, mapped back through
-            // MIR inlining and macro expansion to the line the user wrote.
-            // (The function operand's own span is reset to a dummy by MIR
-            // inlining, so it is useless for diagnostics.)
-            let call_span = outermost_user_span(mir, terminator.source_info);
-            self.process_call_operand(func, call_span, caller, ctx);
+        match &terminator.kind {
+            TerminatorKind::Call { func, .. } => {
+                // The span of the whole call expression, mapped back through
+                // MIR inlining and macro expansion to the line the user wrote.
+                // (The function operand's own span is reset to a dummy by MIR
+                // inlining, so it is useless for diagnostics.)
+                let call_span = outermost_user_span(mir, terminator.source_info);
+                self.process_call_operand(func, call_span, caller, ctx);
+            }
+            TerminatorKind::Drop { place, .. } => {
+                // Collect `drop_in_place::<T>` when T has non-trivial drop glue.
+                // Without this, the MIR translator would emit a call to a
+                // `drop_in_place` symbol that has no definition in the module.
+                self.process_drop_place(place, mir, caller, ctx);
+            }
+            _ => {}
         }
+    }
+
+    /// Collect the `drop_in_place::<T>` function for a `Drop` terminator.
+    ///
+    /// When the MIR contains a `Drop` terminator for a place of type `T`,
+    /// rustc generates a `drop_in_place::<T>` shim that calls `<T as Drop>::drop`
+    /// (if `T` implements `Drop`) and recursively drops each field. The
+    /// mir-importer needs this function to exist as a device function so it
+    /// can emit a call to it.
+    ///
+    /// The shim's MIR body may itself contain `Call` terminators (to
+    /// `<T as Drop>::drop` and to nested `drop_in_place::<FieldTy>`) and
+    /// `Drop` terminators (for fields). These are discovered transitively
+    /// when the shim's body is walked by `collect()` on subsequent iterations.
+    ///
+    /// Drop glue instances resolve to `InstanceKind::DropGlue`, not
+    /// `InstanceKind::Item`, so the regular `process_call_operand` path
+    /// would skip them. This dedicated handler resolves the drop instance
+    /// directly and enqueues it.
+    fn process_drop_place(
+        &mut self,
+        place: &rustc_middle::mir::Place<'tcx>,
+        mir: &rustc_middle::mir::Body<'tcx>,
+        caller: &CollectedFunction<'tcx>,
+        ctx: &DiscoveryCtx,
+    ) {
+        use rustc_middle::ty::EarlyBinder;
+
+        // Compute the type of the dropped place, substituting the caller's
+        // generic args to get a fully monomorphized type.
+        let place_ty = place.ty(mir, self.tcx).ty;
+        let place_ty = self.tcx.instantiate_and_normalize_erasing_regions(
+            caller.instance.args,
+            TypingEnv::fully_monomorphized(),
+            EarlyBinder::bind(place_ty),
+        );
+
+        // Resolve drop_in_place::<T>. This returns the drop glue shim
+        // (InstanceKind::DropGlue) which wraps the actual Drop::drop call.
+        let drop_instance = Instance::resolve_drop_in_place(self.tcx, place_ty);
+
+        // DropGlue(_, None) is an empty shim for types that need no
+        // destructor. The mir-importer's no-op analysis will lower these
+        // as plain branches, so there's nothing to collect.
+        if let InstanceKind::DropGlue(_, None) = drop_instance.def {
+            return;
+        }
+
+        let mangled = self.tcx.symbol_name(drop_instance).name.to_string();
+        if self.seen.contains(&mangled) {
+            return;
+        }
+
+        // Ensure the type is fully monomorphized
+        if !is_fully_monomorphized(self.tcx, drop_instance) {
+            if self.verbose {
+                eprintln!(
+                    "[collector] Skipping non-monomorphized drop_in_place: {:?}",
+                    place_ty
+                );
+            }
+            return;
+        }
+
+        // Skip drop glue whose shim body is provably a no-op: the
+        // mir-importer's translate_drop lowers such drops to plain
+        // branches and never references the shim, so collecting it would
+        // only translate dead code and transitively pull in stdlib
+        // `Drop::drop` bodies (e.g. `core::array::IntoIter`'s
+        // `PolymorphicIter`) whose MIR the device pipeline cannot
+        // compile. This is the same predicate the importer's emit
+        // decision and the device_codegen translation filter consult,
+        // so the three decisions cannot drift.
+        if self.drop_glue_is_noop(drop_instance) {
+            if self.verbose {
+                eprintln!("[collector] Skipping no-op drop_in_place::<{:?}>", place_ty);
+            }
+            return;
+        }
+
+        let drop_ctx = DiscoveryCtx {
+            root_name: ctx.root_name.clone(),
+            root_is_kernel: ctx.root_is_kernel,
+            user_span: ctx.user_span,
+        };
+
+        // Use the mangled name as the export name for drop glue instances.
+        // The mir-importer uses Instance::resolve_drop_in_place followed by
+        // mangled_name() to derive the callee symbol, so the export name
+        // must match. Drop glue always has generic args (the dropped type),
+        // so mangled_name is the correct choice (never the simple FQDN).
+        let export_name = sanitize_ptx_name(&mangled);
+
+        if self.verbose {
+            eprintln!(
+                "[collector] Discovered drop_in_place::<{:?}> -> {}",
+                place_ty, export_name
+            );
+        }
+
+        self.discovery.insert(mangled.clone(), drop_ctx);
+        self.seen.insert(mangled);
+        self.used_export_names.insert(export_name.clone());
+        self.worklist.push_back(CollectedFunction {
+            instance: drop_instance,
+            is_kernel: false,
+            export_name,
+        });
+    }
+
+    /// Returns true when the drop glue `instance` is provably a no-op.
+    ///
+    /// Delegates to `mir_importer::drop_instance_is_noop`, the single
+    /// shared predicate that also drives the importer's emit decision
+    /// (`translate_drop`) and the `device_codegen` translation filter.
+    /// Sharing one predicate keeps collection, emission, and translation
+    /// in lockstep: everything the importer calls is collected, and
+    /// nothing dead is translated.
+    ///
+    /// The predicate needs stable MIR queries, so a scoped
+    /// `rustc_internal::run` context is set up per query. Collection runs
+    /// before `device_codegen` enters its own context, so this never
+    /// nests; if it ever does, `run` returns an error and we fall back to
+    /// collecting the shim, a safe over-approximation that the
+    /// `device_codegen` filter prunes with the same predicate.
+    fn drop_glue_is_noop(&self, instance: Instance<'tcx>) -> bool {
+        use rustc_public::rustc_internal;
+        rustc_internal::run(self.tcx, || {
+            mir_importer::drop_instance_is_noop(&rustc_internal::stable(instance))
+        })
+        .unwrap_or(false)
     }
 
     /// Process a call operand to extract and add the callee.
@@ -1174,14 +1507,80 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         }
 
-        // Skip intrinsics and other special functions
-        if !matches!(resolved.def, InstanceKind::Item(_)) {
+        // Skip intrinsics and other special functions, but allow DropGlue
+        // instances through so that drop_in_place calls inside drop shim
+        // bodies (e.g. for array/slice element drops) are collected.
+        if !matches!(
+            resolved.def,
+            InstanceKind::Item(_) | InstanceKind::DropGlue(..)
+        ) {
+            return;
+        }
+
+        // For DropGlue instances discovered via Call terminators (rather
+        // than Drop terminators), route them through the same collection
+        // logic as process_drop_place to avoid duplicating the enqueue path.
+        if let InstanceKind::DropGlue(_, Some(_)) = resolved.def {
+            let mangled = self.tcx.symbol_name(resolved).name.to_string();
+            if self.seen.contains(&mangled) {
+                return;
+            }
+            if !is_fully_monomorphized(self.tcx, resolved) {
+                return;
+            }
+            // Skip provably no-op drop glue; same shared predicate as
+            // process_drop_place, for the same lockstep reason.
+            if self.drop_glue_is_noop(resolved) {
+                return;
+            }
+            let callee_ctx = DiscoveryCtx {
+                root_name: ctx.root_name.clone(),
+                root_is_kernel: ctx.root_is_kernel,
+                user_span: if caller.instance.def_id().is_local() && !call_span.is_dummy() {
+                    call_span
+                } else {
+                    ctx.user_span
+                },
+            };
+            let export_name = sanitize_ptx_name(&mangled);
+            if self.verbose {
+                eprintln!(
+                    "[collector] Discovered drop_in_place (via call) -> {}",
+                    export_name
+                );
+            }
+            self.discovery.insert(mangled.clone(), callee_ctx);
+            self.seen.insert(mangled);
+            self.used_export_names.insert(export_name.clone());
+            self.worklist.push_back(CollectedFunction {
+                instance: resolved,
+                is_kernel: false,
+                export_name,
+            });
+            return;
+        }
+
+        // Empty drop glue (DropGlue with None type) has no body to collect.
+        if let InstanceKind::DropGlue(_, None) = resolved.def {
+            return;
+        }
+
+        let raw_name = self.tcx.def_path_str(resolved.def_id());
+        let crate_name = self.tcx.crate_name(resolved.def_id().krate);
+        if self.is_generated_intrinsic_placeholder_or_report_mismatch(
+            crate_name.as_str(),
+            &raw_name,
+            resolved.def_id(),
+            call_span,
+        ) {
+            if self.verbose {
+                eprintln!("[collector] Skipping generated intrinsic placeholder: {raw_name}");
+            }
             return;
         }
 
         // Check if this is a device extern declaration (FFI with external LTOIR).
         // These have no MIR body but should be emitted as LLVM `declare` statements.
-        let raw_name = self.tcx.def_path_str(resolved.def_id());
         if is_device_extern_symbol(&raw_name) {
             self.add_device_extern(resolved.def_id(), &raw_name);
             return;
@@ -1215,6 +1614,13 @@ impl<'tcx> DeviceCollector<'tcx> {
         if is_unroll_marker_path(&raw_name) {
             if self.verbose {
                 eprintln!("[collector] Skipping unroll marker: {raw_name}");
+            }
+            return;
+        }
+
+        if is_launch_metadata_marker_path(&raw_name) {
+            if self.verbose {
+                eprintln!("[collector] Skipping launch metadata marker: {raw_name}");
             }
             return;
         }
@@ -1301,6 +1707,28 @@ impl<'tcx> DeviceCollector<'tcx> {
             }
             _ => return,
         };
+
+        let target = self.tcx.def_path_str(instance.def_id());
+        let crate_name = self.tcx.crate_name(instance.def_id().krate);
+        if self.is_generated_intrinsic_placeholder_or_report_mismatch(
+            crate_name.as_str(),
+            &target,
+            instance.def_id(),
+            call_span,
+        ) {
+            self.tcx
+                .dcx()
+                .struct_span_fatal(
+                    call_span,
+                    format!(
+                        "`{target}` cannot be used as a function item in device code because generated CUDA intrinsics require direct call-site lowering"
+                    ),
+                )
+                .with_help(
+                    "wrap the intrinsic call in a local `#[device]` function and pass that wrapper instead",
+                )
+                .emit()
+        }
 
         match self.should_collect_from_crate(instance.def_id()) {
             CollectDecision::Collect => {}
@@ -1427,8 +1855,12 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Check if this is a kernel entry point. Kernels can come from ANY
         // crate — this enables library crates to export generic kernels that
         // get monomorphized when used in an application.
-        let fn_name = self.tcx.item_name(def_id);
-        if is_kernel_symbol(fn_name.as_str()) {
+        // Unnamed items (closures) have no item name — `item_name` ICEs on
+        // them — and can never be kernel entry points, so fall through to
+        // the crate-based decision for them.
+        if let Some(fn_name) = self.tcx.opt_item_name(def_id)
+            && is_kernel_symbol(fn_name.as_str())
+        {
             return CollectDecision::Collect;
         }
 
@@ -1594,6 +2026,62 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         false
+    }
+
+    /// Recognize a generated intrinsic placeholder or reject a mismatched raw
+    /// intrinsic crate before its panic-only host body enters collection.
+    fn is_generated_intrinsic_placeholder_or_report_mismatch(
+        &self,
+        crate_name: &str,
+        displayed_path: &str,
+        def_id: DefId,
+        call_span: Span,
+    ) -> bool {
+        if crate::generated_intrinsics::is_generated_intrinsic_crate(crate_name) {
+            // `def_path_str` intentionally prefers a public re-export path.
+            // Intrinsic ABI matching instead uses rustc's underlying DefPath,
+            // whose parent chain is stable and still contains the hidden ABI
+            // namespace and opaque per-intrinsic ID.
+            let canonical_path = format!(
+                "{}{}",
+                crate_name,
+                self.tcx.def_path(def_id).to_string_no_crate_verbose()
+            );
+            if !crate::generated_intrinsics::is_generated_intrinsic_canonical_path(&canonical_path)
+            {
+                self.report_generated_intrinsic_abi_mismatch(&canonical_path, call_span);
+            }
+            return true;
+        }
+
+        crate::generated_intrinsics::is_generated_intrinsic_placeholder(crate_name, displayed_path)
+    }
+
+    /// Emit a focused error when the raw declaration crate and compiler were
+    /// generated from different intrinsic ABI versions or identity tables.
+    fn report_generated_intrinsic_abi_mismatch(&self, path: &str, call_span: Span) -> ! {
+        let canonical_paths =
+            crate::generated_intrinsics::GENERATED_INTRINSIC_CANONICAL_PATHS.join(", ");
+        let public_paths = crate::generated_intrinsics::GENERATED_INTRINSIC_PUBLIC_PATHS.join(", ");
+        self.tcx
+            .dcx()
+            .struct_span_fatal(
+                call_span,
+                format!(
+                    "cuda-intrinsics ABI mismatch: `{path}` is not recognized by this cuda-oxide compiler"
+                ),
+            )
+            .with_note(format!(
+                "this compiler supports generated intrinsic ABI v{} in hidden namespace `{}`",
+                crate::generated_intrinsics::GENERATED_INTRINSIC_ABI,
+                crate::generated_intrinsics::GENERATED_INTRINSIC_ABI_NAMESPACE,
+            ))
+            .with_note(format!("recognized canonical path(s): {canonical_paths}"))
+            .with_note(format!("supported public source path(s): {public_paths}"))
+            .with_help(
+                "use the cuda-intrinsics crate generated by this cuda-oxide revision, then rebuild the device crate",
+            )
+            .emit()
     }
 
     /// Emits the heap-allocation diagnostic (issue #108) and aborts.
@@ -1775,29 +2263,38 @@ impl<'tcx> DeviceCollector<'tcx> {
             .emit()
     }
 
-    /// Diagnoses panic-formatting machinery inside a collected body
-    /// (issue #76).
+    /// Diagnoses a missing `#[device]` annotation found through the panic
+    /// machinery of a collected body (issue #76).
     ///
     /// Called from [`collect`] for every function that is about to be
-    /// translated. A basic block that ends in a call into
-    /// `core::panicking` and *materializes a `&str` constant in a
-    /// statement* (the panic message, or pieces of a `format_args!`
-    /// template) cannot be translated: string constants in statements have
-    /// no device lowering, so the user would get an opaque
-    /// constant-translation error pointing into `core`. Report the real
-    /// situation instead.
+    /// translated. A basic block ending in a call into `core::panicking`
+    /// is a panic path; the string constants it materializes are the panic
+    /// message (or the pieces of a `format_args!` template).
     ///
-    /// Panic calls whose message travels only in the call arguments are
-    /// left alone on purpose: diverging call arguments are dropped by the
-    /// translator and the call lowers to LLVM `unreachable`, which is the
-    /// supported behavior for conditional panics like `unwrap`.
+    /// A *genuine* panic is not this function's business: the mir-importer
+    /// drops the diverging call, skips the dead message-building statements
+    /// and traps instead (`mir-importer`'s
+    /// `translator::block::translate_block`), so `panic!`, `unwrap`,
+    /// `expect` and every core panic reached through them compile.
+    ///
+    /// One message is still a hard error, because trapping it would bury a
+    /// real bug: the `thread::index_*` stub marker. It can only appear in
+    /// device-reachable MIR when a helper without `#[device]` called the
+    /// public stub and got its host-only panicking body inlined. Lowering
+    /// that to a trap would turn "you forgot an annotation" into a thread
+    /// that silently aborts the kernel, so it is reported here instead.
     fn check_panic_machinery(
         &self,
         mir: &rustc_middle::mir::Body<'tcx>,
         func: &CollectedFunction<'tcx>,
         ctx: &DiscoveryCtx,
+        reachable: &DenseBitSet<BasicBlock>,
     ) {
         for (bb, bb_data) in mir.basic_blocks.iter_enumerated() {
+            // A panic in a mono-unreachable block never runs on device.
+            if !reachable.contains(bb) {
+                continue;
+            }
             let Some(term) = &bb_data.terminator else {
                 continue;
             };
@@ -1817,6 +2314,30 @@ impl<'tcx> DeviceCollector<'tcx> {
                 found: Vec::new(),
             };
             scan.visit_basic_block_data(bb, bb_data);
+
+            // Stub marker: the `thread::index_*` stub was inlined into this
+            // body, so a function on the way here is missing `#[device]`.
+            let stub_marker = scan
+                .found
+                .iter()
+                .find(|(_, _, text)| text.contains(MISSING_DEVICE_STUB_MARKER));
+
+            // Any other panic message is fine: the message-building
+            // statements are dead once the diverging call is dropped, so the
+            // importer skips them and the path lowers to a device trap. Note
+            // it under `--verbose` so the dropped message stays traceable.
+            let Some((_, _, marker_text)) = stub_marker else {
+                if self.verbose
+                    && let Some((_, _, text)) = scan.found.first()
+                {
+                    eprintln!(
+                        "[collector] Panic message dropped, path traps on device: {text:?} \
+                         (in `{}`)",
+                        self.tcx.def_path_str(func.instance.def_id())
+                    );
+                }
+                continue;
+            };
 
             let func_path = self.tcx.def_path_str(func.instance.def_id());
             let root_kind = if ctx.root_is_kernel {
@@ -1842,60 +2363,23 @@ impl<'tcx> DeviceCollector<'tcx> {
             // through MIR inlining and macro expansion to user code.
             let user_span = outermost_user_span(mir, term.source_info);
 
-            // Stub marker: the `thread::index_*` stub was inlined into this
-            // body, so a function on the way here is missing `#[device]`.
-            if let Some((_, _, text)) = scan
-                .found
-                .iter()
-                .find(|(_, _, text)| text.contains(MISSING_DEVICE_STUB_MARKER))
-            {
-                let stub = stub_name_from_marker_message(text);
-                self.tcx
-                    .dcx()
-                    .struct_span_fatal(
-                        user_span,
-                        format!(
-                            "`{stub}` only works inside `#[kernel]` / `#[device]` \
-                             functions; here it resolves to a host-only stub that \
-                             panics instead of reading the thread index"
-                        ),
-                    )
-                    .with_note(location_note.clone())
-                    .with_help(format!(
-                        "annotate the helper that calls `{stub}` with `#[device]`, or \
-                         compute the index in the kernel and pass it in as a parameter"
-                    ))
-                    .emit()
-            }
-
-            // A panic message materialized in a statement: translation of
-            // this body is guaranteed to fail, so error out with the likely
-            // causes instead.
-            if scan
-                .found
-                .iter()
-                .any(|(loc, _, _)| loc.statement_index < bb_data.statements.len())
-            {
-                self.tcx
-                    .dcx()
-                    .struct_span_fatal(
-                        user_span,
-                        "device code reaches a panic that builds a message string; \
-                         panic message formatting is not supported on the GPU",
-                    )
-                    .with_note(location_note)
-                    .with_note(
-                        "likely causes: a function used in device code without \
-                         `#[device]` (its body then resolves to a host-only stub that \
-                         panics), or a real panic path such as `panic!` / `assert!` / \
-                         `expect` with a message",
-                    )
-                    .with_help(
-                        "annotate device helpers with `#[device]`; for intentional \
-                         checks, branch and return instead of panicking with a message",
-                    )
-                    .emit()
-            }
+            let stub = stub_name_from_marker_message(marker_text);
+            self.tcx
+                .dcx()
+                .struct_span_fatal(
+                    user_span,
+                    format!(
+                        "`{stub}` only works inside `#[kernel]` / `#[device]` \
+                         functions; here it resolves to a host-only stub that \
+                         panics instead of reading the thread index"
+                    ),
+                )
+                .with_note(location_note)
+                .with_help(format!(
+                    "annotate the helper that calls `{stub}` with `#[device]`, or \
+                     compute the index in the kernel and pass it in as a parameter"
+                ))
+                .emit()
         }
     }
 
@@ -1944,4 +2428,131 @@ pub fn dump_device_mir_info<'tcx>(tcx: TyCtxt<'tcx>, functions: &[CollectedFunct
         }
     }
     eprintln!("=================================\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        device_runtime_checks_target, is_kernel_entry_def_path, unsupported_codegen_protocol_root,
+    };
+    use reserved_oxide_symbols::{
+        DEVICE_PREFIX, KERNEL_PREFIX, LEGACY_DEVICE_PREFIX, LEGACY_KERNEL_PREFIX,
+        PTX_MERGE_REQUIRED_PREFIX, is_ptx_merge_required_marker, ptx_merge_required_marker,
+    };
+    use rustc_index::Idx;
+    use rustc_middle::mir::BasicBlock;
+
+    #[test]
+    fn ptx_merge_marker_matches_only_the_final_path_component() {
+        let marker = ptx_merge_required_marker("map");
+        assert!(is_ptx_merge_required_marker(&marker));
+        assert!(is_ptx_merge_required_marker(&format!(
+            "crate_name::kernels::{marker}"
+        )));
+        assert!(!is_ptx_merge_required_marker(&format!(
+            "crate_name::prefix_{marker}"
+        )));
+        assert!(!is_ptx_merge_required_marker(PTX_MERGE_REQUIRED_PREFIX));
+        assert!(!is_ptx_merge_required_marker("crate_name::ordinary_static"));
+    }
+
+    #[test]
+    fn scoped_cache_protocol_rejects_legacy_local_and_external_roots() {
+        assert!(!unsupported_codegen_protocol_root(&format!(
+            "local::{KERNEL_PREFIX}map"
+        )));
+        assert!(!unsupported_codegen_protocol_root(&format!(
+            "local::{DEVICE_PREFIX}helper"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "legacy::{LEGACY_KERNEL_PREFIX}map"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "dependency::{LEGACY_KERNEL_PREFIX}generic_kernel"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "legacy::{LEGACY_DEVICE_PREFIX}helper"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "{LEGACY_KERNEL_PREFIX}codegen_v1_map"
+        )));
+        assert!(unsupported_codegen_protocol_root(&format!(
+            "crate::{KERNEL_PREFIX}module::{LEGACY_KERNEL_PREFIX}map"
+        )));
+        assert!(!unsupported_codegen_protocol_root(
+            "ordinary::host_function"
+        ));
+    }
+
+    #[test]
+    fn runtime_checks_select_the_device_false_target() {
+        let false_target = BasicBlock::from_usize(1);
+        let true_target = BasicBlock::from_usize(2);
+        let targets = rustc_middle::mir::SwitchTargets::static_if(0, false_target, true_target);
+        assert_eq!(device_runtime_checks_target(&targets), false_target);
+    }
+
+    #[test]
+    fn kernel_def_paths_are_entry_points() {
+        // Bare and fully-qualified kernel names: the marker is the final segment.
+        assert!(is_kernel_entry_def_path(&format!("{KERNEL_PREFIX}vecadd")));
+        assert!(is_kernel_entry_def_path(&format!(
+            "kernels::{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(is_kernel_entry_def_path(&format!(
+            "my_crate::kernels::{KERNEL_PREFIX}vecadd"
+        )));
+        // Legacy roots still classify as entry points. They must not vanish
+        // as ordinary host functions: the scoped-cache handshake rejects
+        // them with an explicit diagnostic (see
+        // `unsupported_codegen_protocol_root`), and builds outside the
+        // protocol continue to compile them.
+        assert!(is_kernel_entry_def_path(&format!(
+            "legacy::{LEGACY_KERNEL_PREFIX}vecadd"
+        )));
+    }
+
+    #[test]
+    fn items_nested_inside_kernel_bodies_are_not_entry_points() {
+        // A named fn defined inside a kernel body: the kernel name is a path
+        // prefix, not the final segment. Rooting it would mint a `_TID_`
+        // export name (generic case) that no call site references.
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}softmax::reduce_workspace_max"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::kernels::{KERNEL_PREFIX}softmax::helper"
+        )));
+        // Deeper nesting (fn inside a block inside the kernel).
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}softmax::inner::helper"
+        )));
+    }
+
+    #[test]
+    fn closures_inside_kernel_bodies_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{KERNEL_PREFIX}map::{{closure#0}}"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "kernels::{KERNEL_PREFIX}map::{{closure#1}}"
+        )));
+    }
+
+    #[test]
+    fn non_kernel_paths_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path("my_crate::helpers::sum_slice"));
+        // The marker must begin the final segment. A substring match here
+        // would let ordinary near-miss names masquerade as kernel entries.
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::not_{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::not_{LEGACY_KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::helpers::prefix{KERNEL_PREFIX}vecadd"
+        )));
+        assert!(!is_kernel_entry_def_path(""));
+    }
 }

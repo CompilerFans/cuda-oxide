@@ -3,16 +3,19 @@ name = "cuda-host"
 version = "0.2.1"
 edition.workspace = true
 description = "Host-side utilities for CUDA kernel development"
+readme = "README.md"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 half = { workspace = true }
-cuda-macros = { workspace = true }
+# `host` is a cuda-macros default, but name it: cuda-host is precisely the
+# crate that needs the generated host surface, and it must keep it even if
+# another crate in the graph takes cuda-macros with default-features = false.
+cuda-macros = { workspace = true, features = ["host"] }
 cuda-core = { workspace = true }
-libnvvm-sys = { workspace = true }
-nvjitlink-sys = { workspace = true }
+cuda-artifact-finalizer = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 cuda-async = { workspace = true, optional = true }
@@ -23,3 +26,4 @@ async = ["dep:cuda-async", "cuda-macros/async"]
 
 [dev-dependencies]
 oxide-artifacts = { workspace = true }
+cuda-device = { workspace = true }

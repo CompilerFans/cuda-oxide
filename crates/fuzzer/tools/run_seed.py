@@ -40,6 +40,19 @@ def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def display_path(path: Path) -> str:
+    """Render an artifact path relative to the repo root.
+
+    The absolute form ties the printed summary (and the transcripts quoted
+    in the fuzzer README) to one particular checkout; the repo-relative form
+    is what a reader can actually resolve.
+    """
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def reason_from_output(output: str) -> str:
     prefixes = (
         "Unsupported construct:",
@@ -122,7 +135,7 @@ def make_record(
         "status": status,
         "stage": stage,
         "reason": reason,
-        "log": str(log_path) if log_path else None,
+        "log": display_path(log_path) if log_path else None,
     }
 
 
@@ -185,11 +198,18 @@ def run_seed(seed: int, *, no_build: bool, keep_logs: bool) -> dict[str, object]
             log_path=log_path,
         )
         append_summary(record)
-        print(f"seed {seed}: {status} [{stage}] {reason} ({log_path})")
+        print(f"seed {seed}: {status} [{stage}] {reason} ({display_path(log_path)})")
         return record
 
     remove_stale_ptx()
-    run_cmd = ["cargo", "oxide", "run", "rustlantis-smoke"]
+    # --no-fmad keeps the two backends comparable on float seeds. Device
+    # codegen contracts an fmul feeding an fadd into a single fma.rn by
+    # default, matching nvcc's --fmad=true, while the CPU oracle rounds the
+    # multiply and the add separately. Both are correct, so the resulting
+    # trace difference says nothing about a miscompile, and it would mask the
+    # differences that do. Contraction is worth fuzzing on its own terms, as
+    # a comparison against a contracted reference.
+    run_cmd = ["cargo", "oxide", "run", "--no-fmad", "rustlantis-smoke"]
     result = run(run_cmd, cwd=ROOT)
     status, stage, reason = classify_run(result.returncode, result.stdout)
 
@@ -207,7 +227,7 @@ def run_seed(seed: int, *, no_build: bool, keep_logs: bool) -> dict[str, object]
                 output=result.stdout,
                 include_generated_case=True,
             )
-            print(f"  log: {log_path}")
+            print(f"  log: {display_path(log_path)}")
     else:
         log_path = write_log(
             seed=seed,
@@ -219,7 +239,7 @@ def run_seed(seed: int, *, no_build: bool, keep_logs: bool) -> dict[str, object]
             output=result.stdout,
             include_generated_case=True,
         )
-        print(f"seed {seed}: {status} [{stage}] {reason} ({log_path})")
+        print(f"seed {seed}: {status} [{stage}] {reason} ({display_path(log_path)})")
 
     record = make_record(
         seed=seed,

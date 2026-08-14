@@ -4,7 +4,11 @@
  */
 
 use crate::error::PipelineError;
-use crate::target::{DetectedFeatures, arch_satisfies, select_target, validate_target_features};
+use crate::generated::GeneratedModuleRequirements;
+use crate::target::{
+    DetectedFeatures, arch_satisfies, generated_ptx_isa_requirement, generated_target_satisfied,
+    select_target_with_generated, validate_generated_target, validate_target_features,
+};
 use libnvvm_sys::CudaArch;
 use llvm_export::export::{DebugKind, DeviceExternType, ExportBackendConfig, NvvmIrDialect};
 use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
@@ -77,48 +81,102 @@ impl llvm_export::export::AsDeviceExtern for DeviceExternDecl {
 
 // mir-importer pipeline plumbing; not part of the frontend contract.
 #[doc(hidden)]
+#[cfg(test)]
 pub fn resolve_nvvm_target(
     explicit_target: Option<&str>,
     device_arch_hint: Option<&str>,
     automatic_features: Option<DetectedFeatures>,
 ) -> Result<CudaArch, PipelineError> {
+    resolve_nvvm_target_with_generated(
+        explicit_target,
+        device_arch_hint,
+        automatic_features,
+        &GeneratedModuleRequirements::default(),
+    )
+}
+
+pub(crate) fn resolve_nvvm_target_with_generated(
+    explicit_target: Option<&str>,
+    device_arch_hint: Option<&str>,
+    automatic_features: Option<DetectedFeatures>,
+    generated: &GeneratedModuleRequirements,
+) -> Result<CudaArch, PipelineError> {
+    // A target the caller requested, or one detected from the device, is an
+    // input to compilation, so its rejection is classified as
+    // `TargetSelection` and reported at `CompilationStage::Input`. Only the
+    // failures that belong to the export itself stay `Export`.
     let parse = |target: &str, source: &str| {
-        target.parse::<CudaArch>().map_err(|error| {
-            PipelineError::Export(format!(
-                "cannot select an NVVM IR dialect from the {source} `{target}`: {error}"
-            ))
-        })
+        target
+            .parse::<CudaArch>()
+            .map_err(|error| PipelineError::TargetSelection {
+                target: target.to_string(),
+                reason: format!(
+                    "cannot select an NVVM IR dialect from the {source} `{target}`: {error}"
+                ),
+            })
     };
+
+    // libNVVM chooses the final PTX version itself, but still reject a future
+    // catalog floor that this compiler does not know how to represent. This
+    // keeps NVVM IR and ordinary PTX builds equally fail closed.
+    generated_ptx_isa_requirement(generated).map_err(PipelineError::Export)?;
 
     if let Some(target) = explicit_target {
         let parsed = parse(target, "explicit CUDA target")?;
         if let Some(features) = automatic_features {
-            validate_target_features(&parsed, features).map_err(PipelineError::Export)?;
+            validate_target_features(&parsed, features).map_err(|reason| {
+                PipelineError::TargetSelection {
+                    target: parsed.sm(),
+                    reason,
+                }
+            })?;
         }
+        validate_generated_target(&parsed.sm(), generated).map_err(|reason| {
+            PipelineError::TargetSelection {
+                target: parsed.sm(),
+                reason,
+            }
+        })?;
         return Ok(parsed);
     }
 
     if let Some(features) = automatic_features {
         if let Some(target) = device_arch_hint {
             let parsed = parse(target, "detected GPU architecture")?;
-            if arch_satisfies(&parsed.sm(), features) {
+            if arch_satisfies(&parsed.sm(), features)
+                && generated_target_satisfied(&parsed.sm(), generated)
+            {
                 return Ok(parsed);
             }
         }
-        let target = select_target(features).map_err(PipelineError::Export)?;
-        return parse(target, "feature-based compiler default");
+        let target =
+            select_target_with_generated(features, generated).map_err(PipelineError::Export)?;
+        return parse(&target, "feature-based compiler default");
     }
 
     if let Some(target) = device_arch_hint {
-        return parse(target, "detected GPU architecture");
+        let parsed = parse(target, "detected GPU architecture")?;
+        if generated_target_satisfied(&parsed.sm(), generated) {
+            return Ok(parsed);
+        }
     }
 
-    Err(PipelineError::Export(
-        "NVVM IR requires a concrete CUDA target because pre-Blackwell and Blackwell+ \
-         use different LLVM dialects; pass `cargo oxide ... --arch sm_XX` (or set \
-         CUDA_OXIDE_TARGET)"
+    if !generated.is_empty() {
+        let target = select_target_with_generated(DetectedFeatures::Basic, generated)
+            .map_err(PipelineError::Export)?;
+        return parse(&target, "generated-intrinsic requirement");
+    }
+
+    // Nothing supplied a target, so there is none to name. The caller still
+    // has to act on their own input, which is why this reports at
+    // `CompilationStage::Input` alongside the rejections above.
+    Err(PipelineError::TargetSelection {
+        target: String::new(),
+        reason: "NVVM IR requires a concrete CUDA target because pre-Blackwell and Blackwell+ \
+                 use different LLVM dialects; pass `cargo oxide ... --arch sm_XX` (or set \
+                 CUDA_OXIDE_TARGET)"
             .to_string(),
-    ))
+    })
 }
 
 // mir-importer pipeline plumbing; not part of the frontend contract.
@@ -155,33 +213,9 @@ pub fn export_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
-) -> Result<String, PipelineError> {
-    export_llvm_ir_with_backend(
-        ctx,
-        module_op_ptr,
-        device_externs,
-        path,
-        emit_nvvm_ir,
-        nvvm_dialect,
-        debug_kind,
-        crate::options::TargetBackend::Cuda,
-    )
-}
-
-/// Exports an LLVM dialect module to textual LLVM IR with explicit backend target.
-// mir-importer pipeline plumbing; not part of the frontend contract.
-#[doc(hidden)]
-pub fn export_llvm_ir_with_backend(
-    ctx: &Context,
-    module_op_ptr: Ptr<Operation>,
-    device_externs: &[DeviceExternDecl],
-    path: &Path,
-    emit_nvvm_ir: bool,
-    nvvm_dialect: Option<NvvmIrDialect>,
-    debug_kind: DebugKind,
     backend: crate::options::TargetBackend,
-) -> Result<String, PipelineError> {
-    let llvm_ir = render_llvm_ir_with_backend(
+) -> Result<llvm_export::export::ExportedModule, PipelineError> {
+    let exported = render_exported_llvm_ir(
         ctx,
         module_op_ptr,
         device_externs,
@@ -191,9 +225,9 @@ pub fn export_llvm_ir_with_backend(
         backend,
     )?;
 
-    std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
+    std::fs::write(path, &exported.llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;
 
-    Ok(llvm_ir)
+    Ok(exported)
 }
 
 /// Render LLVM text without publishing an artifact.
@@ -210,22 +244,21 @@ pub fn render_llvm_ir(
     emit_nvvm_ir: bool,
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
+    backend: crate::options::TargetBackend,
 ) -> Result<String, PipelineError> {
-    render_llvm_ir_with_backend(
+    render_exported_llvm_ir(
         ctx,
         module_op_ptr,
         device_externs,
         emit_nvvm_ir,
         nvvm_dialect,
         debug_kind,
-        crate::options::TargetBackend::Cuda,
+        backend,
     )
+    .map(|exported| exported.llvm_ir)
 }
 
-/// Render LLVM text with explicit backend target selection.
-// mir-importer pipeline plumbing; not part of the frontend contract.
-#[doc(hidden)]
-pub fn render_llvm_ir_with_backend(
+fn render_exported_llvm_ir(
     ctx: &Context,
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
@@ -233,58 +266,52 @@ pub fn render_llvm_ir_with_backend(
     nvvm_dialect: Option<NvvmIrDialect>,
     debug_kind: DebugKind,
     backend: crate::options::TargetBackend,
-) -> Result<String, PipelineError> {
+) -> Result<llvm_export::export::ExportedModule, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
-    let llvm_ir = match backend {
-        crate::options::TargetBackend::Maca => {
-            let config = PipelineExportConfig {
-                inner: llvm_export::export::MacaExportConfig,
-                debug_kind,
-            };
-            llvm_export::export::export_module_with_externs(
-                ctx,
-                &module_op,
-                device_externs,
-                &config,
-            )
-            .map_err(PipelineError::Export)?
-        }
-        crate::options::TargetBackend::Cuda if emit_nvvm_ir => {
-            let dialect = nvvm_dialect.ok_or_else(|| {
-                PipelineError::Export(
-                    "NVVM export reached without a selected IR dialect".to_string(),
-                )
-            })?;
-            let config = PipelineExportConfig {
-                inner: llvm_export::export::NvvmExportConfig::new(dialect),
-                debug_kind,
-            };
-            llvm_export::export::export_module_with_externs(
-                ctx,
-                &module_op,
-                device_externs,
-                &config,
-            )
-            .map_err(PipelineError::Export)?
-        }
-        crate::options::TargetBackend::Cuda => {
-            let config = PipelineExportConfig {
-                inner: llvm_export::export::PtxExportConfig,
-                debug_kind,
-            };
-            llvm_export::export::export_module_with_externs(
-                ctx,
-                &module_op,
-                device_externs,
-                &config,
-            )
-            .map_err(PipelineError::Export)?
-        }
+    let exported = if backend == crate::options::TargetBackend::Maca {
+        let config = PipelineExportConfig {
+            inner: llvm_export::export::MacaExportConfig,
+            debug_kind,
+        };
+        llvm_export::export::export_module_with_externs_and_roots(
+            ctx,
+            &module_op,
+            device_externs,
+            &config,
+        )
+        .map_err(PipelineError::Export)?
+    } else if emit_nvvm_ir {
+        let dialect = nvvm_dialect.ok_or_else(|| {
+            PipelineError::Export("NVVM export reached without a selected IR dialect".to_string())
+        })?;
+        let config = PipelineExportConfig {
+            inner: llvm_export::export::NvvmExportConfig::new(dialect),
+            debug_kind,
+        };
+        llvm_export::export::export_module_with_externs_and_roots(
+            ctx,
+            &module_op,
+            device_externs,
+            &config,
+        )
+        .map_err(PipelineError::Export)?
+    } else {
+        let config = PipelineExportConfig {
+            inner: llvm_export::export::PtxExportConfig,
+            debug_kind,
+        };
+        llvm_export::export::export_module_with_externs_and_roots(
+            ctx,
+            &module_op,
+            device_externs,
+            &config,
+        )
+        .map_err(PipelineError::Export)?
     };
 
-    Ok(llvm_ir)
+    Ok(exported)
 }
 
 struct PipelineExportConfig<C> {
@@ -350,6 +377,67 @@ pub fn module_uses_libdevice(ctx: &Context, module_op_ptr: Ptr<Operation>) -> bo
     op_uses_libdevice(ctx, module_op_ptr)
 }
 
+/// Whether `name` is a CUDA libdevice entry point.
+///
+/// The unresolved-symbol filter and the libdevice detector both read this, so
+/// the `__nv_` spelling has one definition in the crate.
+pub(crate) fn is_libdevice_symbol(name: &str) -> bool {
+    name.starts_with("__nv_")
+}
+
+/// Whether `c` can appear in a PTX identifier (`followsym`).
+fn is_ptx_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Names of `.extern .func` declarations in `ptx` that name a CUDA libdevice
+/// (`__nv_*`) symbol.
+///
+/// `llc` prints an unresolved callee as `.extern .func __nv_foo(` when it
+/// returns void, or `.extern .func  (.param .b32 func_retval0) __nv_foo(`
+/// when it returns a value, the same two shapes the `.visible .func` scan in
+/// `ptx.rs`'s tests already parses for exported and unreferenced libdevice
+/// symbols.
+///
+/// `llvm-link --only-needed` resolves whatever `__nv_*` symbols it finds in
+/// `libdevice.10.bc` and stays silent about the rest, so a `__nv_*` symbol
+/// libdevice does not define survives as an unresolved declaration all the
+/// way through `opt` and `llc`, both of which exit 0, into PTX that `ptxas`
+/// also accepts. The failure then surfaces only at `cuModuleLoad` on the
+/// device, with no diagnostic. This scan is what catches it at compile time
+/// for the self-contained output policy, where no later link step exists to
+/// resolve it.
+pub(crate) fn unresolved_libdevice_ptx_declarations(ptx: &str) -> Vec<String> {
+    let mut declared: Vec<String> = Vec::new();
+    for line in ptx.lines() {
+        let Some(rest) = line.trim_start().strip_prefix(".extern") else {
+            continue;
+        };
+        let Some(idx) = rest.find(".func") else {
+            continue;
+        };
+        let mut rest = rest[idx + ".func".len()..].trim_start();
+        // Skip the `(.param .b32 func_retval0)` clause of a value-returning
+        // declaration, matching `exported_nv_functions` in `ptx.rs`.
+        if let Some(after_open) = rest.strip_prefix('(') {
+            let Some(close) = after_open.find(')') else {
+                continue;
+            };
+            rest = after_open[close + 1..].trim_start();
+        }
+        let name: String = rest
+            .chars()
+            .take_while(|c| is_ptx_identifier_char(*c))
+            .collect();
+        if is_libdevice_symbol(&name) {
+            declared.push(name);
+        }
+    }
+    declared.sort();
+    declared.dedup();
+    declared
+}
+
 /// Return unresolved non-intrinsic LLVM function declarations.
 ///
 /// Standalone PTX has no link step. LLVM intrinsics are resolved by `llc`, but
@@ -394,14 +482,14 @@ fn collect_unresolved_external_symbols(
 /// Recursively scan for declared or called CUDA libdevice functions.
 fn op_uses_libdevice(ctx: &Context, op_ptr: Ptr<Operation>) -> bool {
     if let Some(func) = Operation::get_op::<llvm_export::ops::FuncOp>(op_ptr, ctx)
-        && func.get_symbol_name(ctx).starts_with("__nv_")
+        && is_libdevice_symbol(&func.get_symbol_name(ctx))
     {
         return true;
     }
 
     if let Some(call) = Operation::get_op::<llvm_export::ops::CallOp>(op_ptr, ctx)
         && let CallOpCallable::Direct(callee) = call.callee(ctx)
-        && callee.to_string().starts_with("__nv_")
+        && is_libdevice_symbol(&callee.to_string())
     {
         return true;
     }
@@ -425,8 +513,30 @@ fn op_uses_libdevice(ctx: &Context, op_ptr: Ptr<Operation>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated_intrinsic_targets::{
+        GeneratedIntrinsicBackend, generated_intrinsic_target_by_marker,
+    };
     use llvm_export::export::AsDeviceExtern;
     use pliron::op::Op;
+
+    #[test]
+    fn nvvm_target_resolution_applies_generated_backend_floors() {
+        let f16 = generated_intrinsic_target_by_marker("v1:i0014").unwrap();
+        let requirements = GeneratedModuleRequirements::from_targets(vec![f16])
+            .for_backend(GeneratedIntrinsicBackend::LibNvvm);
+
+        let error = resolve_nvvm_target_with_generated(Some("sm_70"), None, None, &requirements)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("packed_atomic_add_f16x2"), "{error}");
+        assert!(error.contains("sm_75 or newer"), "{error}");
+        assert_eq!(
+            resolve_nvvm_target_with_generated(Some("sm_75"), None, None, &requirements)
+                .unwrap()
+                .sm(),
+            "sm_75"
+        );
+    }
 
     #[test]
     fn nvvm_target_resolution_is_concrete_and_strict() {
@@ -501,6 +611,63 @@ mod tests {
         assert!(
             resolve_nvvm_target(None, Some("not-an-arch"), Some(DetectedFeatures::Basic)).is_err()
         );
+    }
+
+    /// Every rejection the NVVM IR resolver attributes to a target is decided
+    /// before any export runs, so it reports at `CompilationStage::Input`.
+    #[test]
+    fn nvvm_target_rejections_report_the_input_stage() {
+        let f16 = generated_intrinsic_target_by_marker("v1:i0014").unwrap();
+        let below_floor = GeneratedModuleRequirements::from_targets(vec![f16])
+            .for_backend(GeneratedIntrinsicBackend::LibNvvm);
+        let none = GeneratedModuleRequirements::default();
+
+        for (case, error) in [
+            (
+                "unparsable explicit target",
+                resolve_nvvm_target_with_generated(Some("sm_9x"), None, None, &none).unwrap_err(),
+            ),
+            (
+                "unparsable device hint",
+                resolve_nvvm_target_with_generated(
+                    None,
+                    Some("not-an-arch"),
+                    Some(DetectedFeatures::Basic),
+                    &none,
+                )
+                .unwrap_err(),
+            ),
+            (
+                "target below a detected feature floor",
+                resolve_nvvm_target_with_generated(
+                    Some("sm_70"),
+                    None,
+                    Some(DetectedFeatures::Movmatrix),
+                    &none,
+                )
+                .unwrap_err(),
+            ),
+            (
+                "target below a generated intrinsic floor",
+                resolve_nvvm_target_with_generated(Some("sm_70"), None, None, &below_floor)
+                    .unwrap_err(),
+            ),
+            (
+                "no target supplied at all",
+                resolve_nvvm_target_with_generated(None, None, None, &none).unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(error, PipelineError::TargetSelection { .. }),
+                "{case}: got {error:?}"
+            );
+            let compile_error = crate::api::CompileError::from(error);
+            assert_eq!(
+                compile_error.stage(),
+                crate::api::CompilationStage::Input,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -625,7 +792,16 @@ mod tests {
         let mut ctx = Context::new();
         let module_ptr = build_module_with_func_decl(&mut ctx, "llvm_nvvm_tcgen05_alloc");
 
-        let preview = render_llvm_ir(&ctx, module_ptr, &[], false, None, DebugKind::Off).unwrap();
+        let preview = render_llvm_ir(
+            &ctx,
+            module_ptr,
+            &[],
+            false,
+            None,
+            DebugKind::Off,
+            crate::options::TargetBackend::Cuda,
+        )
+        .unwrap();
 
         assert!(preview.contains("@llvm.nvvm.tcgen05.alloc"), "{preview}");
         assert_eq!(
@@ -692,5 +868,30 @@ mod tests {
             module_uses_libdevice(&ctx, module_ptr),
             "direct call to a `__nv_*` symbol must be detected"
         );
+    }
+
+    #[test]
+    fn unresolved_libdevice_ptx_declarations_finds_void_and_value_returning_externs() {
+        let ptx = "\
+.visible .entry kernel(
+.extern .func __nv_void_helper(
+.extern .func  (.param .b32 func_retval0) __nv_totally_not_real(
+.extern .func vprintf(
+.func  (.param .b32 func_retval0) __nv_internal_only(
+";
+        assert_eq!(
+            unresolved_libdevice_ptx_declarations(ptx),
+            ["__nv_totally_not_real", "__nv_void_helper"]
+        );
+    }
+
+    #[test]
+    fn unresolved_libdevice_ptx_declarations_ignores_a_fully_linked_module() {
+        let ptx = "\
+.visible .entry kernel(
+.visible .func __nv_helper(
+\tcall.uni __nv_helper, (param0);
+";
+        assert!(unresolved_libdevice_ptx_declarations(ptx).is_empty());
     }
 }

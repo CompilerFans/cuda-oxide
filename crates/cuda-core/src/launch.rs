@@ -170,6 +170,11 @@ impl KernelLaunchConfig for LaunchConfig3D {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockRequirement {
     /// The launch must use exactly these `(x, y, z)` block dimensions.
+    ///
+    /// A kernel compiled by cuda-oxide also carries this shape as PTX
+    /// `.reqntid`, so the CUDA driver rejects a differing block on any axis
+    /// independently of this check. Preparation still reports the mismatch
+    /// first, with the kernel name and both shapes.
     Exact((u32, u32, u32)),
     /// The block may contain at most this many threads in total.
     ///
@@ -208,6 +213,20 @@ pub enum DynamicSharedMemoryRequirement {
     },
 }
 
+/// Coordinate widths whose range is guaranteed by launch preparation.
+///
+/// `U32` does not change CUDA's grid or block dimensions. It proves that each
+/// per-axis global coordinate fits in `u32`, allowing a contracted kernel to
+/// keep coordinate arithmetic narrow until the final address calculation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoordinateRequirement {
+    /// Make no narrower-coordinate promise.
+    #[default]
+    Native,
+    /// Every active-axis coordinate is representable by `u32`.
+    U32,
+}
+
 /// An immutable description of a kernel's launch-time assumptions.
 ///
 /// Macro-generated contract marker types expose one of these through
@@ -221,6 +240,7 @@ pub struct LaunchContractSpec {
     cluster: Option<(u32, u32, u32)>,
     cooperative: bool,
     min_compute_capability: Option<(u32, u32)>,
+    coordinates: CoordinateRequirement,
 }
 
 impl LaunchContractSpec {
@@ -238,6 +258,7 @@ impl LaunchContractSpec {
             cluster: None,
             cooperative: false,
             min_compute_capability: None,
+            coordinates: CoordinateRequirement::Native,
         }
     }
 
@@ -259,6 +280,17 @@ impl LaunchContractSpec {
     #[must_use]
     pub const fn with_min_compute_capability(mut self, major: u32, minor: u32) -> Self {
         self.min_compute_capability = Some((major, minor));
+        self
+    }
+
+    /// Proves that every global coordinate fits in `u32`.
+    ///
+    /// Preparation checks `grid_axis * block_axis <= 2^32` independently for
+    /// X, Y, and Z. Exactly `2^32` positions is valid because the largest
+    /// zero-based coordinate is `u32::MAX`.
+    #[must_use]
+    pub const fn with_u32_coordinates(mut self) -> Self {
+        self.coordinates = CoordinateRequirement::U32;
         self
     }
 
@@ -290,6 +322,11 @@ impl LaunchContractSpec {
     /// Returns the minimum compute capability, if one was declared.
     pub const fn min_compute_capability(&self) -> Option<(u32, u32)> {
         self.min_compute_capability
+    }
+
+    /// Returns the coordinate-width requirement.
+    pub const fn coordinates(&self) -> CoordinateRequirement {
+        self.coordinates
     }
 }
 
@@ -378,6 +415,19 @@ pub enum LaunchContractError {
         kernel: &'static str,
         /// Shape whose product overflowed.
         dimension: LaunchDimension,
+    },
+    /// A per-axis global coordinate cannot be represented by `u32`.
+    CoordinateRangeExceedsU32 {
+        /// Kernel being prepared.
+        kernel: &'static str,
+        /// Axis whose coordinate range is too large.
+        axis: LaunchAxis,
+        /// Number of blocks on this axis.
+        grid: u32,
+        /// Number of threads per block on this axis.
+        block: u32,
+        /// Number of coordinate values required on this axis.
+        positions: u64,
     },
     /// A shared-memory alignment was not a nonzero power of two.
     InvalidSharedMemoryAlignment {
@@ -557,12 +607,6 @@ pub enum LaunchContractError {
         /// Requested cluster dimensions.
         cluster: (u32, u32, u32),
     },
-    /// Safe cooperative-residency validation for clustered launches is not
-    /// available through the non-cluster occupancy query.
-    ClusteredCooperativeValidationUnsupported {
-        /// Kernel being prepared.
-        kernel: &'static str,
-    },
     /// A cooperative grid cannot be fully resident on the device.
     CooperativeGridTooLarge {
         /// Kernel being prepared.
@@ -581,6 +625,26 @@ pub enum LaunchContractError {
         /// Stream device ordinal.
         stream_device: usize,
     },
+    /// A declared `requires` size requirement over the kernel's
+    /// parameters did not hold at launch time.
+    SizeRequirementViolated {
+        /// Kernel being launched.
+        kernel: &'static str,
+        /// Source text of the violated relation.
+        relation: &'static str,
+        /// Evaluated left-hand side of the comparison, widened to `u64`.
+        lhs: u64,
+        /// Evaluated right-hand side of the comparison, widened to `u64`.
+        rhs: u64,
+    },
+    /// Arithmetic inside a `requires` size requirement left the `u64`
+    /// range, so the relation could not be evaluated.
+    SizeRequirementOverflow {
+        /// Kernel being launched.
+        kernel: &'static str,
+        /// Source text of the relation whose arithmetic overflowed.
+        relation: &'static str,
+    },
     /// A CUDA driver query or one-time function configuration failed.
     Driver(DriverError),
 }
@@ -597,6 +661,16 @@ impl Display for LaunchContractError {
             Self::DimensionProductOverflow { kernel, dimension } => {
                 write!(f, "{kernel}: {dimension:?} dimension product overflowed")
             }
+            Self::CoordinateRangeExceedsU32 {
+                kernel,
+                axis,
+                grid,
+                block,
+                positions,
+            } => write!(
+                f,
+                "{kernel}: Grid.{axis:?} {grid} * Block.{axis:?} {block} requires {positions} coordinates, exceeding the u32 range"
+            ),
             Self::InvalidSharedMemoryAlignment { kernel, alignment } => write!(
                 f,
                 "{kernel}: dynamic shared-memory alignment {alignment} is not a nonzero power of two"
@@ -738,10 +812,6 @@ impl Display for LaunchContractError {
                 f,
                 "{kernel}: no cluster with shape {cluster:?} can be resident"
             ),
-            Self::ClusteredCooperativeValidationUnsupported { kernel } => write!(
-                f,
-                "{kernel}: clustered cooperative residency cannot be validated by this API"
-            ),
             Self::CooperativeGridTooLarge {
                 kernel,
                 blocks,
@@ -757,6 +827,19 @@ impl Display for LaunchContractError {
             } => write!(
                 f,
                 "{kernel}: function is on device {function_device}, stream is on device {stream_device}"
+            ),
+            Self::SizeRequirementViolated {
+                kernel,
+                relation,
+                lhs,
+                rhs,
+            } => write!(
+                f,
+                "{kernel}: size requirement `{relation}` violated: left-hand side is {lhs}, right-hand side is {rhs}"
+            ),
+            Self::SizeRequirementOverflow { kernel, relation } => write!(
+                f,
+                "{kernel}: arithmetic in size requirement `{relation}` overflowed the u64 range"
             ),
             Self::Driver(error) => Display::fmt(error, f),
         }
@@ -874,13 +957,6 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
                 C::SPEC.kernel_name,
                 context.supports_cooperative_launch()?,
             )?;
-            if C::SPEC.cluster.is_some() {
-                return Err(
-                    LaunchContractError::ClusteredCooperativeValidationUnsupported {
-                        kernel: C::SPEC.kernel_name,
-                    },
-                );
-            }
         }
 
         // Perform the only persistent function mutation after all checks that
@@ -890,6 +966,12 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
         if contract_dynamic_max > function_max_dynamic {
             function.set_max_dynamic_shared_memory_bytes(contract_dynamic_max)?;
         }
+
+        // Cluster occupancy is reused for cooperative residency when both
+        // modes are declared: a cooperative clustered grid must fit entirely
+        // in the concurrent cluster capacity reported by
+        // `cuOccupancyMaxActiveClusters`.
+        let mut clustered_resident_blocks: Option<u64> = None;
 
         if let Some(cluster) = C::SPEC.cluster {
             let max_cluster_size = function.max_potential_cluster_size(
@@ -917,16 +999,37 @@ impl<C: KernelLaunchContract> PreparedLaunch<C> {
                 Err(error) => return Err(error.into()),
             };
             validate_cluster_residency(C::SPEC.kernel_name, cluster, active_clusters)?;
+            // Deliberate error reuse: `active_clusters * cluster_blocks` is a
+            // device-capacity product over the cluster dimension, and
+            // `DimensionProductOverflow { Cluster }` is the closest existing
+            // diagnostic. The arm is unreachable in practice: both factors fit
+            // in u32 (`active_clusters` is driver-reported, `cluster_blocks`
+            // was validated against the u32 `max_cluster_size` above), so the
+            // product always fits in u64. `checked_mul` keeps the math honest.
+            clustered_resident_blocks = Some(
+                u64::from(active_clusters)
+                    .checked_mul(cluster_blocks)
+                    .ok_or(LaunchContractError::DimensionProductOverflow {
+                        kernel: C::SPEC.kernel_name,
+                        dimension: LaunchDimension::Cluster,
+                    })?,
+            );
         }
 
         if C::SPEC.cooperative {
-            let block_threads =
-                shape_product(C::SPEC.kernel_name, LaunchDimension::Block, raw.block_dim)?;
-            let active_per_sm = function
-                .max_active_blocks_per_multiprocessor(block_threads as u32, raw.shared_mem_bytes)?;
-            let multiprocessors = context.multiprocessor_count()?;
-            let resident_capacity = u64::from(active_per_sm) * u64::from(multiprocessors);
             let blocks = shape_product(C::SPEC.kernel_name, LaunchDimension::Grid, raw.grid_dim)?;
+            let resident_capacity = if let Some(capacity) = clustered_resident_blocks {
+                capacity
+            } else {
+                let block_threads =
+                    shape_product(C::SPEC.kernel_name, LaunchDimension::Block, raw.block_dim)?;
+                let active_per_sm = function.max_active_blocks_per_multiprocessor(
+                    block_threads as u32,
+                    raw.shared_mem_bytes,
+                )?;
+                let multiprocessors = context.multiprocessor_count()?;
+                u64::from(active_per_sm) * u64::from(multiprocessors)
+            };
             validate_cooperative_residency(C::SPEC.kernel_name, blocks, resident_capacity)?;
         }
 
@@ -977,6 +1080,10 @@ fn validate_static(
 
     validate_shape(spec.kernel_name, LaunchDimension::Grid, config.grid_dim)?;
     validate_shape(spec.kernel_name, LaunchDimension::Block, config.block_dim)?;
+
+    if spec.coordinates == CoordinateRequirement::U32 {
+        validate_u32_coordinates(spec.kernel_name, config.grid_dim, config.block_dim)?;
+    }
 
     match spec.block {
         BlockRequirement::Exact(required) => {
@@ -1053,6 +1160,28 @@ fn validate_static(
         }
     }
 
+    Ok(())
+}
+
+fn validate_u32_coordinates(
+    kernel: &'static str,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+) -> Result<(), LaunchContractError> {
+    const U32_COORDINATE_COUNT: u64 = u32::MAX as u64 + 1;
+
+    for (axis, grid, block) in axes(grid, block) {
+        let positions = u64::from(grid) * u64::from(block);
+        if positions > U32_COORDINATE_COUNT {
+            return Err(LaunchContractError::CoordinateRangeExceedsU32 {
+                kernel,
+                axis,
+                grid,
+                block,
+                positions,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1450,6 +1579,24 @@ mod tests {
     }
 
     #[test]
+    fn u32_coordinate_contract_accepts_exact_range_and_rejects_larger_axis() {
+        let spec = exact_spec((2, 1, 1)).with_u32_coordinates();
+
+        // 2^31 blocks * 2 threads gives exactly 2^32 zero-based coordinates,
+        // whose largest value is u32::MAX.
+        assert!(validate_static(spec, raw((1 << 31, 1, 1), (2, 1, 1), 0)).is_ok());
+
+        assert!(matches!(
+            validate_static(spec, raw(((1 << 31) + 1, 1, 1), (2, 1, 1), 0)),
+            Err(LaunchContractError::CoordinateRangeExceedsU32 {
+                axis: LaunchAxis::X,
+                positions: 4_294_967_298,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn validates_dynamic_shared_memory_exact_range_and_alignment() {
         let exact = LaunchContractSpec::new(
             KERNEL,
@@ -1693,15 +1840,54 @@ mod tests {
     }
 
     #[test]
+    fn clustered_cooperative_residency_uses_active_cluster_capacity() {
+        // A (2,1,1) cluster with 4 concurrent clusters can host 8 blocks.
+        // A fully-resident cooperative grid of 8 blocks therefore passes, while
+        // 10 blocks (5 clusters) must fail with CooperativeGridTooLarge.
+        let cluster_blocks = 2u64;
+        let active_clusters = 4u64;
+        let resident_capacity = active_clusters * cluster_blocks;
+
+        assert!(validate_cooperative_residency(KERNEL, 8, resident_capacity).is_ok());
+        assert!(matches!(
+            validate_cooperative_residency(KERNEL, 10, resident_capacity),
+            Err(LaunchContractError::CooperativeGridTooLarge {
+                blocks: 10,
+                resident_capacity: 8,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn combined_cluster_cooperative_spec_is_expressible() {
+        let spec = exact_spec((128, 1, 1))
+            .with_cluster((2, 1, 1))
+            .with_cooperative();
+        assert_eq!(spec.cluster(), Some((2, 1, 1)));
+        assert!(spec.cooperative());
+
+        // Static geometry still requires the grid to be an integer number of
+        // clusters even when cooperative residency is also required.
+        assert!(validate_static(spec, raw((4, 1, 1), (128, 1, 1), 0)).is_ok());
+        assert!(matches!(
+            validate_static(spec, raw((3, 1, 1), (128, 1, 1), 0)),
+            Err(LaunchContractError::ClusterDoesNotDivideGrid { .. })
+        ));
+    }
+
+    #[test]
     fn spec_builders_preserve_diagnostic_metadata() {
         let spec = exact_spec((32, 1, 1))
             .with_cluster((2, 1, 1))
             .with_cooperative()
-            .with_min_compute_capability(9, 0);
+            .with_min_compute_capability(9, 0)
+            .with_u32_coordinates();
         assert_eq!(spec.kernel_name(), KERNEL);
         assert_eq!(spec.block(), BlockRequirement::Exact((32, 1, 1)));
         assert_eq!(spec.cluster(), Some((2, 1, 1)));
         assert!(spec.cooperative());
         assert_eq!(spec.min_compute_capability(), Some((9, 0)));
+        assert_eq!(spec.coordinates(), CoordinateRequirement::U32);
     }
 }

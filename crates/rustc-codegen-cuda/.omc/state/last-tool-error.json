@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"sed -n '985,1030p' crates/rustc-codegen-cuda/src/lib.rs\",\"description\":\"See artifact kind match site\"}",
+  "error": "Exit code 2\nsed: can't read crates/rustc-codegen-cuda/src/lib.rs: No such file or directory",
+  "timestamp": "2026-08-14T17:05:14.291Z",
+  "retry_count": 1
+}

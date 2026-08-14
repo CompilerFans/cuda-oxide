@@ -235,7 +235,73 @@ impl LlvmOp<'_> {
     }
 }
 
+const LOCAL_MEMORY_VALUE_PREFIX: &str = "__cuda_oxide_local_x";
+const LOCAL_MEMORY_ALLOCA_PREFIX: &str = "__cuda_oxide_local_alloca_x";
+
+/// Ceiling for the pre-hex provenance payload.
+///
+/// Hex encoding doubles the byte count, and LLVM's textual parser mis-lexes
+/// value names longer than roughly a kilobyte (empirically the failure
+/// surfaces as a bogus "multiple definition of local value" parse error), so
+/// the whole `%__cuda_oxide_local_x<hex>_` identifier must stay comfortably
+/// below that. The importer already spells types compactly; this cap makes
+/// the exporter safe against any producer, since the attribute itself places
+/// no bound on field lengths.
+const LOCAL_MEMORY_MAX_PAYLOAD_BYTES: usize = 256;
+
+/// Serialize a [`crate::ops::LocalMemoryProvenanceAttr`] into the hex payload
+/// carried by the alloca's SSA value name.
+///
+/// This is the only place the provenance leaves the first-class attribute
+/// world: textual `.ll` handed to an external `opt` has no other channel that
+/// reliably survives on live instructions. Tabs separate the fields, the hex
+/// encoding keeps arbitrary identifiers and type spellings valid in an LLVM
+/// value name, and the trailing `_` sentinel terminates the hex run so LLVM's
+/// numeric name-uniquing suffixes (a second inlined copy of the same local
+/// becomes `<name>1`) cannot extend or garble the payload.
+fn encode_local_memory_provenance(provenance: &crate::ops::LocalMemoryProvenanceAttr) -> String {
+    let mut payload = format!(
+        "{}\t{}\t{}\t{}",
+        provenance.local_index,
+        provenance.size_bytes,
+        provenance.binding_name.as_str(),
+        provenance.type_name.as_str()
+    );
+    if payload.len() > LOCAL_MEMORY_MAX_PAYLOAD_BYTES {
+        // Truncate on a char boundary so the decoded bytes stay valid UTF-8;
+        // only the trailing type spelling loses detail.
+        let mut cut = LOCAL_MEMORY_MAX_PAYLOAD_BYTES;
+        while !payload.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        payload.truncate(cut);
+    }
+    let mut encoded = String::with_capacity(payload.len() * 2 + 1);
+    for byte in payload.as_bytes() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded.push('_');
+    encoded
+}
+
 impl<'a> ModuleExportState<'a> {
+    fn local_memory_value_name(
+        &self,
+        op: Ptr<Operation>,
+        allocation_storage: bool,
+    ) -> Option<String> {
+        let provenance = crate::ops::local_memory_provenance(self.ctx, op)?;
+        let prefix = if allocation_storage {
+            LOCAL_MEMORY_ALLOCA_PREFIX
+        } else {
+            LOCAL_MEMORY_VALUE_PREFIX
+        };
+        Some(format!(
+            "%{prefix}{}",
+            encode_local_memory_provenance(&provenance)
+        ))
+    }
+
     pub(super) fn export_op(
         &mut self,
         op: Ptr<Operation>,
@@ -258,6 +324,16 @@ impl<'a> ModuleExportState<'a> {
             .as_ref()
             .is_some_and(LlvmOp::needs_scoped_debug_location);
         let output_before = output.len();
+
+        // Rust-local allocas carry an encoded provenance name into textual LLVM IR.
+        // `opt -O2` preserves SSA names on instructions that survive, so the
+        // post-optimization local-memory diagnostic can attribute a remaining
+        // alloca without relying on non-semantic metadata preservation.
+        if let Some(LlvmOp::Alloca(alloca)) = llvm_op.as_ref()
+            && let Some(name) = self.local_memory_value_name(alloca.get_operation(), false)
+        {
+            value_names.insert(op_ref.get_result(0), name);
+        }
 
         // Register result names (skip if already named in pre-pass)
         for res in op_ref.results() {
@@ -462,7 +538,9 @@ impl<'a> ModuleExportState<'a> {
         let actual_ref = actual.deref(self.ctx);
         let matches = match expected {
             DeviceExternType::Void => actual_ref.is::<VoidType>(),
-            DeviceExternType::Integer(bits) => actual_ref
+            DeviceExternType::Integer(bits)
+            | DeviceExternType::SignExtInteger(bits)
+            | DeviceExternType::ZeroExtInteger(bits) => actual_ref
                 .downcast_ref::<IntegerType>()
                 .is_some_and(|ty| ty.width() == *bits),
             DeviceExternType::Float16 => actual_ref.is::<HalfType>(),
@@ -721,7 +799,8 @@ impl<'a> ModuleExportState<'a> {
         let needs_normalization = self.legacy_typed_pointers() && !self.is_i8_type(elem_llvm_ty);
         let alloca_as = self.alloca_address_space;
         let alloca_name = if needs_normalization || alloca_as != 0 {
-            Self::fresh_value_name(next_value_id)
+            self.local_memory_value_name(op.get_operation(), true)
+                .unwrap_or_else(|| Self::fresh_value_name(next_value_id))
         } else {
             res_name.clone()
         };
@@ -890,7 +969,11 @@ impl<'a> ModuleExportState<'a> {
             res_name.clone()
         };
 
-        write!(output, "  {gep_name} = getelementptr inbounds ").unwrap();
+        write!(output, "  {gep_name} = getelementptr").unwrap();
+        if ops::gep_inbounds(self.ctx, op.get_operation()) {
+            write!(output, " inbounds").unwrap();
+        }
+        write!(output, " ").unwrap();
         self.export_type(elem_ty, output)?;
         write!(output, ", ").unwrap();
         if self.legacy_typed_pointers() {
@@ -1210,6 +1293,7 @@ impl<'a> ModuleExportState<'a> {
         output: &mut String,
     ) -> Result<(), String> {
         let op_ref = op.get_operation().deref(self.ctx);
+        let is_noreturn = crate::ops::op_noreturn(self.ctx, op.get_operation());
         let callee = op.callee(self.ctx);
         let func_ty = op.callee_type(self.ctx);
         let func_ty_ref = func_ty.deref(self.ctx);
@@ -1217,20 +1301,29 @@ impl<'a> ModuleExportState<'a> {
         let ret_ty = llvm_func_ty.result_type();
         let is_void = ret_ty.deref(self.ctx).is::<VoidType>();
 
-        // Device externs keep their pointer types outside the opaque-pointer
-        // module. Clone the declaration before updating exporter state.
-        let device_extern = match &callee {
+        let direct_callee_name = match &callee {
             CallOpCallable::Direct(identifier) => {
                 let name = identifier.to_string();
-                let fixed = if name.starts_with("llvm_") {
-                    name.replace('_', ".")
+                Some(if name.starts_with("llvm_") {
+                    super::names::decode_intrinsic_identifier(&name)
                 } else {
                     super::names::strip_device_prefix(&name)
-                };
-                self.device_extern(&fixed).cloned()
+                })
             }
             CallOpCallable::Indirect(_) => None,
         };
+        let legacy_atomic_add = if let Some(name) = &direct_callee_name {
+            self.legacy_nvvm_atomic_add_signature(name, llvm_func_ty)?
+        } else {
+            None
+        };
+
+        // Device externs keep their pointer types outside the opaque-pointer
+        // module. Clone the declaration before updating exporter state.
+        let device_extern = direct_callee_name
+            .as_deref()
+            .and_then(|name| self.device_extern(name))
+            .cloned();
 
         let indirect_callee = match callee {
             CallOpCallable::Indirect(value) => Some(value),
@@ -1270,6 +1363,20 @@ impl<'a> ModuleExportState<'a> {
 
         let argument_offset = usize::from(indirect_callee.is_some());
         let arguments: Vec<Value> = op_ref.operands().skip(argument_offset).collect();
+        let legacy_atomic_pointer_argument = if let Some((pointee, _)) = legacy_atomic_add {
+            let pointer = arguments.first().copied().ok_or_else(|| {
+                "legacy NVVM atomic-add call is missing its pointer argument".to_string()
+            })?;
+            Some(self.typed_pointer_operand(
+                pointer,
+                pointee,
+                value_names,
+                next_value_id,
+                output,
+            )?)
+        } else {
+            None
+        };
         let adapted_arguments = if let Some(decl) = &device_extern {
             if arguments.len() != decl.param_types.len() {
                 return Err(format!(
@@ -1330,6 +1437,11 @@ impl<'a> ModuleExportState<'a> {
         } else {
             write!(output, "  {} = call ", call_result_name.as_deref().unwrap()).unwrap();
             if let Some(decl) = &device_extern {
+                // Return-position attributes precede the type:
+                // `%r = call signext i8 @f()`.
+                if let Some(attr) = decl.return_type.ext_attr() {
+                    write!(output, "{attr} ").unwrap();
+                }
                 decl.return_type
                     .write_llvm(output, self.legacy_typed_pointers())?;
             } else {
@@ -1338,15 +1450,8 @@ impl<'a> ModuleExportState<'a> {
         }
 
         match callee {
-            CallOpCallable::Direct(identifier) => {
-                let name = identifier.to_string();
-                // LLVM intrinsics use dots in IR; Pliron IR identifiers use underscores.
-                let fixed = if name.starts_with("llvm_") {
-                    name.replace('_', ".")
-                } else {
-                    super::names::strip_device_prefix(&name)
-                };
-                write!(output, " @{fixed}(").unwrap();
+            CallOpCallable::Direct(_) => {
+                write!(output, " @{}(", direct_callee_name.as_deref().unwrap()).unwrap();
             }
             CallOpCallable::Indirect(val) => {
                 write!(output, " ").unwrap();
@@ -1364,13 +1469,21 @@ impl<'a> ModuleExportState<'a> {
                 write!(output, ", ").unwrap();
             }
             if let Some(decl) = &device_extern {
-                decl.param_types[i].write_llvm(output, self.legacy_typed_pointers())?;
+                decl.param_types[i].write_llvm_with_attr(output, self.legacy_typed_pointers())?;
+            } else if i == 0
+                && let Some((pointee, address_space)) = legacy_atomic_add
+            {
+                self.export_pointer_to(pointee, address_space, output)?;
             } else {
                 self.export_type(arg.get_type(self.ctx), output)?;
             }
             write!(output, " ").unwrap();
             if let Some(adapted) = &adapted_arguments {
                 write!(output, "{}", adapted[i]).unwrap();
+            } else if i == 0
+                && let Some(adapted) = &legacy_atomic_pointer_argument
+            {
+                write!(output, "{adapted}").unwrap();
             } else {
                 self.export_value(arg, value_names, output)?;
             }
@@ -1381,7 +1494,8 @@ impl<'a> ModuleExportState<'a> {
         // performs a barrier / shuffle / vote, `opt -O2` must not sink or
         // duplicate the call across divergent control flow. opt strips the
         // attribute from calls it proves never reach a convergent op.
-        writeln!(output, ") #0").unwrap();
+        let noreturn_attr = if is_noreturn { " noreturn" } else { "" };
+        writeln!(output, "){noreturn_attr} #0").unwrap();
         self.convergent_used = true;
 
         if normalize_pointer_result {
@@ -1717,7 +1831,7 @@ impl<'a> ModuleExportState<'a> {
         }
 
         let function_name = if symbol_name.starts_with("llvm_") {
-            symbol_name.replace('_', ".")
+            super::names::decode_intrinsic_identifier(&symbol_name)
         } else {
             super::names::strip_device_prefix(&symbol_name)
         };
@@ -1926,5 +2040,52 @@ fn fmt_syncscope(scope: Option<Ref<StringAttr>>) -> String {
     match scope.map(|s| String::from((*s).clone())) {
         Some(s) if !s.is_empty() => format!(" syncscope(\"{s}\")"),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::LocalMemoryProvenanceAttr;
+
+    fn decode_hex_payload(encoded: &str) -> String {
+        let hex = encoded.strip_suffix('_').expect("sentinel-terminated");
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect();
+        String::from_utf8(bytes).expect("capped payload stays valid UTF-8")
+    }
+
+    #[test]
+    fn provenance_encoding_round_trips_and_is_sentinel_terminated() {
+        let provenance = LocalMemoryProvenanceAttr {
+            local_index: 3,
+            size_bytes: 16,
+            binding_name: "scratch".into(),
+            type_name: "[u32; 4]".into(),
+        };
+        let encoded = encode_local_memory_provenance(&provenance);
+        assert_eq!(decode_hex_payload(&encoded), "3\t16\tscratch\t[u32; 4]");
+    }
+
+    #[test]
+    fn oversized_provenance_payloads_are_capped_for_llvm() {
+        // LLVM's textual parser mis-lexes kilobyte-long value names, so a
+        // pathological type spelling must not reach the emitted identifier
+        // at full length.
+        let provenance = LocalMemoryProvenanceAttr {
+            local_index: 7,
+            size_bytes: 4096,
+            binding_name: "state".into(),
+            type_name: "Ty { … }".repeat(1000).into(),
+        };
+        let encoded = encode_local_memory_provenance(&provenance);
+        assert!(encoded.len() <= LOCAL_MEMORY_MAX_PAYLOAD_BYTES * 2 + 1);
+        // The capped payload still decodes as UTF-8 (the truncation respects
+        // char boundaries even through the multi-byte ellipsis) and keeps the
+        // leading fields intact.
+        let decoded = decode_hex_payload(&encoded);
+        assert!(decoded.starts_with("7\t4096\tstate\tTy { "));
     }
 }

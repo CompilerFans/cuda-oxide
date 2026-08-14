@@ -29,10 +29,29 @@ pub(super) struct KernelClusterConfig {
     pub(super) dim_z: u32,
 }
 
-/// Launch bounds for a kernel (from `#[launch_bounds(max, min)]` attribute).
+/// Block geometry declared for a kernel entry.
+///
+/// ptxas rejects an entry carrying both `.maxntid` and `.reqntid`, so an entry
+/// declares one or the other. An exact shape is the stronger statement and
+/// displaces a thread maximum, which is why these are alternatives rather than
+/// two fields.
+#[derive(Clone, Copy)]
+pub(super) enum KernelBlockGeometry {
+    /// Maximum threads per block from `#[launch_bounds(max, _)]`, emitted as
+    /// `maxntid*`. Bounds the product `x * y * z` and says nothing per axis.
+    MaxThreads(u32),
+    /// Exact block shape from `#[launch_contract(block = (x, y, z))]`, emitted
+    /// as `reqntid*`. The CUDA driver enforces it per axis at launch.
+    ExactBlock(u32, u32, u32),
+}
+
+/// Launch geometry for a kernel, from `#[launch_bounds(max, min)]` and from an
+/// exact `#[launch_contract(block = (x, y, z))]`.
+///
+/// A kernel declaring neither is never recorded.
 pub(super) struct KernelLaunchBounds {
     pub(super) name: String,
-    pub(super) max_threads: u32,
+    pub(super) geometry: KernelBlockGeometry,
     pub(super) min_blocks: Option<u32>, // None if not specified (0 in attribute)
 }
 
@@ -45,6 +64,14 @@ pub(super) struct KernelInfo {
 pub(super) struct GlobalSymbolInfo {
     pub(super) value_type: TypeHandle,
     pub(super) address_space: u32,
+}
+
+#[derive(Clone)]
+pub(super) struct GlobalSourceInfo {
+    pub(super) symbol: String,
+    pub(super) value_type: TypeHandle,
+    pub(super) address_space: u32,
+    pub(super) initializer_size: Option<u64>,
 }
 
 pub(super) struct ModuleExportState<'a> {
@@ -63,6 +90,12 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) kernel_calling_convention: KernelCallingConvention,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
+    /// Defined globals retain external linkage because CUDA host code can
+    /// resolve them by name (for example through `cuModuleGetGlobal`).
+    pub(super) public_globals: Vec<String>,
+    /// Globals explicitly consumed outside device code and therefore rooted in
+    /// `@llvm.used` so materialization cannot discard them.
+    pub(super) retained_globals: Vec<String>,
     /// Emitted function signatures keyed by their final, prefix-stripped name.
     pub(super) function_types: FxHashMap<String, TypeHandle>,
     /// Original pliron symbol spelling for each final exported function name.
@@ -79,6 +112,11 @@ pub(super) struct ModuleExportState<'a> {
     /// Global value types/address spaces, indexed before any function body is
     /// emitted so `addressof` is independent of top-level textual order.
     pub(super) global_symbols: FxHashMap<String, GlobalSymbolInfo>,
+    /// Device globals indexed by their stable rustc source key.
+    ///
+    /// Relocation metadata refers to this key because ordinary globals receive
+    /// generated LLVM symbol names during MIR lowering.
+    pub(super) global_sources: FxHashMap<String, GlobalSourceInfo>,
     /// Next `!N` metadata ID in this module.
     ///
     /// LLVM has one flat numbered metadata namespace per module. Today this is
@@ -152,11 +190,14 @@ impl<'a> ModuleExportState<'a> {
             track_all_kernels,
             kernel_calling_convention,
             device_functions: Vec::new(),
+            public_globals: Vec::new(),
+            retained_globals: Vec::new(),
             function_types: FxHashMap::default(),
             function_source_names: FxHashMap::default(),
             function_definitions: HashSet::new(),
             device_externs: FxHashMap::default(),
             global_symbols: FxHashMap::default(),
+            global_sources: FxHashMap::default(),
             next_metadata_id: 0,
             debug_kind,
             nvvm_ir_dialect,
@@ -233,6 +274,11 @@ impl<'a> ModuleExportState<'a> {
             || name.starts_with("llvm.nvvm.redux")
             // Async bulk operations (TMA)
             || name.starts_with("llvm.nvvm.cp.async.bulk")
+            // Warpgroup register reconfiguration
+            // (setmaxnreg.{inc,dec}.sync.aligned.u32): all warps of the
+            // warpgroup must execute it together, so it is convergent and
+            // side-effecting and must not be sunk into divergent branches.
+            || name.starts_with("llvm.nvvm.setmaxnreg")
     }
 }
 
@@ -296,6 +342,42 @@ mod tests {
             assert!(
                 !ModuleExportState::is_convergent_intrinsic(name),
                 "{name} should not be flagged convergent"
+            );
+        }
+    }
+
+    #[test]
+    fn setmaxnreg_is_convergent() {
+        // `setmaxnreg.{inc,dec}.sync.aligned.u32` reconfigures the register
+        // file for the whole warpgroup; every warp must execute it together,
+        // so the exported declaration must carry `convergent`.
+        for name in [
+            "llvm.nvvm.setmaxnreg.inc.sync.aligned.u32",
+            "llvm.nvvm.setmaxnreg.dec.sync.aligned.u32",
+        ] {
+            assert!(
+                ModuleExportState::is_convergent_intrinsic(name),
+                "{name} should be flagged convergent"
+            );
+        }
+    }
+
+    #[test]
+    fn counted_cta_barriers_are_convergent() {
+        // The counted CTA barrier family (barrier.cta.{sync,arrive} with a
+        // thread count, aligned or not) is covered by the `llvm.nvvm.barrier`
+        // prefix; this checks that coverage against the exact names the
+        // generated lowerings produce.
+        for name in [
+            "llvm.nvvm.barrier.cta.sync.count",
+            "llvm.nvvm.barrier.cta.sync.aligned.count",
+            "llvm.nvvm.barrier.cta.arrive.count",
+            "llvm.nvvm.barrier.cta.arrive.aligned.count",
+            "llvm.nvvm.barrier.cta.sync.aligned.all",
+        ] {
+            assert!(
+                ModuleExportState::is_convergent_intrinsic(name),
+                "{name} should be flagged convergent"
             );
         }
     }

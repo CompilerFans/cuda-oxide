@@ -4,15 +4,19 @@
  */
 
 use dialect_mir::{
-    attributes::MirCastKindAttr,
+    attributes::{FieldIndexAttr, MirCastKindAttr, VariantIndexAttr},
     ops::{
         MirAddOp, MirAssertOp, MirAssignOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCmpOp,
-        MirCondBranchOp, MirConstantOp, MirConstructSliceOp, MirDivOp, MirEqOp, MirExtractFieldOp,
-        MirFuncOp, MirGeOp, MirGlobalAllocOp, MirGotoOp, MirGtOp, MirLeOp, MirLoadOp, MirLtOp,
-        MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRemOp, MirReturnOp,
-        MirSetDiscriminantOp, MirStoreOp, MirSubOp,
+        MirCondBranchOp, MirConstantOp, MirConstructDisjointSliceOp, MirConstructEnumOp,
+        MirConstructSliceOp, MirDivOp, MirEnumPayloadOp, MirEqOp, MirExtractFieldOp,
+        MirFieldAddrOp, MirFuncOp, MirGeOp, MirGetDiscriminantOp, MirGlobalAllocOp, MirGotoOp,
+        MirGtOp, MirLeOp, MirLoadOp, MirLtOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp,
+        MirPtrOffsetOp, MirRemOp, MirReturnOp, MirSetDiscriminantOp, MirStoreOp, MirSubOp,
     },
-    types::{EnumVariant, MirEnumType, MirPtrType, MirSliceType, MirTupleType, MirUnionType},
+    types::{
+        EnumVariant, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType, MirTupleType,
+        MirUnionType,
+    },
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -304,6 +308,15 @@ fn test_mir_ptr_offset_verify() {
     );
     let offset_op = MirPtrOffsetOp::new(op);
     assert!(offset_op.verify(&ctx).is_ok(), "Valid MirPtrOffsetOp");
+    assert!(
+        offset_op.is_inbounds(&ctx),
+        "ordinary pointer offsets default to inbounds"
+    );
+    offset_op.set_inbounds(&mut ctx, false);
+    assert!(
+        !offset_op.is_inbounds(&ctx),
+        "wrapping pointer offsets retain their explicit semantics"
+    );
 
     let block2 = BasicBlock::new(&mut ctx, None, vec![i32_ty.into(), usize_ty.into()]);
     let i32_val = block2.deref(&ctx).get_argument(0);
@@ -388,6 +401,127 @@ fn test_mir_extract_field_verify() {
     let union_extract = MirExtractFieldOp::new(union_extract);
     union_extract.set_attr_index(&ctx, dialect_mir::attributes::FieldIndexAttr(1));
     assert!(union_extract.verify(&ctx).is_ok(), "Valid union extract");
+}
+
+#[test]
+fn test_mir_construct_disjoint_slice_verify() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let f32_ty = FP32Type::get(&ctx);
+    let usize_ty = IntegerType::get(&ctx, 64, Signedness::Unsigned);
+    let width_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let f32_ptr_ty = MirPtrType::get_generic(&mut ctx, f32_ty.into(), true);
+    let plain_ty = MirDisjointSliceType::get(&mut ctx, f32_ty.into());
+    let width_ty_handle: pliron::r#type::TypeHandle = width_ty.into();
+    let row_width_ty =
+        MirDisjointSliceType::get_with_space(&mut ctx, f32_ty.into(), vec![width_ty_handle]);
+
+    let block = BasicBlock::new(
+        &mut ctx,
+        None,
+        vec![f32_ptr_ty.into(), usize_ty.into(), width_ty.into()],
+    );
+    let ptr_val = block.deref(&ctx).get_argument(0);
+    let len_val = block.deref(&ctx).get_argument(1);
+    let width_val = block.deref(&ctx).get_argument(2);
+
+    // Valid: an index space with no runtime layout takes two operands.
+    let op = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![plain_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op).verify(&ctx).is_ok(),
+        "Valid space-free disjoint slice construction"
+    );
+
+    // Valid: a runtime row width takes a third operand.
+    let op_width = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![row_width_ty.into()],
+        vec![ptr_val, len_val, width_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op_width)
+            .verify(&ctx)
+            .is_ok(),
+        "Valid row-width disjoint slice construction"
+    );
+
+    // Invalid: the row width is missing, so the slice would carry whatever
+    // slot 2 held.
+    let op_missing_width = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![row_width_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op_missing_width)
+            .verify(&ctx)
+            .is_err(),
+        "Missing index-space operand"
+    );
+
+    // Invalid: a space-free slice given a third operand.
+    let op_extra = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![plain_ty.into()],
+        vec![ptr_val, len_val, width_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op_extra)
+            .verify(&ctx)
+            .is_err(),
+        "Index-space operand for a space-free slice"
+    );
+
+    // Invalid: the row width operand has the wrong width, which would write a
+    // 64-bit value into the 32-bit row width slot.
+    let op_wrong_width_ty = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![row_width_ty.into()],
+        vec![ptr_val, len_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op_wrong_width_ty)
+            .verify(&ctx)
+            .is_err(),
+        "Index-space operand type mismatch"
+    );
+
+    // Invalid: result is a plain slice, which `mir.construct_slice` owns.
+    let plain_slice_ty = MirSliceType::get(&mut ctx, f32_ty.into());
+    let op_bad_res = Operation::new(
+        &mut ctx,
+        MirConstructDisjointSliceOp::get_concrete_op_info(),
+        vec![plain_slice_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructDisjointSliceOp::new(op_bad_res)
+            .verify(&ctx)
+            .is_err(),
+        "Result must be a disjoint slice type"
+    );
 }
 
 #[test]
@@ -1061,8 +1195,21 @@ fn test_mir_set_discriminant_verify() {
     let enum_ptr = blk.deref(&ctx).get_argument(0);
     let discr_val = blk.deref(&ctx).get_argument(1);
 
-    // Valid: pointer to enum + discriminant of the enum's discriminant type.
-    let op_valid = Operation::new(
+    // Malformed IR must be diagnosed without panicking, regardless of whether
+    // the generated operand-count interface happens to run first.
+    let op_no_operands = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    let no_operands = MirSetDiscriminantOp::new(op_no_operands);
+    no_operands.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(0));
+    assert!(no_operands.verify(&ctx).is_err(), "zero operands rejected");
+
+    let op_extra_operand = Operation::new(
         &mut ctx,
         MirSetDiscriminantOp::get_concrete_op_info(),
         vec![],
@@ -1070,17 +1217,32 @@ fn test_mir_set_discriminant_verify() {
         vec![],
         0,
     );
+    let extra_operand = MirSetDiscriminantOp::new(op_extra_operand);
+    extra_operand.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(0));
     assert!(
-        MirSetDiscriminantOp::new(op_valid).verify(&ctx).is_ok(),
-        "Valid set_discriminant"
+        extra_operand.verify(&ctx).is_err(),
+        "extra operand rejected"
     );
+
+    // Valid: pointer to enum plus the semantic target variant attribute.
+    let op_valid = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![enum_ptr],
+        vec![],
+        0,
+    );
+    let valid = MirSetDiscriminantOp::new(op_valid);
+    valid.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(1));
+    assert!(valid.verify(&ctx).is_ok(), "Valid set_discriminant");
 
     // Invalid: first operand is not a pointer.
     let op_bad_ptr = Operation::new(
         &mut ctx,
         MirSetDiscriminantOp::get_concrete_op_info(),
         vec![],
-        vec![discr_val, discr_val],
+        vec![discr_val],
         vec![],
         0,
     );
@@ -1089,42 +1251,481 @@ fn test_mir_set_discriminant_verify() {
         "Non-pointer enum operand rejected"
     );
 
+    // Invalid: SetDiscriminant writes memory and therefore cannot accept an
+    // immutable pointer even when the pointee is the right enum.
+    let immutable_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty.into(), false);
+    let immutable_block = BasicBlock::new(&mut ctx, None, vec![immutable_ptr_ty.into()]);
+    let immutable_ptr = immutable_block.deref(&ctx).get_argument(0);
+    let op_immutable = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![immutable_ptr],
+        vec![],
+        0,
+    );
+    let immutable = MirSetDiscriminantOp::new(op_immutable);
+    immutable.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(0));
+    assert!(
+        immutable.verify(&ctx).is_err(),
+        "immutable pointer rejected"
+    );
+
     // Invalid: pointer does not point to an enum.
     let i32_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), true);
     let blk_i32 = BasicBlock::new(&mut ctx, None, vec![i32_ptr_ty.into(), i8_ty.into()]);
     let i32_ptr = blk_i32.deref(&ctx).get_argument(0);
-    let i32_discr = blk_i32.deref(&ctx).get_argument(1);
     let op_bad_pointee = Operation::new(
         &mut ctx,
         MirSetDiscriminantOp::get_concrete_op_info(),
         vec![],
-        vec![i32_ptr, i32_discr],
+        vec![i32_ptr],
         vec![],
         0,
     );
+    let bad_pointee = MirSetDiscriminantOp::new(op_bad_pointee);
+    bad_pointee.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(0));
     assert!(
-        MirSetDiscriminantOp::new(op_bad_pointee)
-            .verify(&ctx)
-            .is_err(),
+        bad_pointee.verify(&ctx).is_err(),
         "Non-enum pointee rejected"
     );
 
-    // Invalid: discriminant type mismatch (i32 instead of i8).
-    let blk_bad_discr = BasicBlock::new(&mut ctx, None, vec![enum_ptr_ty.into(), i32_ty.into()]);
-    let enum_ptr_2 = blk_bad_discr.deref(&ctx).get_argument(0);
-    let bad_discr = blk_bad_discr.deref(&ctx).get_argument(1);
-    let op_bad_discr = Operation::new(
+    // Invalid: target attribute is required.
+    let op_missing_target = Operation::new(
         &mut ctx,
         MirSetDiscriminantOp::get_concrete_op_info(),
         vec![],
-        vec![enum_ptr_2, bad_discr],
+        vec![enum_ptr],
         vec![],
         0,
     );
     assert!(
-        MirSetDiscriminantOp::new(op_bad_discr)
+        MirSetDiscriminantOp::new(op_missing_target)
             .verify(&ctx)
             .is_err(),
-        "Discriminant type mismatch rejected"
+        "Missing target rejected"
+    );
+
+    // Invalid: target index is out of bounds.
+    let op_oob = Operation::new(
+        &mut ctx,
+        MirSetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![enum_ptr],
+        vec![],
+        0,
+    );
+    let oob = MirSetDiscriminantOp::new(op_oob);
+    oob.set_attr_set_discriminant_variant_index(&ctx, VariantIndexAttr(2));
+    assert!(oob.verify(&ctx).is_err(), "Out-of-bounds target rejected");
+}
+
+#[test]
+fn test_mir_enum_ops_malformed_arity_is_diagnostic() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Unsigned);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let unit_enum = MirEnumType::get(
+        &mut ctx,
+        "Unit".into(),
+        i8_ty.into(),
+        vec![0],
+        vec![EnumVariant::unit("Only".into())],
+    );
+    let payload_enum = MirEnumType::get(
+        &mut ctx,
+        "Payload".into(),
+        i8_ty.into(),
+        vec![0],
+        vec![EnumVariant::new("Only".into(), vec![i32_ty.into()])],
+    );
+    let block = BasicBlock::new(&mut ctx, None, vec![unit_enum.into(), payload_enum.into()]);
+    let unit_value = block.deref(&ctx).get_argument(0);
+    let payload_value = block.deref(&ctx).get_argument(1);
+
+    let construct_no_result = Operation::new(
+        &mut ctx,
+        MirConstructEnumOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    let construct_no_result = MirConstructEnumOp::new(construct_no_result);
+    construct_no_result.set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(0));
+    assert!(construct_no_result.verify(&ctx).is_err());
+
+    let construct_extra_result = Operation::new(
+        &mut ctx,
+        MirConstructEnumOp::get_concrete_op_info(),
+        vec![unit_enum.into(), unit_enum.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    let construct_extra_result = MirConstructEnumOp::new(construct_extra_result);
+    construct_extra_result.set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(0));
+    assert!(construct_extra_result.verify(&ctx).is_err());
+
+    let get_empty = Operation::new(
+        &mut ctx,
+        MirGetDiscriminantOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(MirGetDiscriminantOp::new(get_empty).verify(&ctx).is_err());
+    let get_extra = Operation::new(
+        &mut ctx,
+        MirGetDiscriminantOp::get_concrete_op_info(),
+        vec![i8_ty.into(), i8_ty.into()],
+        vec![unit_value, unit_value],
+        vec![],
+        0,
+    );
+    assert!(MirGetDiscriminantOp::new(get_extra).verify(&ctx).is_err());
+
+    let payload_empty = Operation::new(
+        &mut ctx,
+        MirEnumPayloadOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    let payload_empty = MirEnumPayloadOp::new(payload_empty);
+    payload_empty.set_attr_payload_variant_index(&ctx, VariantIndexAttr(0));
+    payload_empty.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+    assert!(payload_empty.verify(&ctx).is_err());
+
+    let payload_extra = Operation::new(
+        &mut ctx,
+        MirEnumPayloadOp::get_concrete_op_info(),
+        vec![i32_ty.into(), i32_ty.into()],
+        vec![payload_value, payload_value],
+        vec![],
+        0,
+    );
+    let payload_extra = MirEnumPayloadOp::new(payload_extra);
+    payload_extra.set_attr_payload_variant_index(&ctx, VariantIndexAttr(0));
+    payload_extra.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+    assert!(payload_extra.verify(&ctx).is_err());
+}
+
+#[test]
+fn test_mir_enum_payload_rejects_uninhabited_variant() {
+    use dialect_mir::types::{EnumCarrierKind, EnumEncoding, EnumLayoutKind};
+
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Unsigned);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+    let enum_ty = MirEnumType::get_with_encoding(
+        &mut ctx,
+        "HasImpossibleField".into(),
+        i8_ty.into(),
+        vec![0, 1],
+        vec![
+            EnumVariant::unit("Live".into()),
+            // An uninhabited variant's unused physical offsets need not fit
+            // the object. The verifier must stop them reaching lowering.
+            EnumVariant::new_with_layout(
+                "Impossible".into(),
+                vec![i32_ty.into()],
+                vec![64],
+                vec![4],
+            ),
+        ],
+        EnumEncoding {
+            tag_offset: 0,
+            total_size: 1,
+            abi_align: 1,
+            layout_kind: EnumLayoutKind::Direct,
+            carrier_kind: EnumCarrierKind::Integer,
+            carrier_width: 8,
+            variant_inhabited: vec![1, 0],
+            ..EnumEncoding::default()
+        },
+    );
+    assert!(enum_ty.verify(&ctx).is_ok());
+
+    let block = BasicBlock::new(&mut ctx, None, vec![enum_ty.into()]);
+    let value = block.deref(&ctx).get_argument(0);
+    let op = Operation::new(
+        &mut ctx,
+        MirEnumPayloadOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![value],
+        vec![],
+        0,
+    );
+    let payload = MirEnumPayloadOp::new(op);
+    payload.set_attr_payload_variant_index(&ctx, VariantIndexAttr(1));
+    payload.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+    assert!(payload.verify(&ctx).is_err());
+}
+
+/// Reachable-but-dead MIR (e.g. the residual arms of `array::try_from_fn`)
+/// can name uninhabited variants. The importer must lower such reads and
+/// constructions to typed undefs; if it ever emits the real ops again, these
+/// verifiers are the loud stop.
+#[test]
+fn test_uninhabited_enum_construct_and_discriminant_fail_verification() {
+    use dialect_mir::types::{EnumCarrierKind, EnumEncoding, EnumLayoutKind};
+
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Unsigned);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+
+    // Constructing an uninhabited variant must fail verification.
+    let partial = MirEnumType::get_with_encoding(
+        &mut ctx,
+        "HasImpossibleVariant".into(),
+        i8_ty.into(),
+        vec![0, 1],
+        vec![
+            EnumVariant::unit("Live".into()),
+            EnumVariant::new_with_layout(
+                "Impossible".into(),
+                vec![i32_ty.into()],
+                vec![0],
+                vec![4],
+            ),
+        ],
+        EnumEncoding {
+            tag_offset: 0,
+            total_size: 8,
+            abi_align: 4,
+            layout_kind: EnumLayoutKind::Direct,
+            carrier_kind: EnumCarrierKind::Integer,
+            carrier_width: 8,
+            variant_inhabited: vec![1, 0],
+            ..EnumEncoding::default()
+        },
+    );
+    let block = BasicBlock::new(&mut ctx, None, vec![i32_ty.into()]);
+    let field = block.deref(&ctx).get_argument(0);
+    let construct = Operation::new(
+        &mut ctx,
+        MirConstructEnumOp::get_concrete_op_info(),
+        vec![partial.into()],
+        vec![field],
+        vec![],
+        0,
+    );
+    let construct = MirConstructEnumOp::new(construct);
+    construct.set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(1));
+    assert!(construct.verify(&ctx).is_err());
+
+    // Reading the discriminant of a fully uninhabited enum must fail
+    // verification.
+    let never = MirEnumType::get_with_encoding(
+        &mut ctx,
+        "Never".into(),
+        i8_ty.into(),
+        vec![],
+        vec![],
+        EnumEncoding {
+            tag_offset: 0,
+            total_size: 0,
+            abi_align: 1,
+            layout_kind: EnumLayoutKind::Empty,
+            carrier_kind: EnumCarrierKind::None,
+            carrier_width: 0,
+            variant_inhabited: vec![],
+            ..EnumEncoding::default()
+        },
+    );
+    assert!(never.verify(&ctx).is_ok());
+    let never_block = BasicBlock::new(&mut ctx, None, vec![never.into()]);
+    let never_value = never_block.deref(&ctx).get_argument(0);
+    let get_discriminant = Operation::new(
+        &mut ctx,
+        MirGetDiscriminantOp::get_concrete_op_info(),
+        vec![i8_ty.into()],
+        vec![never_value],
+        vec![],
+        0,
+    );
+    let get_discriminant = MirGetDiscriminantOp::new(get_discriminant);
+    assert!(get_discriminant.verify(&ctx).is_err());
+}
+
+#[test]
+fn test_mir_field_addr_tuple_pointee_verify() {
+    // `(u8, u32)` laid out the way rustc actually places it: the u32 field
+    // first in memory for alignment, so declaration index 0 (`u8`) lands at
+    // byte offset 4 and declaration index 1 (`u32`) lands at byte offset 0.
+    // `field_addr`'s `field_index` attribute is a DECLARATION index (it names
+    // `.0`/`.1` as written), so this test only passes if the op resolves the
+    // field's type through `MirTupleType::get_types()` (declaration order)
+    // rather than assuming identity with memory order.
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let u8_ty = IntegerType::get(&ctx, 8, Signedness::Unsigned);
+    let u32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+
+    let tuple_ty = MirTupleType::get_with_layout(
+        &mut ctx,
+        vec![u8_ty.into(), u32_ty.into()],
+        vec![1, 0],
+        vec![4, 0],
+        8,
+        4,
+    );
+
+    let tuple_ptr_ty = MirPtrType::get_generic(&mut ctx, tuple_ty.into(), false);
+    let blk = BasicBlock::new(&mut ctx, None, vec![tuple_ptr_ty.into()]);
+    let tuple_ptr = blk.deref(&ctx).get_argument(0);
+
+    let u8_ptr_ty = MirPtrType::get_generic(&mut ctx, u8_ty.into(), false);
+    let op_field0 = Operation::new(
+        &mut ctx,
+        MirFieldAddrOp::get_concrete_op_info(),
+        vec![u8_ptr_ty.into()],
+        vec![tuple_ptr],
+        vec![],
+        0,
+    );
+    let field0 = MirFieldAddrOp::new(op_field0);
+    field0.set_attr_field_index(&ctx, FieldIndexAttr(0));
+    assert!(
+        field0.verify(&ctx).is_ok(),
+        "tuple field 0 (u8) address accepted"
+    );
+
+    let u32_ptr_ty = MirPtrType::get_generic(&mut ctx, u32_ty.into(), false);
+    let op_field1 = Operation::new(
+        &mut ctx,
+        MirFieldAddrOp::get_concrete_op_info(),
+        vec![u32_ptr_ty.into()],
+        vec![tuple_ptr],
+        vec![],
+        0,
+    );
+    let field1 = MirFieldAddrOp::new(op_field1);
+    field1.set_attr_field_index(&ctx, FieldIndexAttr(1));
+    assert!(
+        field1.verify(&ctx).is_ok(),
+        "tuple field 1 (u32) address accepted"
+    );
+
+    // Result pointee type must match the DECLARED field type, not whatever
+    // sits at that byte offset: pointing field 0's result at u32 (field 1's
+    // type) must be rejected even though both are in-bounds indices.
+    let op_wrong_result_ty = Operation::new(
+        &mut ctx,
+        MirFieldAddrOp::get_concrete_op_info(),
+        vec![u32_ptr_ty.into()],
+        vec![tuple_ptr],
+        vec![],
+        0,
+    );
+    let wrong_result_ty = MirFieldAddrOp::new(op_wrong_result_ty);
+    wrong_result_ty.set_attr_field_index(&ctx, FieldIndexAttr(0));
+    assert!(
+        wrong_result_ty.verify(&ctx).is_err(),
+        "result pointee type mismatch rejected"
+    );
+
+    let op_out_of_bounds = Operation::new(
+        &mut ctx,
+        MirFieldAddrOp::get_concrete_op_info(),
+        vec![u8_ptr_ty.into()],
+        vec![tuple_ptr],
+        vec![],
+        0,
+    );
+    let out_of_bounds = MirFieldAddrOp::new(op_out_of_bounds);
+    out_of_bounds.set_attr_field_index(&ctx, FieldIndexAttr(2));
+    assert!(
+        out_of_bounds.verify(&ctx).is_err(),
+        "out-of-bounds tuple field index rejected"
+    );
+}
+
+#[test]
+fn test_mir_field_addr_tuple_pointee_store_verify() {
+    // The WRITE side of the tuple-pointee unlock: `t.1 = x` / `arr[i].1 = x`
+    // lower to `mir.field_addr` + `mir.store` through the field's address, so
+    // a tuple-pointee field address used as a store destination must pass
+    // verification too. Same reordered `(u8, u32)` layout as above (the u32
+    // field first in memory), so the store type-checks against the DECLARED
+    // field type, not whatever occupies that memory slot.
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let u8_ty = IntegerType::get(&ctx, 8, Signedness::Unsigned);
+    let u32_ty = IntegerType::get(&ctx, 32, Signedness::Unsigned);
+
+    let tuple_ty = MirTupleType::get_with_layout(
+        &mut ctx,
+        vec![u8_ty.into(), u32_ty.into()],
+        vec![1, 0],
+        vec![4, 0],
+        8,
+        4,
+    );
+
+    let tuple_ptr_ty = MirPtrType::get_generic(&mut ctx, tuple_ty.into(), false);
+    let blk = BasicBlock::new(
+        &mut ctx,
+        None,
+        vec![tuple_ptr_ty.into(), u32_ty.into(), u8_ty.into()],
+    );
+    let tuple_ptr = blk.deref(&ctx).get_argument(0);
+    let u32_val = blk.deref(&ctx).get_argument(1);
+    let u8_val = blk.deref(&ctx).get_argument(2);
+
+    // `.1 = x`: address declaration field 1 (u32, memory slot 0) and store a
+    // u32 through it.
+    let u32_ptr_ty = MirPtrType::get_generic(&mut ctx, u32_ty.into(), false);
+    let op_field1 = Operation::new(
+        &mut ctx,
+        MirFieldAddrOp::get_concrete_op_info(),
+        vec![u32_ptr_ty.into()],
+        vec![tuple_ptr],
+        vec![],
+        0,
+    );
+    let field1 = MirFieldAddrOp::new(op_field1);
+    field1.set_attr_field_index(&ctx, FieldIndexAttr(1));
+    assert!(
+        field1.verify(&ctx).is_ok(),
+        "tuple field 1 (u32) address accepted as a store destination"
+    );
+    let field1_ptr = op_field1.deref(&ctx).get_result(0);
+
+    let op_store = Operation::new(
+        &mut ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![field1_ptr, u32_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirStoreOp::new(op_store).verify(&ctx).is_ok(),
+        "store through a tuple field address verifies"
+    );
+
+    // The stored value must match the DECLARED field type (`u32` for `.1`),
+    // not the type of the field sharing the tuple: a u8 store through the
+    // `.1` pointer is a type mismatch.
+    let op_store_wrong_ty = Operation::new(
+        &mut ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![field1_ptr, u8_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirStoreOp::new(op_store_wrong_ty).verify(&ctx).is_err(),
+        "store of a mismatched value type through a tuple field address rejected"
     );
 }

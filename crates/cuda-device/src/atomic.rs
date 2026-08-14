@@ -53,6 +53,30 @@
 //! }
 //! ```
 //!
+//! # Performance: a scoped atomic load cannot be served from L1
+//!
+//! `load` and `store` here are *coherent* at their scope. An L1 cache is not
+//! coherent across SMs, so a device- or system-scoped atomic access bypasses L1
+//! by construction, on every call, however weak its ordering. Relaxed does not
+//! make it cheap; relaxed only removes ordering, not coherence.
+//!
+//! That matters when the access is on a hot path and the algorithm does not
+//! actually need coherence. A common shape is a hash table where a thread
+//! publishes a key and then an index, and readers must not observe the first
+//! without the second. Reading the index with `load` on every lookup pays an
+//! uncached access every time, when the index is almost always already
+//! published. Reading it plainly first and falling back to `load` only while
+//! genuinely waiting keeps the common path in L1.
+//!
+//! Measured on such a probe loop: doing it the first way took the L1 sector hit
+//! rate from 54% to 29%, pushed 1.7x the sectors through to L2, and made the
+//! kernel 24% slower, with the entire difference showing up as
+//! `long_scoreboard` warp stalls. No instruction count changes; only where the
+//! data is allowed to live.
+//!
+//! Use these types where you need cross-thread visibility. Do not reach for
+//! them by reflex just because a location is shared.
+//!
 //! # Naming and overlap with `core::sync::atomic`
 //!
 //! Device-scope types are named **`DeviceAtomic*`** (e.g. `DeviceAtomicU32`) so they
@@ -572,91 +596,4 @@ define_float_atomic! {
 // They bypass the scoped-type system and use `atom.global` directly.
 // =============================================================================
 
-/// Packed f16x2 atomic add on global memory.
-///
-/// Adds the two packed f16 lanes in `val` to the corresponding lanes at
-/// `*addr`. Each 16-bit lane is atomic independently; the two lane operations
-/// occur in an unspecified order.
-///
-/// Both `val` and the return value are `u32` words carrying two f16 values
-/// (low 16 bits = first lane, high 16 bits = second lane).
-/// The returned lanes are the two prior lane values, but they need not come
-/// from one coherent 32-bit snapshot.
-///
-/// This is a relaxed, device-scope (`.gpu`) global-memory operation. It does
-/// not order other memory accesses and does not synchronize with host/system
-/// atomics.
-///
-/// # PTX
-///
-/// ```ptx
-/// atom.global.add.noftz.f16x2 %old, [%addr], %val;
-/// ```
-///
-/// `.noftz` preserves subnormal values; each lane rounds to nearest-even.
-///
-/// # Supported on
-///
-/// - `sm_70+`, cuda-oxide's Volta floor (the PTX instruction itself requires
-///   PTX 6.2 and `sm_60+`).
-///
-/// # Safety
-///
-/// - `addr` must point to 4 writable bytes in global memory, naturally
-///   aligned to 4 bytes.
-/// - Do not race this operation with a whole-word `u32` atomic or with any
-///   non-atomic access to either 16-bit lane; such overlapping accesses do not
-///   share this instruction's lane-wise atomicity and are undefined behavior.
-/// - Concurrent lane atomics must use scopes that include one another. This
-///   device-scope operation is not atomic with respect to host/system access.
-#[must_use]
-#[inline(never)]
-pub unsafe fn atom_add_f16x2(addr: *mut u32, val: u32) -> u32 {
-    let _ = (addr, val);
-    unreachable!("atom_add_f16x2 called outside CUDA kernel context")
-}
-
-/// Packed bf16x2 atomic add on global memory.
-///
-/// Adds the two packed bf16 lanes in `val` to the corresponding lanes at
-/// `*addr`. Each 16-bit lane is atomic independently; the two lane operations
-/// occur in an unspecified order.
-///
-/// Both `val` and the return value are `u32` words carrying two bf16 values
-/// (low 16 bits = first lane, high 16 bits = second lane).
-/// The returned lanes are the two prior lane values, but they need not come
-/// from one coherent 32-bit snapshot.
-///
-/// This is a relaxed, device-scope (`.gpu`) global-memory operation. It does
-/// not order other memory accesses and does not synchronize with host/system
-/// atomics.
-///
-/// # PTX
-///
-/// ```ptx
-/// atom.global.add.noftz.bf16x2 %old, [%addr], %val;
-/// ```
-///
-/// `.noftz` preserves subnormal values; each lane rounds to nearest-even.
-///
-/// # Supported on
-///
-/// - `sm_90+` with PTX ISA 7.8+. CUDA C++ emulates this operation on older
-///   GPUs, but this low-level cuda-oxide intrinsic intentionally exposes only
-///   the native PTX instruction.
-///
-/// # Safety
-///
-/// - `addr` must point to 4 writable bytes in global memory, naturally
-///   aligned to 4 bytes.
-/// - Do not race this operation with a whole-word `u32` atomic or with any
-///   non-atomic access to either 16-bit lane; such overlapping accesses do not
-///   share this instruction's lane-wise atomicity and are undefined behavior.
-/// - Concurrent lane atomics must use scopes that include one another. This
-///   device-scope operation is not atomic with respect to host/system access.
-#[must_use]
-#[inline(never)]
-pub unsafe fn atom_add_bf16x2(addr: *mut u32, val: u32) -> u32 {
-    let _ = (addr, val);
-    unreachable!("atom_add_bf16x2 called outside CUDA kernel context")
-}
+include!("generated/atomic.rs");

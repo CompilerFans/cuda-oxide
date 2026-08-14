@@ -18,9 +18,15 @@
 mod api;
 mod error;
 mod export;
+mod generated;
+#[allow(dead_code, missing_docs)]
+mod generated_intrinsic_targets;
+mod iket;
 mod llvm_tools;
+mod local_memory_diagnostic;
 mod lower;
 mod maca;
+mod mir_pass_registry;
 mod options;
 mod pipeline;
 mod prep;
@@ -45,9 +51,15 @@ mod verify;
 /// lowering pipeline. Kernel entries are top-level
 /// [`dialect_mir::ops::MirFuncOp`] values whose symbols are marked through
 /// [`CodegenModule::mark_kernel_entry`](experimental::CodegenModule::mark_kernel_entry).
-/// The v1 PTX output must be self-contained: libdevice calls and other
-/// unresolved functions return
+/// The v1 PTX output is self-contained. By default any libdevice call or
+/// other unresolved function returns
 /// [`CompileError::UnsupportedLinking`](experimental::CompileError::UnsupportedLinking).
+/// [`Linking::Libdevice`](experimental::Linking::Libdevice) opts into
+/// resolving `__nv_*` calls against `libdevice.10.bc` at the LLVM IR level,
+/// which keeps the output a single self-contained PTX artifact. Unresolved
+/// symbols that are not libdevice stay rejected under that option, and a
+/// toolchain that cannot perform the link returns
+/// [`CompileError::LibdeviceUnavailable`](experimental::CompileError::LibdeviceUnavailable).
 ///
 /// # Minimal flow
 ///
@@ -91,7 +103,7 @@ mod verify;
 pub mod experimental {
     pub use crate::api::{
         CodegenModule, Compilation, CompilationStage, CompileError, CompileOptions, Compiler,
-        DebugInfo, Diagnostic, DiagnosticLevel, Optimization, Target, Toolchain,
+        DebugInfo, Diagnostic, DiagnosticLevel, Linking, Optimization, Target, Toolchain,
     };
 }
 
@@ -117,6 +129,18 @@ pub mod __private {
     pub use crate::verify::verify_operation;
     #[doc(hidden)]
     pub use llvm_export::export::DeviceExternType;
+
+    /// Compiler-only attribute used to carry the Rust generated-intrinsic ABI marker.
+    #[doc(hidden)]
+    pub const GENERATED_INTRINSIC_MARKER_ATTR: &str =
+        crate::generated_intrinsic_targets::GENERATED_INTRINSIC_MARKER_ATTR;
+
+    /// Return the unique generated ABI marker for a dialect operation name.
+    #[doc(hidden)]
+    pub fn generated_intrinsic_marker_by_op_name(op_name: &str) -> Option<&'static str> {
+        crate::generated_intrinsic_targets::generated_intrinsic_target_by_op_name(op_name)
+            .map(|target| target.marker)
+    }
 }
 
 #[cfg(test)]

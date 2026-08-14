@@ -3,7 +3,33 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#![feature(proc_macro_def_site)]
+//! Procedural macros for CUDA kernel development: `#[kernel]`, `#[device]`,
+//! `#[cuda_module]`, `gpu_printf!`, `ptx_asm!`, and friends.
+//!
+//! # The `host` feature in mixed build graphs
+//!
+//! The default-on `host` cargo feature makes `#[kernel]` and `#[cuda_module]`
+//! emit the generated host surface (the `LoadedModule` loader and launchers,
+//! the `CudaKernel` marker impls), all of which names `::cuda_host` /
+//! `::cuda_core`. A crate that only compiles kernels takes this crate with
+//! `default-features = false` and drops the host dependency stack.
+//!
+//! Proc-macro features unify globally per build graph. If any crate in the
+//! graph enables `cuda-macros/host`, every crate expanding these macros gets
+//! the host-emitting expansion, including a device-only kernel crate; its
+//! expansion then names `cuda_host`, which it cannot resolve (E0433). A
+//! device-only kernel crate consumed by a host application must therefore
+//! forward the feature itself:
+//!
+//! ```toml
+//! [features]
+//! host = ["dep:cuda-host", "cuda-macros/host"]
+//! ```
+//!
+//! so the same switch that turns host emission on also adds the `cuda-host`
+//! dependency that resolves it.
+
+#![feature(proc_macro_def_site, proc_macro_tracked_env)]
 
 mod device_copy;
 mod printf;
@@ -54,10 +80,10 @@ pub fn gpu_printf(input: TokenStream) -> TokenStream {
 
 /// Inline PTX assembly for CUDA device code.
 ///
-/// The macro accepts the `%0` operand placeholders used by CUDA inline PTX, plus
-/// `in` / `out` operands with PTX constraint strings. Supported constraints are
-/// CUDA register constraints `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and `"d"`, plus
-/// `"n"` for immediate integer constants:
+/// The macro accepts the `%0` operand placeholders used by CUDA inline PTX,
+/// plus `in`, `out`, and `inout` operands with PTX constraint strings.
+/// Supported register constraints are `"h"`, `"r"`, `"l"`, `"q"`, `"f"`, and
+/// `"d"`, plus `"n"` for immediate integer inputs:
 ///
 /// ```ignore
 /// let y: u32;
@@ -71,16 +97,53 @@ pub fn gpu_printf(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
+/// Read-write operands use `inout` with a `+`-prefixed register constraint.
+/// The current Rust value initializes the PTX output register and the final
+/// register value is written back to the same place:
+///
+/// ```ignore
+/// let mut accumulator = initial;
+/// unsafe {
+///     ptx_asm!(
+///         "add.u32 %0, %0, %1;",
+///         inout("+r") accumulator,
+///         in("r") increment,
+///         options(register_only),
+///     );
+/// }
+/// ```
+///
 /// Literal PTX registers that begin with `%` must be escaped as `%%`, matching
 /// CUDA C++ inline PTX. Literal `$` labels can be written normally.
 ///
-/// The initial surface supports zero or one `out`, up to 16 `in` operands,
-/// `clobber("memory")`, `options(register_only)`, and the explicit
-/// `options(register_only, may_diverge)` opt-in.
+/// The surface supports up to 16 output operands across `out` and `inout`,
+/// up to 16 explicit `in` operands, `clobber("memory")`,
+/// `options(register_only)`, and the explicit
+/// `options(register_only, may_diverge)` opt-in. `out` constraints use an `=`
+/// prefix, such as `"=r"`, while `inout` constraints use a `+` prefix, such as
+/// `"+r"`. All output operands must appear before explicit inputs.
+///
+/// With two or more output operands, including any mixture of `out` and
+/// `inout`, the marker returns a tuple under the hood and the macro writes its
+/// elements back to the output places in declaration order:
+///
+/// ```ignore
+/// let sum: u32;
+/// let prod: u32;
+/// unsafe {
+///     ptx_asm!(
+///         "add.u32 %0, %2, %3; mul.lo.u32 %1, %2, %3;",
+///         out("=r") sum,
+///         out("=r") prod,
+///         in("r") x,
+///         in("r") y,
+///     );
+/// }
+/// ```
 ///
 /// By default, snippets are treated as side-effecting and stay inside their
 /// current control flow. Use `options(register_only)` only for snippets that
-/// read explicit operands and write the explicit output. **Never** use
+/// read explicit operands and write explicit outputs. **Never** use
 /// `may_diverge` for `.sync` instructions, collectives, or any snippet whose
 /// participating lanes matter.
 #[proc_macro]
@@ -104,8 +167,10 @@ pub fn device_copy(input: TokenStream) -> TokenStream {
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use reserved_oxide_symbols::{
-    DEVICE_EXTERN_PREFIX, DEVICE_PREFIX, INSTANTIATE_PREFIX, KERNEL_PREFIX, KERNEL_SCOPE_LOCAL,
-    RESERVED_ROOT, artifact_anchor_symbol, artifact_anchor_symbol_v2, constant_symbol,
+    CODEGEN_FINGERPRINT_ENV, DEVICE_CODEGEN_CRATE_ENV, DEVICE_EXTERN_PREFIX, DEVICE_PREFIX,
+    INSTANTIATE_PREFIX, KERNEL_PREFIX, KERNEL_SCOPE_LOCAL, MATERIALIZE_CUBIN_ENV,
+    MATERIALIZER_PROVENANCE_ENV, RESERVED_ROOT, artifact_anchor_symbol, artifact_anchor_symbol_v2,
+    constant_symbol, ptx_merge_required_marker,
 };
 use syn::{
     Expr, ExprCall, ExprMethodCall, ExprPath, FnArg, ForeignItem, GenericArgument, GenericParam,
@@ -115,9 +180,18 @@ use syn::{
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
-    visit::Visit,
+    visit::{self, Visit},
     visit_mut::{self, VisitMut},
 };
+
+/// Record cuda-oxide's exact device-codegen identity in the consuming crate's
+/// dep-info. Cargo then rebuilds only crates that can own or instantiate device
+/// code when output mode, architecture, policy, or tool provenance changes.
+fn track_codegen_environment() {
+    let _ = proc_macro::tracked::env_var(CODEGEN_FINGERPRINT_ENV);
+    let _ = proc_macro::tracked::env_var(MATERIALIZE_CUBIN_ENV);
+    let _ = proc_macro::tracked::env_var(MATERIALIZER_PROVENANCE_ENV);
+}
 
 /// Build a private identifier that cannot capture, or be captured by, a name
 /// written in the user's kernel signature.
@@ -232,26 +306,123 @@ fn impl_trait_parameter_error(input: &ItemFn, item_kind: &str) -> Option<syn::Er
     })
 }
 
-/// Attribute arguments for #[kernel(...)]
-/// Supports: #[kernel] or #[kernel(Type1, Type2, Type3)]
+/// Attribute arguments for `#[kernel(...)]`.
+///
+/// Legacy explicit-instantiation types, the optional launch-context binding,
+/// and the bare `unchecked_indexing` flag may appear in any order:
+///
+/// ```ignore
+/// #[kernel(launch_context = launch_context)]
+/// #[kernel(f32, f64, launch_context = launch_context)]
+/// #[kernel(unchecked_indexing)]
+/// #[kernel(f32, unchecked_indexing)]
+/// #[kernel(launch_context = launch_context, unchecked_indexing)]
+/// ```
 struct KernelArgs {
     /// Types to instantiate generic kernels for
     instantiate_types: Vec<Type>,
+    /// User-selected name for the entry's typed launch context.
+    launch_context: Option<Ident>,
+    /// Elide slice/array bounds checks in this kernel's body (UB contract).
+    unchecked_indexing: bool,
+}
+
+/// Returns true when the next attribute argument is exactly the bare flag
+/// word `flag` (an identifier followed by `,` or end of input, never `=`).
+///
+/// A bare identifier also parses as a `Type`, so this peek must run before
+/// the legacy instantiation-type fallback to keep flag words from being
+/// swallowed as type arguments.
+fn peek_bare_kernel_flag(input: ParseStream, flag: &str) -> bool {
+    if !input.peek(Ident) || input.peek2(Token![=]) {
+        return false;
+    }
+    let fork = input.fork();
+    match fork.parse::<Ident>() {
+        Ok(ident) => ident == flag && (fork.is_empty() || fork.peek(Token![,])),
+        Err(_) => false,
+    }
 }
 
 impl Parse for KernelArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(KernelArgs {
-                instantiate_types: vec![],
-            });
+        let mut instantiate_types = Vec::new();
+        let mut launch_context = None;
+        let mut unchecked_indexing = false;
+
+        while !input.is_empty() {
+            if input.peek(Ident) && input.peek2(Token![=]) {
+                let name: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                if name != "launch_context" {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        format!(
+                            "unknown #[kernel] named argument `{name}`; expected `launch_context = IDENT`"
+                        ),
+                    ));
+                }
+                let value: Ident = input.parse().map_err(|_| {
+                    syn::Error::new(
+                        input.span(),
+                        "`launch_context` must be a single Rust identifier",
+                    )
+                })?;
+                if launch_context.replace(value).is_some() {
+                    return Err(syn::Error::new(
+                        name.span(),
+                        "duplicate `launch_context` argument in #[kernel]",
+                    ));
+                }
+            } else if peek_bare_kernel_flag(input, "unchecked_indexing") {
+                let flag: Ident = input.parse()?;
+                if unchecked_indexing {
+                    return Err(syn::Error::new(
+                        flag.span(),
+                        "duplicate `unchecked_indexing` argument in #[kernel]",
+                    ));
+                }
+                unchecked_indexing = true;
+            } else {
+                instantiate_types.push(input.parse::<Type>()?);
+            }
+
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
         }
 
-        let types: Punctuated<Type, Token![,]> = Punctuated::parse_terminated(input)?;
         Ok(KernelArgs {
-            instantiate_types: types.into_iter().collect(),
+            instantiate_types,
+            launch_context,
+            unchecked_indexing,
         })
     }
+}
+
+fn scope_parameter_collision(input: &ItemFn, scope: &Ident) -> Option<Ident> {
+    struct Finder<'a> {
+        scope: &'a Ident,
+        found: Option<Ident>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Finder<'_> {
+        fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+            if self.found.is_none() && pattern.ident == *self.scope {
+                self.found = Some(pattern.ident.clone());
+            }
+            syn::visit::visit_pat_ident(self, pattern);
+        }
+    }
+
+    let mut finder = Finder { scope, found: None };
+    for argument in &input.sig.inputs {
+        if let FnArg::Typed(argument) = argument {
+            syn::visit::Visit::visit_pat(&mut finder, &argument.pat);
+        }
+    }
+    finder.found
 }
 
 /// Generates a typed host-side loader and launch surface for the kernels in an
@@ -342,6 +513,7 @@ impl Parse for KernelArgs {
 /// when the source kernel itself is safe.
 #[proc_macro_attribute]
 pub fn cuda_module(attr: TokenStream, item: TokenStream) -> TokenStream {
+    track_codegen_environment();
     if !attr.is_empty() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -386,14 +558,19 @@ enum DynamicSharedContract {
     Range { min_bytes: u32, max_bytes: u32 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct CudaModuleLaunchContract {
     domain: u8,
+    u32_coordinates: bool,
     exact_block: Option<(u32, u32, u32)>,
-    max_block_threads: Option<u32>,
+    max_block_threads: Option<ConstU32Expr>,
     dynamic_shared: DynamicSharedContract,
     dynamic_shared_alignment: u32,
     min_compute_capability: (u32, u32),
+    /// Size requirements over the kernel's own parameters, validated
+    /// against the parameter list at expansion time. Each relation becomes an
+    /// overflow-safe host-side check in every checked launcher.
+    requires: Vec<Expr>,
 }
 
 /// Arguments accepted by `#[launch_contract(...)]`.
@@ -402,23 +579,27 @@ struct CudaModuleLaunchContract {
 /// launch domain and resource envelope; `#[cuda_module]` turns that statement
 /// into a branded host configuration and validates it against the live
 /// function/device once during preparation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct LaunchContractArgs {
     domain: u8,
+    u32_coordinates: bool,
     exact_block: Option<(u32, u32, u32)>,
     dynamic_shared: DynamicSharedContract,
     dynamic_shared_alignment: u32,
     min_compute_capability: (u32, u32),
+    requires: Vec<Expr>,
 }
 
 impl Parse for LaunchContractArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut domain = None;
         let mut exact_block = None;
+        let mut coordinates = None;
         let mut dynamic_shared = None;
         let mut dynamic_shared_range = None;
         let mut dynamic_shared_alignment = None;
         let mut min_compute_capability = None;
+        let mut requires = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -432,6 +613,17 @@ impl Parse for LaunchContractArgs {
                 "block" => {
                     reject_duplicate(&key, exact_block.is_some())?;
                     exact_block = Some(parse_u32_triplet(input, "block")?);
+                }
+                "coordinates" => {
+                    reject_duplicate(&key, coordinates.is_some())?;
+                    let width: Ident = input.parse()?;
+                    if width != "u32" {
+                        return Err(syn::Error::new(
+                            width.span(),
+                            "launch_contract coordinates currently supports only `u32`",
+                        ));
+                    }
+                    coordinates = Some(true);
                 }
                 "dynamic_shared" => {
                     reject_duplicate(&key, dynamic_shared.is_some())?;
@@ -452,10 +644,14 @@ impl Parse for LaunchContractArgs {
                     let (major, minor) = parse_u32_pair(input, "min_compute_capability")?;
                     min_compute_capability = Some((major, minor));
                 }
+                "requires" => {
+                    reject_duplicate(&key, requires.is_some())?;
+                    requires = Some(parse_requires_relations(input)?);
+                }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "unknown launch_contract field; expected domain, block, dynamic_shared, dynamic_shared_range, dynamic_shared_alignment, or min_compute_capability",
+                        "unknown launch_contract field; expected domain, coordinates, block, dynamic_shared, dynamic_shared_range, dynamic_shared_alignment, min_compute_capability, or requires",
                     ));
                 }
             }
@@ -523,12 +719,31 @@ impl Parse for LaunchContractArgs {
         let min_compute_capability = min_compute_capability.unwrap_or((0, 0));
         Ok(Self {
             domain,
+            u32_coordinates: coordinates.unwrap_or(false),
             exact_block,
             dynamic_shared,
             dynamic_shared_alignment,
             min_compute_capability,
+            requires: requires.unwrap_or_default(),
         })
     }
+}
+
+/// Parses `requires = (relation, relation, ...)`: a parenthesized,
+/// comma-separated, non-empty list of relation expressions. The grammar of
+/// each relation is validated later, once the kernel's parameter list is
+/// known (see [`validate_requires_relations`]).
+fn parse_requires_relations(input: ParseStream) -> syn::Result<Vec<Expr>> {
+    let content;
+    parenthesized!(content in input);
+    let relations: Punctuated<Expr, Token![,]> = Punctuated::parse_terminated(&content)?;
+    if relations.is_empty() {
+        return Err(syn::Error::new(
+            content.span(),
+            "requires needs at least one relation, e.g. `requires = (a.len() >= n)`",
+        ));
+    }
+    Ok(relations.into_iter().collect())
 }
 
 fn dynamic_shared_max(contract: DynamicSharedContract) -> u32 {
@@ -592,15 +807,87 @@ struct CudaModuleParam {
     mutable_slice: bool,
     disjoint_slice_ty: Option<Type>,
     disjoint_slice_elem: Option<TokenStream2>,
+    /// Declared type and carried scalar of a `Uniform<T>` parameter, used to
+    /// bound the generated impl by the sealed proof trait so a local type also
+    /// named `Uniform` cannot borrow the scalar host ABI.
+    uniform_ty: Option<Type>,
+    uniform_scalar: Option<TokenStream2>,
+    /// Integer classification of a scalar parameter's declared type, used to
+    /// decide which scalars may appear in `requires` relations. Always
+    /// `Other` for non-scalar parameters.
+    scalar_int: ScalarIntClass,
 }
 
 enum CudaModuleParamMarshal {
     Scalar,
-    ReadOnlyDeviceBuffer { elem_ty: TokenStream2 },
-    WritableDeviceBuffer { elem_ty: TokenStream2 },
+    ReadOnlyDeviceBuffer {
+        elem_ty: TokenStream2,
+    },
+    WritableDeviceBuffer {
+        elem_ty: TokenStream2,
+    },
+    /// A writable buffer whose index space carries a runtime row width, so
+    /// the host supplies the width and the packet gains a third slot.
+    RowWidthDeviceBuffer {
+        elem_ty: TokenStream2,
+    },
 }
 
+/// Integer classification of a kernel scalar parameter as declared in source.
+///
+/// `requires` relations widen every operand to `u64`, which is lossless for
+/// unsigned scalars but raises sign-extension questions for signed ones, so
+/// v1 accepts only `Unsigned` scalars and rejects the rest at expansion time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScalarIntClass {
+    /// `u8`, `u16`, `u32`, `u64`, or `usize`.
+    Unsigned,
+    /// `i8`, `i16`, `i32`, `i64`, or `isize`.
+    Signed,
+    /// Anything else (floats, pointers, generics, non-scalar parameters).
+    Other,
+}
+
+fn scalar_int_class(ty: &Type) -> ScalarIntClass {
+    // A `Uniform<T>` parameter is marshalled as `T` and is evaluated as `T` on
+    // the host, so a relation over it has the same widening behaviour as one
+    // over the bare scalar.
+    if let Some(scalar) = cuda_module_uniform_scalar(ty)
+        && let Ok(scalar) = syn::parse2::<Type>(scalar)
+    {
+        return scalar_int_class(&scalar);
+    }
+
+    let Type::Path(type_path) = ty else {
+        return ScalarIntClass::Other;
+    };
+    if type_path.qself.is_some() {
+        return ScalarIntClass::Other;
+    }
+    let Some(ident) = type_path.path.get_ident() else {
+        return ScalarIntClass::Other;
+    };
+    match ident.to_string().as_str() {
+        "u8" | "u16" | "u32" | "u64" | "usize" => ScalarIntClass::Unsigned,
+        "i8" | "i16" | "i32" | "i64" | "isize" => ScalarIntClass::Signed,
+        _ => ScalarIntClass::Other,
+    }
+}
+
+/// Expands `#[cuda_module]`, emitting the host surface when the `host`
+/// feature is on.
 fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
+    expand_cuda_module_inner(module, cfg!(feature = "host"))
+}
+
+/// `expand_cuda_module` with the host-surface decision passed in.
+///
+/// The decision is a parameter rather than a `cfg!` read inside the body so
+/// that tests can exercise both settings from one build. They otherwise
+/// could not: this crate dev-depends on `cuda-host`, which turns the `host`
+/// feature back on under feature unification even for
+/// `cargo test --no-default-features`.
+fn expand_cuda_module_inner(module: ItemMod, emit_host: bool) -> syn::Result<TokenStream2> {
     let module_attrs = &module.attrs;
     let vis = &module.vis;
     let ident = &module.ident;
@@ -612,7 +899,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     };
 
     let constants = collect_cuda_module_constants(items, ident)?;
-    let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false)?;
+    let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false, emit_host)?;
     if transformed.kernels.is_empty() {
         return Err(syn::Error::new_spanned(
             &module.ident,
@@ -648,18 +935,53 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
 
     let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&transformed.kernels)?;
     let has_generic = transformed.kernels.iter().any(|k| k.is_generic);
+    let ptx_merge_required_markers = transformed.kernels.iter().filter_map(|kernel| {
+        if !kernel.is_generic {
+            return None;
+        }
+        let marker = internal_ident(&ptx_merge_required_marker(&kernel.fn_name.to_string()));
+        let cfg_attrs = &kernel.effective_cfg_attrs;
+        Some(quote! {
+            #(#cfg_attrs)*
+            // Consumed by the codegen collector. This enabled generic kernel
+            // requires run-time PTX bundle merging, which ahead-of-time cubin
+            // materialization cannot represent yet.
+            #[doc(hidden)]
+            #[used]
+            #[allow(dead_code, non_upper_case_globals)]
+            static #marker: u8 = 0;
+        })
+    });
+    let enable_generic_loader_statements = transformed.kernels.iter().filter_map(|kernel| {
+        if !kernel.is_generic {
+            return None;
+        }
+        let cfg_attrs = &kernel.effective_cfg_attrs;
+        Some(quote! {
+            #(#cfg_attrs)*
+            let _ = {
+                __cuda_oxide_has_enabled_generic_kernel = true;
+            };
+        })
+    });
     let has_launch_contract = transformed
         .kernels
         .iter()
         .any(|kernel| kernel.launch_contract.is_some());
     let module_loader = if has_generic {
-        // At least one kernel is generic: its PTX is emitted into the
-        // consuming binary's bundle, not this crate's bundle. Merge all
-        // PTX bundles from the executable so generic monomorphizations are
-        // visible regardless of which crate compiled them.
+        // A syntactically present generic kernel may be removed by cfg. Make
+        // the loader decision under the exact same effective cfg chain as its
+        // marker, so eligibility and run-time behavior cannot disagree.
         quote! {
-            let _ = name; // merged load ignores the crate-name hint
-            let module = ::cuda_host::load_all_ptx_bundles_merged(ctx)?;
+            #[allow(unused_mut)]
+            let mut __cuda_oxide_has_enabled_generic_kernel = false;
+            #(#enable_generic_loader_statements)*
+            let module = if __cuda_oxide_has_enabled_generic_kernel {
+                let _ = name; // merged load ignores the crate-name hint
+                ::cuda_host::load_all_ptx_bundles_merged(ctx)?
+            } else {
+                ::cuda_host::load_embedded_module(ctx, name)?
+            };
         }
     } else {
         quote! {
@@ -849,10 +1171,12 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
         TokenStream2::new()
     };
 
-    Ok(quote! {
-        #(#module_attrs)*
-        #vis mod #ident {
-            #(#module_items)*
+    // Everything below names `::cuda_host` or `::cuda_core`. The kernels
+    // themselves, and the PTX-merge markers the codegen collector consumes, do
+    // not -- so a crate that only compiles kernels can take cuda-macros with
+    // `default-features = false` and stop depending on the host stack.
+    let host_items = if emit_host {
+        quote! {
             #(#launch_contract_impls)*
 
             #[derive(Clone, Debug)]
@@ -888,6 +1212,17 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 #async_launch_methods
             }
         }
+    } else {
+        TokenStream2::new()
+    };
+
+    Ok(quote! {
+        #(#module_attrs)*
+        #vis mod #ident {
+            #(#module_items)*
+            #(#ptx_merge_required_markers)*
+            #host_items
+        }
     })
 }
 
@@ -910,6 +1245,7 @@ fn transform_cuda_module_items(
     module_path: &mut Vec<Ident>,
     ancestor_cfg_attrs: &[syn::Attribute],
     generate_nested_support: bool,
+    emit_host: bool,
 ) -> syn::Result<CudaModuleLevel> {
     let mut transformed_items = Vec::with_capacity(items.len());
     let mut direct_kernels = Vec::new();
@@ -941,6 +1277,7 @@ fn transform_cuda_module_items(
                     module_path,
                     &nested_cfg_attrs,
                     true,
+                    emit_host,
                 )?;
                 module_path.pop();
 
@@ -964,7 +1301,8 @@ fn transform_cuda_module_items(
     if generate_nested_support && !kernels.is_empty() {
         reject_reserved_loaded_module(items)?;
         reject_reserved_loaded_module_methods(&kernels[..direct_kernel_count], true)?;
-        let support = generate_nested_cuda_module_support(&kernels[..direct_kernel_count]);
+        let support =
+            generate_nested_cuda_module_support(&kernels[..direct_kernel_count], emit_host);
         let mut support_items = syn::parse2::<syn::File>(support)?.items;
         transformed_items.append(&mut support_items);
     }
@@ -1074,10 +1412,24 @@ fn cuda_module_kernel(
     let params = cuda_module_params(item_fn)?;
     let launch_contract =
         cuda_module_launch_contract(&item_fn.attrs, &item_fn.sig.ident, &params, cluster_dim)?;
-    let mut generics = item_fn.sig.generics.clone();
-    if let Some(contract) = launch_contract {
+    // `#[cuda_module]` expands before both the nested function attributes and
+    // the recursive module rewrite. Mirror the evaluatability predicates that
+    // `#[launch_bounds]` and `#[kernel]` add to each concrete entry while
+    // retaining the nested module's path and inherited cfg attributes.
+    let mut configured_item = item_fn.clone();
+    rewrite_loop_unroll_attrs(&mut configured_item)?;
+    add_launch_bounds_evaluatability_from_attrs(&mut configured_item)?;
+    let mut generics = configured_item.sig.generics;
+    if let Some(contract) = launch_contract.as_ref() {
         add_cuda_module_disjoint_contract_bounds(&mut generics, &params, contract.domain);
     }
+    // A `Uniform` parameter carries its proof with or without a launch
+    // contract, so this bound is not conditional on one.
+    add_cuda_module_uniform_bounds(&mut generics, &params);
+    // The launch packet's shape (two or three words per slice) must match the
+    // resolved device type with or without a launch contract, so this bound
+    // is unconditional too.
+    add_cuda_module_disjoint_abi_bounds(&mut generics, &params);
     let is_generic = has_codegen_generics(&item_fn.sig.generics);
     let cfg_attrs = cuda_module_cfg_attrs(&item_fn.attrs)?;
     let mut effective_cfg_attrs = ancestor_cfg_attrs.to_vec();
@@ -1099,7 +1451,10 @@ fn cuda_module_kernel(
     }))
 }
 
-fn generate_nested_cuda_module_support(kernels: &[CudaModuleKernel]) -> TokenStream2 {
+fn generate_nested_cuda_module_support(
+    kernels: &[CudaModuleKernel],
+    emit_host: bool,
+) -> TokenStream2 {
     let launch_contract_impls = kernels
         .iter()
         .filter_map(generate_cuda_module_launch_contract_impl);
@@ -1137,6 +1492,11 @@ fn generate_nested_cuda_module_support(kernels: &[CudaModuleKernel]) -> TokenStr
     } else {
         TokenStream2::new()
     };
+
+    // Host-only, exactly as in `expand_cuda_module_inner`; see the note there.
+    if !emit_host {
+        return TokenStream2::new();
+    }
 
     quote! {
         #(#launch_contract_impls)*
@@ -1275,7 +1635,7 @@ fn cuda_module_artifact_anchor_statements(
         return Ok(TokenStream2::new());
     };
 
-    let owner_filter = std::env::var("CUDA_OXIDE_DEVICE_CODEGEN_CRATE").ok();
+    let owner_filter = proc_macro::tracked::env_var(DEVICE_CODEGEN_CRATE_ENV).ok();
     let owner_selection = device_codegen_owner_selection(owner_filter.as_deref(), &crate_name);
     if owner_selection == Some(false) {
         // The backend deliberately omits this crate's artifact. Omitting the
@@ -1759,12 +2119,6 @@ fn cuda_module_launch_contract(
     }
 
     let launch_bounds = cuda_module_launch_bounds(attrs)?;
-    if launch_bounds.is_some_and(|bounds| bounds.max_threads == 0) {
-        return Err(syn::Error::new_spanned(
-            attr,
-            "contracted #[launch_bounds] must allow at least one X-dimension thread",
-        ));
-    }
     if args.exact_block.is_none() && launch_bounds.is_none() {
         return Err(syn::Error::new_spanned(
             attr,
@@ -1772,7 +2126,12 @@ fn cuda_module_launch_contract(
         ));
     }
     let max_block_threads = launch_bounds.map(|bounds| bounds.max_threads);
-    if let (Some(exact), Some(maximum)) = (args.exact_block, max_block_threads) {
+    if let (Some(exact), Some(maximum)) = (
+        args.exact_block,
+        max_block_threads
+            .as_ref()
+            .and_then(|maximum| maximum.literal_value),
+    ) {
         let exact_threads = u64::from(exact.0)
             .checked_mul(u64::from(exact.1))
             .and_then(|xy| xy.checked_mul(u64::from(exact.2)))
@@ -1794,17 +2153,424 @@ fn cuda_module_launch_contract(
         _ => args.min_compute_capability,
     };
 
+    validate_requires_relations(&args.requires, params)?;
+
     Ok(Some(CudaModuleLaunchContract {
         domain: args.domain,
+        u32_coordinates: args.u32_coordinates,
         exact_block: args.exact_block,
         max_block_threads,
         dynamic_shared: args.dynamic_shared,
         dynamic_shared_alignment: args.dynamic_shared_alignment,
         min_compute_capability,
+        requires: args.requires,
     }))
 }
 
-fn cuda_module_launch_bounds(attrs: &[syn::Attribute]) -> syn::Result<Option<LaunchBoundsArgs>> {
+/// One-line reminder of the accepted `requires` grammar, appended to every
+/// rejection so authors see what is allowed and which parameters exist.
+fn requires_grammar_help(params: &[CudaModuleParam]) -> String {
+    let mut names = Vec::new();
+    for param in params {
+        let name = &param.name;
+        match param.marshal {
+            // Only scalars that can actually appear in a relation are
+            // offered; signed and non-integer scalars would be rejected.
+            CudaModuleParamMarshal::Scalar => {
+                if param.scalar_int == ScalarIntClass::Unsigned {
+                    names.push(format!("`{name}`"));
+                }
+            }
+            CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. }
+            | CudaModuleParamMarshal::WritableDeviceBuffer { .. }
+            | CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+                names.push(format!("`{name}.len()`"));
+            }
+        }
+    }
+    let available = if names.is_empty() {
+        "(none of this kernel's parameters can appear in requires)".to_string()
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "each requires relation is one comparison (`>=`, `>`, `<=`, `<`, `==`, `!=`) between \
+         expressions built from slice parameters as `<param>.len()`, unsigned integer scalar \
+         parameters (u8/u16/u32/u64/usize), integer literals, parentheses, and `+`, `-`, `*`; \
+         available operands: {available}"
+    )
+}
+
+/// Validates every `requires` relation against the kernel's own parameter
+/// list at expansion time, so a malformed relation is a compile error at the
+/// attribute instead of a surprise at launch.
+fn validate_requires_relations(relations: &[Expr], params: &[CudaModuleParam]) -> syn::Result<()> {
+    for relation in relations {
+        let Expr::Binary(binary) = relation else {
+            return Err(syn::Error::new_spanned(
+                relation,
+                format!(
+                    "requires relation must be a comparison between two expressions; {}",
+                    requires_grammar_help(params)
+                ),
+            ));
+        };
+        if !requires_comparison_op(&binary.op) {
+            return Err(syn::Error::new_spanned(
+                relation,
+                format!(
+                    "requires relation must compare with `>=`, `>`, `<=`, `<`, `==`, or `!=`; {}",
+                    requires_grammar_help(params)
+                ),
+            ));
+        }
+        validate_requires_operand(&binary.left, params)?;
+        validate_requires_operand(&binary.right, params)?;
+    }
+    Ok(())
+}
+
+fn requires_comparison_op(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::Ge(_)
+            | syn::BinOp::Gt(_)
+            | syn::BinOp::Le(_)
+            | syn::BinOp::Lt(_)
+            | syn::BinOp::Eq(_)
+            | syn::BinOp::Ne(_)
+    )
+}
+
+fn requires_arithmetic_op(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::Add(_) | syn::BinOp::Sub(_) | syn::BinOp::Mul(_)
+    )
+}
+
+/// Validates one side of a `requires` comparison: an arithmetic expression
+/// over `.len()` of slice-like parameters, unsigned integer scalar
+/// parameters, and integer literals.
+fn validate_requires_operand(expr: &Expr, params: &[CudaModuleParam]) -> syn::Result<()> {
+    match expr {
+        Expr::Lit(literal) => match &literal.lit {
+            syn::Lit::Int(int) => {
+                int.base10_parse::<u64>().map_err(|_| {
+                    syn::Error::new_spanned(literal, "integer literal in requires must fit in u64")
+                })?;
+                Ok(())
+            }
+            _ => Err(syn::Error::new_spanned(
+                literal,
+                format!(
+                    "only integer literals are allowed in requires; {}",
+                    requires_grammar_help(params)
+                ),
+            )),
+        },
+        Expr::Path(path) => {
+            let Some(ident) = path.path.get_ident() else {
+                return Err(syn::Error::new_spanned(
+                    path,
+                    format!(
+                        "paths in requires must be bare kernel parameter names; {}",
+                        requires_grammar_help(params)
+                    ),
+                ));
+            };
+            let Some(param) = params.iter().find(|param| param.name == *ident) else {
+                return Err(syn::Error::new_spanned(
+                    path,
+                    format!(
+                        "unknown identifier `{ident}` in requires: relations may only reference \
+                         this kernel's parameters; {}",
+                        requires_grammar_help(params)
+                    ),
+                ));
+            };
+            match param.marshal {
+                CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. }
+                | CudaModuleParamMarshal::WritableDeviceBuffer { .. }
+                | CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+                    Err(syn::Error::new_spanned(
+                        path,
+                        format!(
+                            "slice parameter `{ident}` may only appear in requires as \
+                             `{ident}.len()`; {}",
+                            requires_grammar_help(params)
+                        ),
+                    ))
+                }
+                CudaModuleParamMarshal::Scalar => match param.scalar_int {
+                    ScalarIntClass::Unsigned => Ok(()),
+                    ScalarIntClass::Signed => Err(syn::Error::new_spanned(
+                        path,
+                        format!(
+                            "signed integer parameter `{ident}` is not supported in requires: \
+                             relations are evaluated in u64 and signed widening semantics are \
+                             not defined for v1; {}",
+                            requires_grammar_help(params)
+                        ),
+                    )),
+                    ScalarIntClass::Other => Err(syn::Error::new_spanned(
+                        path,
+                        format!(
+                            "parameter `{ident}` is not an unsigned integer scalar, so it \
+                             cannot appear in requires; {}",
+                            requires_grammar_help(params)
+                        ),
+                    )),
+                },
+            }
+        }
+        Expr::MethodCall(call) => {
+            if call.method != "len" {
+                return Err(syn::Error::new_spanned(
+                    &call.method,
+                    format!(
+                        "only the `.len()` method is allowed in requires; {}",
+                        requires_grammar_help(params)
+                    ),
+                ));
+            }
+            if !call.args.is_empty() || call.turbofish.is_some() {
+                return Err(syn::Error::new_spanned(
+                    call,
+                    "`.len()` in requires takes no arguments or turbofish",
+                ));
+            }
+            let receiver_ident = match &*call.receiver {
+                Expr::Path(path) => path.path.get_ident(),
+                _ => None,
+            };
+            let Some(ident) = receiver_ident else {
+                return Err(syn::Error::new_spanned(
+                    &call.receiver,
+                    format!(
+                        "`.len()` in requires must be called directly on a slice parameter; {}",
+                        requires_grammar_help(params)
+                    ),
+                ));
+            };
+            let Some(param) = params.iter().find(|param| param.name == *ident) else {
+                return Err(syn::Error::new_spanned(
+                    &call.receiver,
+                    format!(
+                        "unknown identifier `{ident}` in requires: relations may only reference \
+                         this kernel's parameters; {}",
+                        requires_grammar_help(params)
+                    ),
+                ));
+            };
+            match param.marshal {
+                CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. }
+                | CudaModuleParamMarshal::WritableDeviceBuffer { .. }
+                | CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => Ok(()),
+                CudaModuleParamMarshal::Scalar => Err(syn::Error::new_spanned(
+                    call,
+                    format!(
+                        "`.len()` in requires is only available on slice or DisjointSlice \
+                         parameters; `{ident}` is a scalar; {}",
+                        requires_grammar_help(params)
+                    ),
+                )),
+            }
+        }
+        Expr::Paren(paren) => validate_requires_operand(&paren.expr, params),
+        Expr::Group(group) => validate_requires_operand(&group.expr, params),
+        Expr::Binary(binary) if requires_arithmetic_op(&binary.op) => {
+            validate_requires_operand(&binary.left, params)?;
+            validate_requires_operand(&binary.right, params)
+        }
+        Expr::Binary(binary) if requires_comparison_op(&binary.op) => Err(syn::Error::new_spanned(
+            binary,
+            "nested comparisons are not supported in requires: each relation is exactly one \
+                 comparison; split it into multiple comma-separated relations instead",
+        )),
+        Expr::Binary(binary) => {
+            let op = &binary.op;
+            Err(syn::Error::new_spanned(
+                binary,
+                format!(
+                    "operator `{}` is not supported in requires; {}",
+                    quote! { #op },
+                    requires_grammar_help(params)
+                ),
+            ))
+        }
+        other => Err(syn::Error::new_spanned(
+            other,
+            format!(
+                "unsupported expression in requires; {}",
+                requires_grammar_help(params)
+            ),
+        )),
+    }
+}
+
+/// How a generated `requires` check reads the length of a slice-like
+/// parameter. Each checked launcher flavor sees slice arguments as a
+/// different host type.
+#[derive(Clone, Copy)]
+enum RequiresLenAccess {
+    /// Sync prepared launcher: slice parameters are `&DeviceBuffer<T>` or
+    /// `&mut DeviceBuffer<T>`, so `.len()` resolves to the inherent method.
+    SyncBuffer,
+    /// Async prepared launcher: slice parameters are `&impl KernelSliceArg`
+    /// or `&mut impl KernelSliceArgMut`.
+    AsyncRef,
+    /// Owned async launcher: slice parameters are owned
+    /// `R: KernelSliceArg(Mut)` resources.
+    OwnedValue,
+}
+
+/// Renders a validated `requires` relation back to compact source text for
+/// error messages, e.g. `a.len() >= m * k`.
+fn render_requires_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Lit(literal) => {
+            let lit = &literal.lit;
+            quote!(#lit).to_string()
+        }
+        Expr::Path(path) => match path.path.get_ident() {
+            Some(ident) => ident.to_string(),
+            None => quote!(#path).to_string(),
+        },
+        Expr::MethodCall(call) => format!("{}.len()", render_requires_expr(&call.receiver)),
+        Expr::Paren(paren) => format!("({})", render_requires_expr(&paren.expr)),
+        Expr::Group(group) => render_requires_expr(&group.expr),
+        Expr::Binary(binary) => {
+            let op = &binary.op;
+            format!(
+                "{} {} {}",
+                render_requires_expr(&binary.left),
+                quote!(#op),
+                render_requires_expr(&binary.right)
+            )
+        }
+        other => quote!(#other).to_string(),
+    }
+}
+
+/// Generates the host-side size checks for a contracted kernel, or
+/// `None` when the contract declares no `requires` relations.
+///
+/// Every operand is widened to `u64` and every `+`/`-`/`*` goes through the
+/// corresponding checked operation, so a relation whose arithmetic leaves the
+/// `u64` range fails with [`SizeRequirementOverflow`] instead of wrapping. A
+/// relation that evaluates to false fails with [`SizeRequirementViolated`]
+/// carrying the relation's source text and both evaluated sides.
+fn generate_requires_checks(
+    kernel: &CudaModuleKernel,
+    access: RequiresLenAccess,
+) -> Option<TokenStream2> {
+    let contract = kernel.launch_contract.as_ref()?;
+    if contract.requires.is_empty() {
+        return None;
+    }
+    let kernel_name = kernel.fn_name.to_string();
+    let lhs_binding = internal_ident("__cuda_oxide_requires_lhs");
+    let rhs_binding = internal_ident("__cuda_oxide_requires_rhs");
+    let checks = contract.requires.iter().map(|relation| {
+        let Expr::Binary(binary) = relation else {
+            unreachable!("requires relations are validated during contract construction");
+        };
+        let relation_text = render_requires_expr(relation);
+        let op = &binary.op;
+        let lhs = requires_operand_tokens(&binary.left, access, &kernel_name, &relation_text);
+        let rhs = requires_operand_tokens(&binary.right, access, &kernel_name, &relation_text);
+        quote! {
+            {
+                let #lhs_binding: u64 = #lhs;
+                let #rhs_binding: u64 = #rhs;
+                if !(#lhs_binding #op #rhs_binding) {
+                    return ::core::result::Result::Err(
+                        ::cuda_core::LaunchContractError::SizeRequirementViolated {
+                            kernel: #kernel_name,
+                            relation: #relation_text,
+                            lhs: #lhs_binding,
+                            rhs: #rhs_binding,
+                        },
+                    );
+                }
+            }
+        }
+    });
+    Some(quote! { #(#checks)* })
+}
+
+/// Transliterates one validated side of a `requires` comparison into a `u64`
+/// expression with checked arithmetic.
+fn requires_operand_tokens(
+    expr: &Expr,
+    access: RequiresLenAccess,
+    kernel_name: &str,
+    relation_text: &str,
+) -> TokenStream2 {
+    match expr {
+        Expr::Lit(literal) => {
+            let syn::Lit::Int(int) = &literal.lit else {
+                unreachable!("requires literals are validated during contract construction");
+            };
+            let value = int
+                .base10_parse::<u64>()
+                .expect("requires literals are validated during contract construction");
+            quote! { #value }
+        }
+        Expr::Path(path) => {
+            // Validated: a bare unsigned integer scalar parameter, so `as
+            // u64` is a lossless widening.
+            quote! { (#path as u64) }
+        }
+        Expr::MethodCall(call) => {
+            let receiver = &call.receiver;
+            match access {
+                RequiresLenAccess::SyncBuffer => quote! { (#receiver.len() as u64) },
+                RequiresLenAccess::AsyncRef => {
+                    quote! { (::cuda_host::KernelSliceArg::len(#receiver) as u64) }
+                }
+                RequiresLenAccess::OwnedValue => {
+                    quote! { (::cuda_host::KernelSliceArg::len(&#receiver) as u64) }
+                }
+            }
+        }
+        Expr::Paren(paren) => {
+            requires_operand_tokens(&paren.expr, access, kernel_name, relation_text)
+        }
+        Expr::Group(group) => {
+            requires_operand_tokens(&group.expr, access, kernel_name, relation_text)
+        }
+        Expr::Binary(binary) => {
+            let lhs = requires_operand_tokens(&binary.left, access, kernel_name, relation_text);
+            let rhs = requires_operand_tokens(&binary.right, access, kernel_name, relation_text);
+            let checked = match binary.op {
+                syn::BinOp::Add(_) => quote! { checked_add },
+                syn::BinOp::Sub(_) => quote! { checked_sub },
+                syn::BinOp::Mul(_) => quote! { checked_mul },
+                _ => unreachable!("requires operators are validated during contract construction"),
+            };
+            quote! {
+                #lhs.#checked(#rhs).ok_or(
+                    ::cuda_core::LaunchContractError::SizeRequirementOverflow {
+                        kernel: #kernel_name,
+                        relation: #relation_text,
+                    },
+                )?
+            }
+        }
+        _ => unreachable!("requires operands are validated during contract construction"),
+    }
+}
+
+#[derive(Clone)]
+struct ContractLaunchBounds {
+    max_threads: ConstU32Expr,
+}
+
+fn cuda_module_launch_bounds(
+    attrs: &[syn::Attribute],
+) -> syn::Result<Option<ContractLaunchBounds>> {
     let matching: Vec<_> = attrs
         .iter()
         .filter(|attr| attr_path_ends_with(attr, "launch_bounds"))
@@ -1815,10 +2581,13 @@ fn cuda_module_launch_bounds(attrs: &[syn::Attribute]) -> syn::Result<Option<Lau
             "a kernel may have only one launch_bounds attribute",
         ));
     }
-    matching
-        .first()
-        .map(|attr| attr.parse_args::<LaunchBoundsArgs>())
-        .transpose()
+    let Some(attr) = matching.first() else {
+        return Ok(None);
+    };
+    let args = attr.parse_args::<LaunchBoundsArgs>()?;
+    Ok(Some(ContractLaunchBounds {
+        max_threads: args.max_threads,
+    }))
 }
 
 fn validate_dimensions_for_domain(
@@ -1879,6 +2648,10 @@ fn cuda_module_param_from_typed(pat_type: &syn::PatType) -> syn::Result<CudaModu
     let disjoint_slice_ty = disjoint_slice_elem
         .as_ref()
         .map(|_| pat_type.ty.as_ref().clone());
+    let uniform_scalar = cuda_module_uniform_scalar(&pat_type.ty);
+    let uniform_ty = uniform_scalar
+        .as_ref()
+        .map(|_| pat_type.ty.as_ref().clone());
     Ok(CudaModuleParam {
         name,
         sync_host_ty,
@@ -1887,6 +2660,9 @@ fn cuda_module_param_from_typed(pat_type: &syn::PatType) -> syn::Result<CudaModu
         mutable_slice,
         disjoint_slice_ty,
         disjoint_slice_elem,
+        uniform_ty,
+        uniform_scalar,
+        scalar_int: scalar_int_class(&pat_type.ty),
     })
 }
 
@@ -1919,12 +2695,32 @@ fn cuda_module_host_type(
     }
 
     if let Some(elem_ty) = cuda_module_disjoint_slice_elem(ty) {
+        if cuda_module_disjoint_slice_has_row_width(ty) {
+            return Ok((
+                quote! { ::cuda_host::RowWidth<'_, #elem_ty> },
+                quote! { ::cuda_host::RowWidth<#async_lifetime, #elem_ty> },
+                CudaModuleParamMarshal::RowWidthDeviceBuffer {
+                    elem_ty: quote! { #elem_ty },
+                },
+            ));
+        }
         return Ok((
             quote! { &mut ::cuda_core::DeviceBuffer<#elem_ty> },
             quote! { &#async_lifetime mut impl ::cuda_host::KernelSliceArgMut<Elem = #elem_ty> },
             CudaModuleParamMarshal::WritableDeviceBuffer {
                 elem_ty: quote! { #elem_ty },
             },
+        ));
+    }
+
+    // A `Uniform<T>` parameter is marshalled exactly like `T`. The host takes
+    // the bare scalar because the host is what makes the value uniform: one
+    // marshalled value reaches every thread of the launch.
+    if let Some(scalar) = cuda_module_uniform_scalar(ty) {
+        return Ok((
+            quote! { #scalar },
+            quote! { #scalar },
+            CudaModuleParamMarshal::Scalar,
         ));
     }
 
@@ -1951,6 +2747,65 @@ fn cuda_module_slice_elem(ty: &Type) -> Option<(TokenStream2, bool)> {
     };
     let elem = &slice.elem;
     Some((quote! { #elem }, type_ref.mutability.is_some()))
+}
+
+/// Scalar carried by a `Uniform<T>` kernel parameter, if the type is spelled
+/// that way.
+///
+/// The host method takes the bare `T`: the host is the source of the
+/// uniformity proof, since it marshals one value into the launch packet for
+/// the whole grid. `Uniform<T>` is `#[repr(transparent)]`, so the launch packet
+/// is byte-identical either way.
+fn cuda_module_uniform_scalar(ty: &Type) -> Option<TokenStream2> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Uniform" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let scalar = args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })?;
+    Some(quote! { #scalar })
+}
+
+/// True when a `DisjointSlice`'s index space carries a runtime row width.
+///
+/// Matched on the spelling of the index-space argument, exactly as the element
+/// type is. The spelling only selects the host ABI; `SpaceLayout` is what
+/// decides whether the device type really carries the width, and a mismatch
+/// between the two is a type error at the generated call rather than a silent
+/// packet-shape difference.
+fn cuda_module_disjoint_slice_has_row_width(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "DisjointSlice" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    let mut space = args.args.iter().filter_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    space.nth(1).is_some_and(|space| {
+        let Type::Path(space_path) = space else {
+            return false;
+        };
+        space_path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "RuntimeRowMajorTiles" || segment.ident == "Runtime2DIndex"
+        })
+    })
 }
 
 fn cuda_module_disjoint_slice_elem(ty: &Type) -> Option<TokenStream2> {
@@ -1997,6 +2852,54 @@ fn add_cuda_module_disjoint_contract_bounds(
         generics.make_where_clause().predicates.push(parse_quote! {
             for<#bound_lifetime> #device_ty:
                 ::cuda_device::__LaunchContractDisjointSlice<#element_ty, #domain>
+        });
+    }
+}
+
+/// Requires every `DisjointSlice` parameter's resolved type to carry exactly
+/// the launch-packet shape the macro chose for it.
+///
+/// The macro picks the two-word `(ptr, len)` or three-word `(ptr, len, width)`
+/// host marshalling from the index space's spelling, which type aliases can
+/// defeat: `type Rt = RuntimeRowMajorTiles<1, 1>;` spells a flat slice over a
+/// runtime-width space, and the launch would then push two kernel parameters
+/// for a three-parameter kernel, making the driver read past the argument
+/// array. The sealed `__LaunchContractDisjointSliceAbi` trait is the semantic
+/// authority: only the genuine `DisjointSlice` whose index space really has
+/// (`true`) or really lacks (`false`) a runtime row width satisfies the bound, so
+/// a spelling/semantics mismatch is a compile error instead of a malformed
+/// launch packet.
+fn add_cuda_module_disjoint_abi_bounds(generics: &mut syn::Generics, params: &[CudaModuleParam]) {
+    for param in params {
+        let (Some(device_ty), Some(element_ty)) =
+            (&param.disjoint_slice_ty, &param.disjoint_slice_elem)
+        else {
+            continue;
+        };
+        let has_row_width = matches!(
+            param.marshal,
+            CudaModuleParamMarshal::RowWidthDeviceBuffer { .. }
+        );
+        let (device_ty, bound_lifetime) = cuda_module_disjoint_bound_type(device_ty);
+        generics.make_where_clause().predicates.push(parse_quote! {
+            for<#bound_lifetime> #device_ty:
+                ::cuda_device::__LaunchContractDisjointSliceAbi<#element_ty, #has_row_width>
+        });
+    }
+}
+
+/// Requires every `Uniform<T>` parameter to be cuda-device's own type.
+///
+/// The host ABI for these parameters is chosen from the spelling `Uniform<T>`,
+/// so without this bound a local type of the same name would be marshalled as
+/// a bare `T` while presenting whatever layout it liked.
+fn add_cuda_module_uniform_bounds(generics: &mut syn::Generics, params: &[CudaModuleParam]) {
+    for param in params {
+        let (Some(device_ty), Some(scalar_ty)) = (&param.uniform_ty, &param.uniform_scalar) else {
+            continue;
+        };
+        generics.make_where_clause().predicates.push(parse_quote! {
+            #device_ty: ::cuda_device::__LaunchContractUniform<#scalar_ty>
         });
     }
 }
@@ -2061,14 +2964,36 @@ fn generate_cuda_module_launch_contract_impl(kernel: &CudaModuleKernel) -> Optio
         3 => quote! { ::cuda_core::LaunchConfig3D },
         _ => unreachable!(),
     };
+    let max_threads_binding = internal_ident("__cuda_oxide_max_threads");
     let block = if let Some((x, y, z)) = contract.exact_block {
         quote! { ::cuda_core::BlockRequirement::Exact((#x, #y, #z)) }
     } else {
-        let max_threads = contract
+        contract
             .max_block_threads
+            .as_ref()
             .expect("validated contract without exact block has launch bounds");
-        quote! { ::cuda_core::BlockRequirement::MaxThreads(#max_threads) }
+        quote! { ::cuda_core::BlockRequirement::MaxThreads(#max_threads_binding) }
     };
+    let launch_bounds_assertions = contract.max_block_threads.as_ref().map(|maximum| {
+        let maximum = &maximum.expr;
+        let exact_assertion = contract.exact_block.map(|(x, y, z)| {
+            let exact_threads = u128::from(x) * u128::from(y) * u128::from(z);
+            quote! {
+                assert!(
+                    #exact_threads <= (#max_threads_binding) as u128,
+                    "launch_contract exact block exceeds launch_bounds maximum threads",
+                );
+            }
+        });
+        quote! {
+            let #max_threads_binding: u32 = #maximum;
+            assert!(
+                #max_threads_binding > 0,
+                "launch_bounds maximum threads must be greater than zero",
+            );
+            #exact_assertion
+        }
+    });
     let alignment = contract.dynamic_shared_alignment;
     let dynamic_shared = match contract.dynamic_shared {
         DynamicSharedContract::Exact(bytes) => quote! {
@@ -2095,6 +3020,9 @@ fn generate_cuda_module_launch_contract_impl(kernel: &CudaModuleKernel) -> Optio
     let compute_capability = ((major, minor) != (0, 0)).then(|| {
         quote! { .with_min_compute_capability(#major, #minor) }
     });
+    let coordinates = contract
+        .u32_coordinates
+        .then(|| quote! { .with_u32_coordinates() });
 
     Some(quote! {
         #(#cfg_attrs)*
@@ -2102,11 +3030,14 @@ fn generate_cuda_module_launch_contract_impl(kernel: &CudaModuleKernel) -> Optio
         #where_clause
         {
             type Config = #config_ty;
-            const SPEC: ::cuda_core::LaunchContractSpec =
+            const SPEC: ::cuda_core::LaunchContractSpec = {
+                #launch_bounds_assertions
                 ::cuda_core::LaunchContractSpec::new(#kernel_name, #block, #dynamic_shared)
                     #cluster
                     #cooperative
-                    #compute_capability;
+                    #compute_capability
+                    #coordinates
+            };
         }
     })
 }
@@ -2280,6 +3211,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
     let unchecked_function_binding = cuda_module_function_binding(kernel);
     let launch_call = cuda_module_launch_call(kernel);
     let unchecked_launch_call = cuda_module_launch_call(kernel);
+    let requires_checks = generate_requires_checks(kernel, RequiresLenAccess::SyncBuffer);
     let stream = internal_ident("__cuda_oxide_stream");
     let prepared = internal_ident("__cuda_oxide_prepared");
     let function = internal_ident("__cuda_oxide_function");
@@ -2299,6 +3231,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
         #where_clause
         {
             #prepared.validate_stream(#stream)?;
+            #requires_checks
             let #function = #prepared.function();
             let #config = #prepared.__raw_config();
             let mut #args: ::std::vec::Vec<*mut ::std::ffi::c_void> = ::std::vec::Vec::new();
@@ -2310,7 +3243,7 @@ fn generate_cuda_module_prepared_launch_method(kernel: &CudaModuleKernel) -> Tok
         #[doc = "Unchecked launch escape hatch for this contracted kernel."]
         #[doc = ""]
         #[doc = "# Safety"]
-        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract."]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract, including any `requires` size requirements. This escape hatch intentionally skips the contract's checks, so an undersized buffer is not caught before the kernel runs."]
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis unsafe fn #unchecked_name #impl_generics (
             &self,
@@ -2433,18 +3366,49 @@ fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) 
     let unchecked_cooperative = kernel.cooperative.then(|| {
         quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
     });
+    let requires_checks = generate_requires_checks(kernel, RequiresLenAccess::AsyncRef);
+    let launch_ty = quote! {
+        ::cuda_host::PreparedAsyncKernelLaunch<#async_lifetime, #marker_ty>
+    };
+    let final_value = quote! {
+        unsafe {
+            ::cuda_host::new_prepared_async_kernel_launch(
+                #launch,
+                (*#prepared).clone(),
+            )
+        }
+    };
+    // Size requirements are evaluated eagerly, before the launch is
+    // enqueued, so a violated relation must surface as a typed error. Only
+    // contracts that declare `requires` pay for the `Result` wrapper.
+    let (return_ty, final_expr, requires_doc) = if requires_checks.is_some() {
+        (
+            quote! {
+                ::core::result::Result<#launch_ty, ::cuda_core::LaunchContractError>
+            },
+            quote! { ::core::result::Result::Ok(#final_value) },
+            Some(quote! {
+                #[doc = ""]
+                #[doc = "Returns a `LaunchContractError` without enqueueing anything if a declared `requires` size requirement does not hold for the supplied arguments."]
+            }),
+        )
+    } else {
+        (launch_ty, final_value, None)
+    };
 
     quote! {
         #(#cfg_attrs)*
         #(#method_attrs)*
+        #requires_doc
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis #unsafety fn #fn_name #impl_generics (
             &self,
             #prepared: &::cuda_core::PreparedLaunch<#marker_ty>,
             #(#params),*
-        ) -> ::cuda_host::PreparedAsyncKernelLaunch<#async_lifetime, #marker_ty>
+        ) -> #return_ty
         #where_clause
         {
+            #requires_checks
             let mut #launch =
                 ::cuda_host::new_async_kernel_launch_builder(#prepared.function().clone());
             #prepared_cluster
@@ -2455,19 +3419,14 @@ fn generate_cuda_module_prepared_async_launch_method(kernel: &CudaModuleKernel) 
             let #launch = unsafe {
                 #launch.finalize_unchecked(#prepared.__raw_config())
             };
-            unsafe {
-                ::cuda_host::new_prepared_async_kernel_launch(
-                    #launch,
-                    (*#prepared).clone(),
-                )
-            }
+            #final_expr
         }
 
         #(#cfg_attrs)*
         #[doc = "Unchecked async launch escape hatch for this contracted kernel."]
         #[doc = ""]
         #[doc = "# Safety"]
-        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled."]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled, including any `requires` size requirements. This escape hatch intentionally skips the contract's checks, so an undersized buffer is not caught before the kernel runs."]
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis unsafe fn #unchecked_name #impl_generics (
             &self,
@@ -2525,6 +3484,12 @@ fn generate_cuda_module_legacy_owned_async_launch_method(
                 let resource_ty = cuda_module_owned_resource_type(index);
                 quote! { mut #name: #resource_ty }
             }
+            // The owned resource carries the buffer; `RowWidthOwned` adds the
+            // row width the kernel will index it by.
+            CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+                let resource_ty = cuda_module_owned_resource_type(index);
+                quote! { mut #name: ::cuda_host::RowWidthOwned<#resource_ty> }
+            }
         }
     });
     let arg_marshalling = kernel
@@ -2547,7 +3512,7 @@ fn generate_cuda_module_legacy_owned_async_launch_method(
         }
     });
     let resources_ty = cuda_module_owned_resources_ty(&resources);
-    let resource_names = resources.iter().map(|(_, name, _, _)| name);
+    let resource_names = resources.iter().map(|(_, name, _, _, _)| name);
     let resources_expr = if resources.is_empty() {
         quote! { () }
     } else {
@@ -2616,6 +3581,12 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
                     let resource_ty = cuda_module_owned_resource_type(index);
                     quote! { mut #name: #resource_ty }
                 }
+                // The owned resource carries the buffer; `RowWidthOwned` adds
+                // the row width the kernel will index it by.
+                CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+                    let resource_ty = cuda_module_owned_resource_type(index);
+                    quote! { mut #name: ::cuda_host::RowWidthOwned<#resource_ty> }
+                }
             }
         })
         .collect();
@@ -2647,8 +3618,8 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
         quote! { ::cuda_host::set_async_kernel_cooperative(&mut #launch, true); }
     });
     let resources_ty = cuda_module_owned_resources_ty(&resources);
-    let prepared_resource_names = resources.iter().map(|(_, name, _, _)| name);
-    let unchecked_resource_names = resources.iter().map(|(_, name, _, _)| name);
+    let prepared_resource_names = resources.iter().map(|(_, name, _, _, _)| name);
+    let unchecked_resource_names = resources.iter().map(|(_, name, _, _, _)| name);
     let prepared_resources_expr = if resources.is_empty() {
         quote! { () }
     } else {
@@ -2659,18 +3630,49 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
     } else {
         quote! { (#(#unchecked_resource_names),*) }
     };
+    let requires_checks = generate_requires_checks(kernel, RequiresLenAccess::OwnedValue);
+    let launch_ty = quote! {
+        ::cuda_host::PreparedOwnedAsyncKernelLaunch<#resources_ty, #marker_ty>
+    };
+    let final_value = quote! {
+        unsafe {
+            ::cuda_host::new_prepared_owned_async_kernel_launch(
+                #owned,
+                (*#prepared).clone(),
+            )
+        }
+    };
+    // Same policy as the borrowed async launcher: `requires` relations are
+    // checked eagerly, before any resource is moved into the launch, and a
+    // violation surfaces as a typed error instead of an enqueued fault.
+    let (return_ty, final_expr, requires_doc) = if requires_checks.is_some() {
+        (
+            quote! {
+                ::core::result::Result<#launch_ty, ::cuda_core::LaunchContractError>
+            },
+            quote! { ::core::result::Result::Ok(#final_value) },
+            Some(quote! {
+                #[doc = ""]
+                #[doc = "Returns a `LaunchContractError` without enqueueing anything if a declared `requires` size requirement does not hold for the supplied arguments."]
+            }),
+        )
+    } else {
+        (launch_ty, final_value, None)
+    };
 
     quote! {
         #(#cfg_attrs)*
         #(#method_attrs)*
+        #requires_doc
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis #unsafety fn #fn_name #impl_generics (
             &self,
             #prepared: &::cuda_core::PreparedLaunch<#marker_ty>,
             #(#params),*
-        ) -> ::cuda_host::PreparedOwnedAsyncKernelLaunch<#resources_ty, #marker_ty>
+        ) -> #return_ty
         #where_clause
         {
+            #requires_checks
             let mut #launch =
                 ::cuda_host::new_async_kernel_launch_builder(#prepared.function().clone());
             #prepared_cluster
@@ -2683,19 +3685,14 @@ fn generate_cuda_module_prepared_owned_async_launch_method(
             };
             let #owned =
                 ::cuda_host::new_owned_async_kernel_launch(#launch, #prepared_resources_expr);
-            unsafe {
-                ::cuda_host::new_prepared_owned_async_kernel_launch(
-                    #owned,
-                    (*#prepared).clone(),
-                )
-            }
+            #final_expr
         }
 
         #(#cfg_attrs)*
         #[doc = "Unchecked owned-async launch escape hatch for this contracted kernel."]
         #[doc = ""]
         #[doc = "# Safety"]
-        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled."]
+        #[doc = "The caller must uphold the kernel's declared geometry, resource, capability, and context contract when the returned operation is scheduled, including any `requires` size requirements. This escape hatch intentionally skips the contract's checks, so an undersized buffer is not caught before the kernel runs."]
         #[allow(clippy::multiple_bound_locations, clippy::too_many_arguments)]
         #vis unsafe fn #unchecked_name #impl_generics (
             &self,
@@ -2741,10 +3738,10 @@ fn cuda_module_launch_generics(kernel: &CudaModuleKernel) -> syn::Generics {
 
 fn cuda_module_owned_async_launch_generics(
     kernel: &CudaModuleKernel,
-    resources: &[(usize, Ident, TokenStream2, bool)],
+    resources: &[(usize, Ident, TokenStream2, bool, bool)],
 ) -> syn::Generics {
     let mut generics = kernel.generics.clone();
-    for (index, _, elem_ty, writable) in resources {
+    for (index, _, elem_ty, writable, _) in resources {
         let resource_ty = cuda_module_owned_resource_type(*index);
         generics.params.push(syn::parse_quote! { #resource_ty });
         let predicate: syn::WherePredicate = if *writable {
@@ -2791,7 +3788,7 @@ fn cuda_module_async_launch_generics(kernel: &CudaModuleKernel) -> syn::Generics
 
 fn cuda_module_owned_resource_params(
     kernel: &CudaModuleKernel,
-) -> Vec<(usize, Ident, TokenStream2, bool)> {
+) -> Vec<(usize, Ident, TokenStream2, bool, bool)> {
     kernel
         .params
         .iter()
@@ -2799,10 +3796,15 @@ fn cuda_module_owned_resource_params(
         .filter_map(|(index, param)| match &param.marshal {
             CudaModuleParamMarshal::Scalar => None,
             CudaModuleParamMarshal::ReadOnlyDeviceBuffer { elem_ty } => {
-                Some((index, param.name.clone(), elem_ty.clone(), false))
+                Some((index, param.name.clone(), elem_ty.clone(), false, false))
             }
             CudaModuleParamMarshal::WritableDeviceBuffer { elem_ty } => {
-                Some((index, param.name.clone(), elem_ty.clone(), true))
+                Some((index, param.name.clone(), elem_ty.clone(), true, false))
+            }
+            // A row-width slice still owns a buffer resource; the width
+            // rides beside it in `RowWidthOwned`.
+            CudaModuleParamMarshal::RowWidthDeviceBuffer { elem_ty } => {
+                Some((index, param.name.clone(), elem_ty.clone(), true, true))
             }
         })
         .collect()
@@ -2813,14 +3815,19 @@ fn cuda_module_owned_resource_type(index: usize) -> Ident {
 }
 
 fn cuda_module_owned_resources_ty(
-    resources: &[(usize, Ident, TokenStream2, bool)],
+    resources: &[(usize, Ident, TokenStream2, bool, bool)],
 ) -> TokenStream2 {
     if resources.is_empty() {
         quote! { () }
     } else {
-        let resource_tys = resources
-            .iter()
-            .map(|(index, _, _, _)| cuda_module_owned_resource_type(*index));
+        let resource_tys = resources.iter().map(|(index, _, _, _, has_row_width)| {
+            let resource_ty = cuda_module_owned_resource_type(*index);
+            if *has_row_width {
+                quote! { ::cuda_host::RowWidthOwned<#resource_ty> }
+            } else {
+                quote! { #resource_ty }
+            }
+        });
         quote! { (#(#resource_tys),*) }
     }
 }
@@ -2862,6 +3869,21 @@ fn cuda_module_arg_marshalling(index: usize, param: &CudaModuleParam) -> TokenSt
                 );
             }
         }
+        CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+            let ptr_name = internal_ident(&format!("__cuda_oxide_arg_{index}_ptr"));
+            let len_name = internal_ident(&format!("__cuda_oxide_arg_{index}_len"));
+            let width_name = internal_ident(&format!("__cuda_oxide_arg_{index}_row_width"));
+            quote! {
+                let (mut #ptr_name, mut #len_name, mut #width_name) =
+                    ::cuda_host::row_width_device_buffer_arg(#name);
+                ::cuda_host::push_kernel_row_width_device_slice(
+                    &mut #args,
+                    &mut #ptr_name,
+                    &mut #len_name,
+                    &mut #width_name,
+                );
+            }
+        }
     }
 }
 
@@ -2884,6 +3906,11 @@ fn cuda_module_owned_async_arg_marshalling(param: &CudaModuleParam) -> TokenStre
                 ::cuda_host::push_async_writable_device_slice(&mut #launch, &mut #name);
             }
         }
+        CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+            quote! {
+                ::cuda_host::push_async_owned_row_width_device_slice(&mut #launch, &mut #name);
+            }
+        }
     }
 }
 
@@ -2904,6 +3931,11 @@ fn cuda_module_async_arg_marshalling(param: &CudaModuleParam) -> TokenStream2 {
         CudaModuleParamMarshal::WritableDeviceBuffer { .. } => {
             quote! {
                 ::cuda_host::push_async_writable_device_slice(&mut #launch, #name);
+            }
+        }
+        CudaModuleParamMarshal::RowWidthDeviceBuffer { .. } => {
+            quote! {
+                ::cuda_host::push_async_row_width_device_slice(&mut #launch, #name);
             }
         }
     }
@@ -3133,6 +4165,72 @@ fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
 /// }
 /// ```
 ///
+/// Kernels that use contract-backed fast coordinates name their launch
+/// capability explicitly. It is a local device-only binding, not an ABI
+/// parameter:
+///
+/// ```ignore
+/// #[kernel(launch_context = launch_context)]
+/// #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+/// pub fn map(mut output: DisjointSlice<u32>) {
+///     let index = thread::index_1d_u32(launch_context);
+///     // ...
+/// }
+/// ```
+///
+/// # Unchecked indexing (opt-in, trust-me contract)
+///
+/// `#[kernel(unchecked_indexing)]` tells the compiler to **delete the safety
+/// check behind slice/array indexing** (`a[i]`) in this kernel. Normally
+/// every `a[i]` compiles to "is `i` inside the slice? if not, stop the
+/// kernel"; with this flag the access happens unconditionally. You are
+/// promising that every index is in bounds, the same promise as
+/// [`slice::get_unchecked`]. If the promise is wrong, the result is
+/// **undefined behavior**: no guard, no trap, possibly silent corruption of
+/// unrelated data. Turn it on only after the checked build is proven correct
+/// (for example under `compute-sanitizer`).
+///
+/// ```ignore
+/// #[kernel(unchecked_indexing)]
+/// pub fn hot_loop(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
+///     let idx = thread::index_1d().get();
+///     if let Some(out) = c.get_mut(thread::index_1d()) {
+///         *out = a[idx] + b[idx]; // no bounds guard or trap emitted
+///     }
+/// }
+/// ```
+///
+/// The flag composes with the other kernel arguments, e.g.
+/// `#[kernel(f32, unchecked_indexing)]` or
+/// `#[kernel(launch_context = lc, unchecked_indexing)]`.
+///
+/// The bare word `unchecked_indexing` is **reserved** in the `#[kernel]`
+/// argument list: it always parses as this flag, never as a legacy
+/// instantiation type. A user type literally named `unchecked_indexing` can
+/// still be instantiated by spelling it as a path, e.g.
+/// `#[kernel(self::unchecked_indexing)]` or
+/// `#[kernel(crate::unchecked_indexing)]`, which parses as a type.
+///
+/// Scope and caveats:
+///
+/// - Only the checks behind indexing (`a[i]`) are removed. Arithmetic
+///   overflow, division/remainder by zero, misaligned-pointer checks, and
+///   every other safety check keep their normal compare-and-trap behavior.
+/// - Range-indexing failures (`&a[i..j]`) and explicit panics arrive as calls
+///   to `core::panicking::*`, not as MIR asserts, so they still trap.
+/// - The flag covers the kernel's translated MIR body, including everything
+///   rustc MIR-inlined into it. Separately translated `#[device]` functions
+///   are **not** covered; the whole-build switch
+///   `CUDA_OXIDE_UNCHECKED_INDEXING=1` (or `cargo oxide ...
+///   --unchecked-indexing`) covers every translated body.
+/// - Elision never leaks out of the opted kernel. For generic kernels
+///   (including legacy `#[kernel(T, ...)]` instantiation), the expansion
+///   keeps the elision marker on the generated entry function plus a hidden
+///   unchecked twin of the implementation that only that entry calls. The
+///   user-named implementation function stays ordinary bounds-checked Rust,
+///   so a different kernel or `#[device]` function that calls it keeps its
+///   own bounds checks (fail-closed).
+///
 /// # Loop unrolling
 ///
 /// Put `#[unroll]` on a loop with a compile-time-known trip count to request full
@@ -3152,6 +4250,11 @@ fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
 /// }
 /// ```
 ///
+/// A factor may also be a typed `u32` policy constant, such as
+/// `#[unroll(P::UNROLL)]`. A generic expression currently requires Rust's
+/// `generic_const_exprs` feature. Partial factors must be in `2..=1024`; an
+/// invalid specialization fails compilation instead of becoming a no-op.
+///
 /// The pass currently recognizes explicit counted `while` loops. Range-based
 /// `for` loops are not yet recognized.
 ///
@@ -3167,17 +4270,37 @@ fn cuda_kernel_marker_name(fn_name: &Ident) -> Ident {
 /// Partial unrolling also requires a positive counter step, a `<` or `<=` test,
 /// and a limit that does not change inside the loop. One annotation may create
 /// at most 1,024 body copies, 8,192 cloned basic blocks, and 65,536 cloned
-/// operations. Unsupported or larger requests warn and are not unrolled.
+/// operations. Factors above 1,024 are rejected; unsupported loop shapes warn
+/// and are not unrolled.
 #[proc_macro_attribute]
 pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
+    track_codegen_environment();
     let args = parse_macro_input!(attr as KernelArgs);
     let mut input = parse_macro_input!(item as ItemFn);
+
+    let KernelArgs {
+        instantiate_types,
+        launch_context,
+        unchecked_indexing,
+    } = args;
 
     if let Some(err) = reject_reserved_name(&input.sig.ident) {
         return err;
     }
     if let Some(err) = impl_trait_parameter_error(&input, "kernel") {
         return err.to_compile_error().into();
+    }
+    if let Some(launch_context) = &launch_context
+        && let Some(parameter) = scope_parameter_collision(&input, launch_context)
+    {
+        return syn::Error::new_spanned(
+            parameter,
+            format!(
+                "kernel launch-context binding `{launch_context}` conflicts with a function parameter; choose a distinct name in `#[kernel(launch_context = ...)]`"
+            ),
+        )
+        .to_compile_error()
+        .into();
     }
 
     // Consume any `#[unroll]` / `#[unroll(N)]` attributes written directly on
@@ -3190,12 +4313,33 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Err(err) = rewrite_loop_unroll_attrs(&mut input) {
         return err.to_compile_error().into();
     }
+    if let Err(err) = add_launch_bounds_evaluatability_from_attrs(&mut input) {
+        return err.to_compile_error().into();
+    }
+
+    // Insert the unchecked-indexing compiler marker at the top of the kernel
+    // body. The MIR importer detects the call, elides bounds-check asserts in
+    // the translated body, and strips the call before code generation. For
+    // simple kernels the function itself becomes the entry, so the marker
+    // stays put. Generic kernel generation strips the marker from the
+    // re-emitted user-named implementation helper and confines it to the
+    // generated entry wrapper (forwarded via
+    // `top_level_kernel_configuration_markers`) plus a hidden unchecked twin
+    // of the implementation that only the entry calls; see
+    // `strip_unchecked_indexing_config_marker` and
+    // `unchecked_indexing_impl_clone`.
+    if unchecked_indexing {
+        let marker_call: syn::Stmt = syn::parse_quote! {
+            ::cuda_device::thread::__unchecked_indexing_config::<true>();
+        };
+        input.block.stmts.insert(0, marker_call);
+    }
 
     // Only type and const parameters create distinct codegen instances.
     // Lifetimes are erased before monomorphization.
     let has_generics = has_codegen_generics(&input.sig.generics);
 
-    if has_generics && !args.instantiate_types.is_empty() {
+    if has_generics && !instantiate_types.is_empty() {
         let type_param_count = input
             .sig
             .generics
@@ -3225,13 +4369,13 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    if has_generics && args.instantiate_types.is_empty() {
+    if has_generics && instantiate_types.is_empty() {
         // Generic kernel without explicit types - allow it!
         // Instantiation will happen from call sites (nvcc-style)
-        return generate_generic_kernel_no_instantiation(input);
+        return generate_generic_kernel_no_instantiation(input, launch_context);
     }
 
-    if !has_generics && !args.instantiate_types.is_empty() {
+    if !has_generics && !instantiate_types.is_empty() {
         // Non-generic kernel with instantiation types - error
         return syn::Error::new_spanned(
             &input.sig.ident,
@@ -3243,10 +4387,10 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if has_generics {
         // Generate wrapper kernels for each instantiation type
-        generate_generic_kernel(input, args.instantiate_types)
+        generate_generic_kernel(input, instantiate_types, launch_context)
     } else {
         // Simple non-generic kernel
-        generate_simple_kernel(input)
+        generate_simple_kernel(input, launch_context)
     }
 }
 
@@ -3334,6 +4478,7 @@ impl Parse for ConstantArgs {
 /// ```
 #[proc_macro_attribute]
 pub fn constant(attr: TokenStream, item: TokenStream) -> TokenStream {
+    track_codegen_environment();
     let args = parse_macro_input!(attr as ConstantArgs);
     let input = parse_macro_input!(item as syn::ItemStatic);
 
@@ -3576,6 +4721,11 @@ const SCOPED_INTRINSICS: &[ScopedIntrinsic] = &[
         preserve_turbofish: false,
         forward_args: true,
     },
+    ScopedIntrinsic {
+        name: "warp_index",
+        preserve_turbofish: false,
+        forward_args: false,
+    },
 ];
 
 /// Method names whose zero-arg call sites get the kernel scope spliced in
@@ -3598,6 +4748,7 @@ fn is_scoped_method(method: &Ident) -> bool {
 
 struct ThreadIndexCallRewriter {
     scope_ident: Ident,
+    borrow_scope: bool,
     rewrote_index_call: bool,
 }
 
@@ -3629,11 +4780,16 @@ impl VisitMut for ThreadIndexCallRewriter {
                 };
                 let internal_path = internal_thread_path(path, intrinsic.name, path_args);
                 let scope_ident = &self.scope_ident;
+                let scope_arg = if self.borrow_scope {
+                    quote! { &#scope_ident }
+                } else {
+                    quote! { #scope_ident }
+                };
 
                 *expr = if intrinsic.forward_args {
-                    parse_quote! { #internal_path(&#scope_ident, #args) }
+                    parse_quote! { #internal_path(#scope_arg, #args) }
                 } else {
-                    parse_quote! { #internal_path(&#scope_ident) }
+                    parse_quote! { #internal_path(#scope_arg) }
                 };
                 self.rewrote_index_call = true;
             }
@@ -3642,7 +4798,11 @@ impl VisitMut for ThreadIndexCallRewriter {
                     return;
                 }
                 let scope_ident = &self.scope_ident;
-                args.push(parse_quote! { &#scope_ident });
+                if self.borrow_scope {
+                    args.push(parse_quote! { &#scope_ident });
+                } else {
+                    args.push(parse_quote! { #scope_ident });
+                }
                 self.rewrote_index_call = true;
             }
             _ => {}
@@ -3650,31 +4810,223 @@ impl VisitMut for ThreadIndexCallRewriter {
     }
 }
 
-fn inject_thread_index_scope(input: &mut ItemFn) {
+#[derive(Clone)]
+struct RewrittenKernelScope {
+    ident: Ident,
+    domain: TokenStream2,
+    coordinates: TokenStream2,
+}
+
+fn rewrite_thread_index_calls(
+    input: &mut ItemFn,
+    borrow_scope: bool,
+) -> Option<RewrittenKernelScope> {
     // Keep the ordinary call-site span so borrow-checker diagnostics continue
     // to point at the user's `#[kernel]` / `#[device]` item. Only rename the
     // binding when a generic parameter has deliberately taken the usual name.
     let scope_ident = call_site_ident_avoiding_item(KERNEL_SCOPE_LOCAL, input);
+    if !rewrite_thread_index_calls_with_scope(input, &scope_ident, borrow_scope) {
+        return None;
+    }
+
+    Some(kernel_scope_spec(input, scope_ident))
+}
+
+fn rewrite_thread_index_calls_with_scope(
+    input: &mut ItemFn,
+    scope_ident: &Ident,
+    borrow_scope: bool,
+) -> bool {
     let mut rewriter = ThreadIndexCallRewriter {
         scope_ident: scope_ident.clone(),
+        borrow_scope,
         rewrote_index_call: false,
     };
     rewriter.visit_block_mut(&mut input.block);
+    rewriter.rewrote_index_call
+}
 
-    if rewriter.rewrote_index_call {
-        let scope_stmt: Stmt = parse_quote! {
-            let #scope_ident = unsafe { ::cuda_device::thread::__internal::make_kernel_scope() };
+fn kernel_scope_spec(input: &ItemFn, ident: Ident) -> RewrittenKernelScope {
+    let (domain, coordinates) = kernel_scope_marker_types(input);
+    RewrittenKernelScope {
+        ident,
+        domain,
+        coordinates,
+    }
+}
+
+fn explicit_kernel_scope(input: &mut ItemFn, ident: Ident) -> RewrittenKernelScope {
+    // Legacy helpers still receive the same capability, but only their
+    // established names are rewritten. The new fast functions are ordinary
+    // Rust calls that take this reference explicitly.
+    rewrite_thread_index_calls_with_scope(input, &ident, false);
+    kernel_scope_spec(input, ident)
+}
+
+fn kernel_scope_binding(scope: &RewrittenKernelScope) -> Stmt {
+    let RewrittenKernelScope {
+        ident,
+        domain,
+        coordinates,
+    } = scope;
+    parse_quote! {
+        let #ident = unsafe {
+            ::cuda_device::thread::__internal::make_kernel_scope::<#domain, #coordinates>()
         };
-        input.block.stmts.insert(0, scope_stmt);
+    }
+}
+
+fn explicit_kernel_scope_bindings(scope: &RewrittenKernelScope) -> Vec<Stmt> {
+    let RewrittenKernelScope {
+        ident,
+        domain,
+        coordinates,
+    } = scope;
+    // Def-site-like hygiene keeps this generated storage binding distinct
+    // from any source binding with the same text. Both its declaration and
+    // reference are emitted by this one proc-macro expansion.
+    let storage = Ident::new(
+        &format!("{KERNEL_SCOPE_LOCAL}_storage"),
+        proc_macro2::Span::mixed_site(),
+    );
+    vec![
+        parse_quote! {
+            let #storage = unsafe {
+                ::cuda_device::thread::__internal::make_kernel_scope::<#domain, #coordinates>()
+            };
+        },
+        parse_quote! {
+            let #ident: ::cuda_device::thread::LaunchContextRef<'_, #domain, #coordinates> =
+                &#storage;
+        },
+    ]
+}
+
+fn append_kernel_scope_parameter(input: &mut ItemFn, scope: &RewrittenKernelScope) {
+    let RewrittenKernelScope {
+        ident,
+        domain,
+        coordinates,
+    } = scope;
+    input.sig.inputs.push(parse_quote! {
+        #ident: ::cuda_device::thread::LaunchContextRef<'_, #domain, #coordinates>
+    });
+}
+
+fn inject_thread_index_scope(input: &mut ItemFn) {
+    if let Some(scope) = rewrite_thread_index_calls(input, true) {
+        input.block.stmts.insert(0, kernel_scope_binding(&scope));
+    }
+}
+
+fn inject_device_thread_index_scope(input: &mut ItemFn) {
+    let Some(mut scope) = rewrite_thread_index_calls(input, true) else {
+        return;
+    };
+    // A device helper has no host preparation boundary of its own. It may use
+    // checked legacy witnesses, but it cannot mint a contract-backed fast
+    // witness; callers must pass that witness or a checked view explicitly.
+    scope.domain = quote! { ::cuda_device::thread::__internal::UnknownDomain };
+    scope.coordinates = quote! { ::cuda_device::thread::__internal::NativeCoordinates };
+    input.block.stmts.insert(0, kernel_scope_binding(&scope));
+}
+
+fn kernel_scope_marker_types(input: &ItemFn) -> (TokenStream2, TokenStream2) {
+    let contract = input
+        .attrs
+        .iter()
+        .find(|attr| attr_path_ends_with(attr, "launch_contract"))
+        .and_then(|attr| attr.parse_args::<LaunchContractArgs>().ok())
+        .map(|args| (args.domain, args.u32_coordinates))
+        .or_else(|| {
+            input
+                .block
+                .stmts
+                .iter()
+                .find_map(launch_contract_marker_values)
+        });
+
+    let (domain, u32_coordinates) = contract.unwrap_or((0, false));
+    let domain = match domain {
+        1 => quote! { ::cuda_device::thread::__internal::Domain1 },
+        2 => quote! { ::cuda_device::thread::__internal::Domain2 },
+        3 => quote! { ::cuda_device::thread::__internal::Domain3 },
+        _ => quote! { ::cuda_device::thread::__internal::UnknownDomain },
+    };
+    let coordinates = if u32_coordinates {
+        quote! { ::cuda_device::thread::__internal::U32Coordinates }
+    } else {
+        quote! { ::cuda_device::thread::__internal::NativeCoordinates }
+    };
+    (domain, coordinates)
+}
+
+fn launch_contract_marker_values(statement: &Stmt) -> Option<(u8, bool)> {
+    let (call, unsafe_wrapped) = configuration_marker_call(statement)?;
+    if !unsafe_wrapped {
+        return None;
+    }
+    if !call.args.is_empty() {
+        return None;
+    }
+    let Expr::Path(ExprPath {
+        qself: None, path, ..
+    }) = &*call.func
+    else {
+        return None;
+    };
+    let segments: Vec<_> = path.segments.iter().collect();
+    if path.leading_colon.is_none()
+        || segments.len() != 3
+        || segments[0].ident != "cuda_device"
+        || segments[1].ident != "thread"
+        || segments[2].ident != "__launch_contract_config"
+    {
+        return None;
+    }
+    let PathArguments::AngleBracketed(arguments) = &segments[2].arguments else {
+        return None;
+    };
+    let mut arguments = arguments.args.iter();
+    let GenericArgument::Const(Expr::Lit(domain)) = arguments.next()? else {
+        return None;
+    };
+    let syn::Lit::Int(domain) = &domain.lit else {
+        return None;
+    };
+    let GenericArgument::Const(Expr::Lit(coordinates)) = arguments.next()? else {
+        return None;
+    };
+    let syn::Lit::Bool(coordinates) = &coordinates.lit else {
+        return None;
+    };
+    if arguments.next().is_some() {
+        return None;
+    }
+    Some((domain.base10_parse().ok()?, coordinates.value))
+}
+
+fn configuration_marker_call(statement: &Stmt) -> Option<(&ExprCall, bool)> {
+    match statement {
+        Stmt::Expr(Expr::Call(call), Some(_semicolon)) => Some((call, false)),
+        Stmt::Expr(Expr::Unsafe(unsafe_block), _) if unsafe_block.block.stmts.len() == 1 => {
+            let Stmt::Expr(Expr::Call(call), Some(_semicolon)) = &unsafe_block.block.stmts[0]
+            else {
+                return None;
+            };
+            Some((call, true))
+        }
+        _ => None,
     }
 }
 
 /// Return compiler configuration markers already materialized in a generic
 /// kernel body by attributes that expanded before `#[kernel]`.
 ///
-/// Only exact, zero-argument calls to cuda-oxide's three internal marker paths
-/// are forwarded. Nested calls and unrelated top-level calls remain solely in
-/// the helper body.
+/// Only exact, zero-argument calls to cuda-oxide's internal marker paths are
+/// forwarded. The launch-contract marker additionally retains its generated
+/// `unsafe` boundary. Nested calls and unrelated top-level calls remain solely
+/// in the helper body.
 fn top_level_kernel_configuration_markers(input: &ItemFn) -> Vec<Stmt> {
     input
         .block
@@ -3686,7 +5038,7 @@ fn top_level_kernel_configuration_markers(input: &ItemFn) -> Vec<Stmt> {
 }
 
 fn is_kernel_configuration_marker(statement: &Stmt) -> bool {
-    let Stmt::Expr(Expr::Call(call), Some(_semicolon)) = statement else {
+    let Some((call, unsafe_wrapped)) = configuration_marker_call(statement) else {
         return false;
     };
     if !call.args.is_empty() {
@@ -3711,14 +5063,143 @@ fn is_kernel_configuration_marker(statement: &Stmt) -> bool {
 
     let module = &segments[1].ident;
     let marker = &segments[2].ident;
-    (module == "thread" && marker == "__launch_bounds_config")
-        || (module == "cluster" && marker == "__cluster_config")
-        || (module == "shared" && marker == "__dynamic_shared_alignment")
+    if unsafe_wrapped {
+        module == "thread" && marker == "__launch_contract_config"
+    } else {
+        (module == "thread"
+            && (marker == "__launch_bounds_config"
+                || marker == "__launch_contract_block_config"
+                || marker == "__unchecked_indexing_config"))
+            || (module == "cluster" && marker == "__cluster_config")
+            || (module == "shared" && marker == "__dynamic_shared_alignment")
+    }
+}
+
+/// True when `statement` is exactly the `__unchecked_indexing_config` marker
+/// call that `#[kernel(unchecked_indexing)]` injects.
+fn is_unchecked_indexing_config_marker(statement: &Stmt) -> bool {
+    if !is_kernel_configuration_marker(statement) {
+        return false;
+    }
+    let Some((call, _)) = configuration_marker_call(statement) else {
+        return false;
+    };
+    let Expr::Path(ExprPath { path, .. }) = &*call.func else {
+        return false;
+    };
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == "__unchecked_indexing_config")
+}
+
+/// Remove the `__unchecked_indexing_config` marker from a function body that
+/// is about to be re-emitted as the user-named implementation helper of a
+/// generic kernel.
+///
+/// The marker may only live in generated kernel ENTRY functions (the
+/// `cuda_oxide_*kernel*`-prefixed symbols); the entry wrapper receives it via
+/// `top_level_kernel_configuration_markers`. The helper is ordinary callable
+/// Rust: if the marker stayed in its body, rustc's MIR inliner could splice
+/// it into a different, non-opted kernel that calls the helper, and the MIR
+/// importer would then elide that caller's bounds checks body-wide without
+/// any opt-in. Stripping is fail-closed: if the helper is ever not
+/// MIR-inlined into its own entry wrapper, the helper body simply keeps its
+/// bounds checks.
+fn strip_unchecked_indexing_config_marker(input: &mut ItemFn) {
+    input
+        .block
+        .stmts
+        .retain(|statement| !is_unchecked_indexing_config_marker(statement));
+}
+
+/// Build the hidden unchecked twin of an opted-in generic kernel's
+/// implementation, returning the identifier the generated entry wrapper must
+/// call plus the emitted item.
+///
+/// `input` must already have the marker stripped (it is the exact body that
+/// becomes the user-named helper); the clone re-inserts the marker as its
+/// first statement.
+///
+/// Why a clone at all: the device pipeline translates the
+/// `#[inline(always)]` implementation as its own device function (LLVM
+/// inlines it into the entry later), so a marker on the entry wrapper alone
+/// cannot elide the implementation body's bounds checks, and a marker left
+/// in the user-named helper leaks elision into every other kernel that calls
+/// the helper. The clone carries the marker instead. It is private,
+/// `#[doc(hidden)]`, and named with a def-site (hygienic) identifier, so the
+/// generated `cuda_oxide_*kernel*` entry wrapper of this same expansion is
+/// its only possible caller: bounds-check elision stays confined to launches
+/// of the opted kernel, and the user-named helper keeps every bounds check.
+fn unchecked_indexing_impl_clone(
+    input: &ItemFn,
+    helper_attrs: &[syn::Attribute],
+) -> (Ident, TokenStream2) {
+    // `Display` of a raw identifier keeps its `r#` prefix (e.g. `r#gen`),
+    // which `Ident::new` rejects; strip it like `format_ident!` would.
+    let implementation_name = input.sig.ident.to_string();
+    let implementation_name = implementation_name
+        .strip_prefix("r#")
+        .unwrap_or(&implementation_name);
+    let clone_name = internal_ident(&format!(
+        "__cuda_oxide_unchecked_impl_{implementation_name}"
+    ));
+    let mut clone_fn = input.clone();
+    clone_fn.sig.ident = clone_name.clone();
+    clone_fn.vis = syn::Visibility::Inherited;
+    // The twin's body is byte-identical to the user-named helper's, so it
+    // carries the same routed attributes (cfg gates, lint levels such as
+    // `#[allow]`/`#[expect]`, deprecation): a lint the author suppressed on
+    // the helper must not re-fire on the twin. Entry directives and
+    // `#[inline]` were already routed away by `route_generic_kernel_attrs`.
+    clone_fn.attrs = helper_attrs.to_vec();
+    let marker_call: Stmt = parse_quote! {
+        ::cuda_device::thread::__unchecked_indexing_config::<true>();
+    };
+    clone_fn.block.stmts.insert(0, marker_call);
+    let tokens = quote! {
+        /// Hidden unchecked twin of the kernel implementation. Only the
+        /// generated kernel entry calls it; its marker elides bounds checks
+        /// solely for launches of the opted kernel.
+        #[doc(hidden)]
+        #[inline(always)]
+        #[allow(non_snake_case)]
+        #clone_fn
+    };
+    (clone_name, tokens)
 }
 
 /// Generate a generic kernel that will be instantiated from call sites (nvcc-style)
-fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
-    inject_thread_index_scope(&mut input);
+fn generate_generic_kernel_no_instantiation(
+    input: ItemFn,
+    explicit_scope: Option<Ident>,
+) -> TokenStream {
+    generic_kernel_no_instantiation_tokens(input, explicit_scope).into()
+}
+
+/// Expansion body of [`generate_generic_kernel_no_instantiation`], split out
+/// so unit tests can inspect the generated items without a live proc-macro
+/// bridge.
+fn generic_kernel_no_instantiation_tokens(
+    mut input: ItemFn,
+    explicit_scope: Option<Ident>,
+) -> TokenStream2 {
+    let entry_inputs = input.sig.inputs.clone();
+    // A routed `#[launch_contract]` expands later on the generated entry
+    // wrapper, whose synthetic parameter names cannot resolve source-level
+    // `requires` identifiers, so those relations are validated here while the
+    // original signature is still in scope.
+    if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
+        return error.to_compile_error();
+    }
+    let has_explicit_scope = explicit_scope.is_some();
+    let rewritten_scope = if let Some(ident) = explicit_scope {
+        Some(explicit_kernel_scope(&mut input, ident))
+    } else {
+        rewrite_thread_index_calls(&mut input, false)
+    };
+    if let Some(scope) = &rewritten_scope {
+        append_kernel_scope_parameter(&mut input, scope);
+    }
 
     // Attributes written below `#[kernel]` still belong to the source item
     // when this macro runs. Route CUDA entry directives to the generated entry
@@ -3726,6 +5207,29 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
     // implementation, and copy cfg gates to every generated item.
     let (implementation_attrs, entry_attrs, cfg_attrs) = route_generic_kernel_attrs(&input.attrs);
     let entry_config_markers = top_level_kernel_configuration_markers(&input);
+    // The unchecked-indexing marker may only live in generated kernel entry
+    // functions and their hidden unchecked twin, never in the user-named
+    // implementation helper: a marker left in the helper would extend
+    // bounds-check elision to every other kernel that calls (and inlines)
+    // the helper, without those kernels opting in.
+    let unchecked_indexing = input
+        .block
+        .stmts
+        .iter()
+        .any(is_unchecked_indexing_config_marker);
+    if unchecked_indexing {
+        strip_unchecked_indexing_config_marker(&mut input);
+    }
+    let unchecked_impl =
+        unchecked_indexing.then(|| unchecked_indexing_impl_clone(&input, &implementation_attrs));
+    // The entry calls the hidden twin, so a private opted kernel's user-named
+    // helper may otherwise be dead code; it stays emitted (bounds-checked)
+    // for other device code to call.
+    let helper_dead_code = if unchecked_indexing {
+        quote! { #[allow(dead_code)] }
+    } else {
+        quote! {}
+    };
     let fn_name = &input.sig.ident;
     let vis = &input.vis;
     let generics = &input.sig.generics;
@@ -3740,13 +5244,13 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
     let kernel_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
     let instantiate_name = format_ident!("{}{}", INSTANTIATE_PREFIX, fn_name);
 
-    let (wrapper_inputs, arg_names) = match forwarding_inputs(inputs) {
+    let (wrapper_inputs, arg_names) = match forwarding_inputs(&entry_inputs) {
         Ok(forwarding) => forwarding,
-        Err(err) => return err.to_compile_error().into(),
+        Err(err) => return err.to_compile_error(),
     };
     let args_info: Vec<_> = arg_names
         .iter()
-        .zip(inputs.iter())
+        .zip(entry_inputs.iter())
         .filter_map(|(name, arg)| {
             let FnArg::Typed(pat_type) = arg else {
                 return None;
@@ -3808,19 +5312,49 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
     // Generate the GenericCudaKernel trait implementation for unified compilation
     let generic_cuda_kernel_impl =
         generate_generic_cuda_kernel_impl(fn_name, vis, generics, where_clause, &cfg_attrs);
-    let implementation_call = quote! { #fn_name #kernel_turbofish (#(#arg_names),*) };
+    let mut implementation_args: Vec<TokenStream2> =
+        arg_names.iter().map(|name| quote! { #name }).collect();
+    if let Some(scope) = &rewritten_scope {
+        let scope_ident = &scope.ident;
+        if has_explicit_scope {
+            implementation_args.push(quote! { #scope_ident });
+        } else {
+            implementation_args.push(quote! { &#scope_ident });
+        }
+    }
+    let scope_bindings = rewritten_scope
+        .as_ref()
+        .map(|scope| {
+            if has_explicit_scope {
+                explicit_kernel_scope_bindings(scope)
+            } else {
+                vec![kernel_scope_binding(scope)]
+            }
+        })
+        .unwrap_or_default();
+    // An opted-in kernel's entry calls the hidden unchecked twin; everyone
+    // else (user code included) calls the user-named, bounds-checked helper.
+    let (implementation_target, unchecked_impl_item) = match &unchecked_impl {
+        Some((clone_name, tokens)) => (quote! { #clone_name }, tokens.clone()),
+        None => (quote! { #fn_name }, quote! {}),
+    };
+    let implementation_call =
+        quote! { #implementation_target #kernel_turbofish (#(#implementation_args),*) };
     let implementation_call = if unsafety.is_some() {
         quote! { unsafe { #implementation_call } }
     } else {
         implementation_call
     };
 
-    let expanded = quote! {
+    quote! {
         // Original generic kernel implementation
         #(#implementation_attrs)*
+        #helper_dead_code
         #[inline(always)]
         #vis #constness #unsafety #abi fn #fn_name #generics (#inputs) #output #where_clause
         #block
+
+        #unchecked_impl_item
 
         // Entry point for collector - NOT inlined so we can detect it
         // When called with concrete types, this instantiates the kernel
@@ -3830,15 +5364,14 @@ fn generate_generic_kernel_no_instantiation(mut input: ItemFn) -> TokenStream {
         #[inline(never)]
         #vis #constness #unsafety #abi fn #kernel_name #generics (#(#wrapper_inputs),*) #output #where_clause {
             #(#entry_config_markers)*
+            #(#scope_bindings)*
             #implementation_call
         }
 
         #instantiate_helper
 
         #generic_cuda_kernel_impl
-    };
-
-    TokenStream::from(expanded)
+    }
 }
 
 /// Route attributes when one generic source function becomes several items.
@@ -3912,8 +5445,14 @@ fn _generate_dummy_binding(name: &Ident, ty: &Type) -> TokenStream2 {
 }
 
 /// Generate a simple non-generic kernel
-fn generate_simple_kernel(mut input: ItemFn) -> TokenStream {
-    inject_thread_index_scope(&mut input);
+fn generate_simple_kernel(mut input: ItemFn, explicit_scope: Option<Ident>) -> TokenStream {
+    if let Some(ident) = explicit_scope {
+        let scope = explicit_kernel_scope(&mut input, ident);
+        let bindings = explicit_kernel_scope_bindings(&scope);
+        input.block.stmts.splice(0..0, bindings);
+    } else {
+        inject_thread_index_scope(&mut input);
+    }
 
     let fn_name = input.sig.ident.clone();
     let new_name = format_ident!("{}{}", KERNEL_PREFIX, fn_name);
@@ -3928,7 +5467,12 @@ fn generate_simple_kernel(mut input: ItemFn) -> TokenStream {
 
     // Generate the CudaKernel trait implementation (host-side only)
     // This provides the PTX name for cuda_launch! to look up
-    let cuda_kernel_impl = generate_cuda_kernel_impl(&fn_name, &ptx_entry_name, &original_fn);
+    let cuda_kernel_impl = generate_cuda_kernel_impl(
+        &fn_name,
+        &ptx_entry_name,
+        &original_fn,
+        cfg!(feature = "host"),
+    );
 
     let expanded = quote! {
         #[unsafe(no_mangle)]
@@ -3971,6 +5515,10 @@ fn generate_simple_kernel(mut input: ItemFn) -> TokenStream {
 /// borrow alive across `stream.synchronize()` remains the caller's
 /// responsibility, exactly as it was under the previous `type_name`
 /// scheme.
+///
+/// Deliberately NOT gated by the `host` feature: generic kernels remain
+/// host-coupled by design for now, because the TypeId naming machinery
+/// lives in `cuda_host`.
 fn generate_generic_cuda_kernel_impl(
     fn_name: &Ident,
     vis: &syn::Visibility,
@@ -4042,7 +5590,19 @@ fn generate_generic_cuda_kernel_impl(
 ///
 /// This generates a marker struct that implements `CudaKernel`, allowing
 /// `cuda_launch!` to look up the PTX entry point name at compile time.
-fn generate_cuda_kernel_impl(fn_name: &Ident, ptx_name: &str, _func: &ItemFn) -> TokenStream2 {
+///
+/// Emitted only under the `host` feature: the impl names `cuda_host`, and a
+/// crate that only compiles kernels never looks a PTX entry name up.
+fn generate_cuda_kernel_impl(
+    fn_name: &Ident,
+    ptx_name: &str,
+    _func: &ItemFn,
+    emit_host: bool,
+) -> TokenStream2 {
+    if !emit_host {
+        return TokenStream2::new();
+    }
+
     // Create a marker struct for this kernel
     // We use a struct because Rust doesn't allow trait impls on function pointers easily
     let marker_name = format_ident!("__{}_CudaKernel", fn_name);
@@ -4061,15 +5621,70 @@ fn generate_cuda_kernel_impl(fn_name: &Ident, ptx_name: &str, _func: &ItemFn) ->
 }
 
 /// Generate wrapper kernels for a generic kernel
-fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> TokenStream {
-    inject_thread_index_scope(&mut input);
+fn generate_generic_kernel(
+    input: ItemFn,
+    instantiate_types: Vec<Type>,
+    explicit_scope: Option<Ident>,
+) -> TokenStream {
+    generic_kernel_instantiation_tokens(input, instantiate_types, explicit_scope).into()
+}
+
+/// Expansion body of [`generate_generic_kernel`] (legacy `#[kernel(Type, ...)]`
+/// instantiation), split out so unit tests can inspect the generated items
+/// without a live proc-macro bridge.
+fn generic_kernel_instantiation_tokens(
+    mut input: ItemFn,
+    instantiate_types: Vec<Type>,
+    explicit_scope: Option<Ident>,
+) -> TokenStream2 {
+    let entry_inputs = input.sig.inputs.clone();
+    // Same as the no-instantiation path: `requires` relations of a routed
+    // `#[launch_contract]` must be validated against the source parameter
+    // names before they are lost to the generated wrappers.
+    if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
+        return error.to_compile_error();
+    }
+    let has_explicit_scope = explicit_scope.is_some();
+    let rewritten_scope = if let Some(ident) = explicit_scope {
+        Some(explicit_kernel_scope(&mut input, ident))
+    } else {
+        rewrite_thread_index_calls(&mut input, false)
+    };
+    if let Some(scope) = &rewritten_scope {
+        append_kernel_scope_parameter(&mut input, scope);
+    }
 
     let (implementation_attrs, entry_attrs, _cfg_attrs) = route_generic_kernel_attrs(&input.attrs);
     let entry_config_markers = top_level_kernel_configuration_markers(&input);
     input.attrs.clear();
+    // Same containment rule as the no-instantiation path: the marker never
+    // stays in the re-emitted user-named helper; opted entries call a hidden
+    // unchecked twin instead.
+    let unchecked_indexing = input
+        .block
+        .stmts
+        .iter()
+        .any(is_unchecked_indexing_config_marker);
+    if unchecked_indexing {
+        strip_unchecked_indexing_config_marker(&mut input);
+    }
+    let unchecked_impl =
+        unchecked_indexing.then(|| unchecked_indexing_impl_clone(&input, &implementation_attrs));
+    // The wrappers call the hidden twin, so a private opted kernel's
+    // user-named helper may otherwise be dead code; it stays emitted
+    // (bounds-checked) for other device code to call.
+    let helper_dead_code = if unchecked_indexing {
+        quote! { #[allow(dead_code)] }
+    } else {
+        quote! {}
+    };
     let fn_name = &input.sig.ident;
     let vis = &input.vis;
     let generics = &input.sig.generics;
+    let (implementation_target, unchecked_impl_item) = match &unchecked_impl {
+        Some((clone_name, tokens)) => (quote! { #clone_name }, tokens.clone()),
+        None => (quote! { #fn_name }, quote! {}),
+    };
 
     // Extract the type parameter name (assume single type param for now)
     let type_param = generics
@@ -4085,7 +5700,7 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
         .expect("Expected type parameter");
 
     // Extract function arguments (excluding self)
-    let args: Vec<_> = input.sig.inputs.iter().collect();
+    let args: Vec<_> = entry_inputs.iter().collect();
 
     // Build the argument pattern and types for wrappers
     let arg_names: Vec<TokenStream2> = args
@@ -4106,12 +5721,32 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
         .map(|inst_type| {
             let entry_attrs = &entry_attrs;
             let entry_config_markers = &entry_config_markers;
+            let implementation_target = &implementation_target;
             // Get a clean name for the type (for the kernel name suffix)
             let type_name = get_type_name(inst_type);
             let wrapper_name = format_ident!("{}{}_{}", KERNEL_PREFIX, fn_name, type_name);
 
             // Export name (what appears in PTX)
             let export_name_str = format!("{}_{}", fn_name, type_name);
+            let scope_bindings = rewritten_scope
+                .as_ref()
+                .map(|scope| {
+                    if has_explicit_scope {
+                        explicit_kernel_scope_bindings(scope)
+                    } else {
+                        vec![kernel_scope_binding(scope)]
+                    }
+                })
+                .unwrap_or_default();
+            let mut implementation_args = arg_names.clone();
+            if let Some(scope) = &rewritten_scope {
+                let scope_ident = &scope.ident;
+                if has_explicit_scope {
+                    implementation_args.push(quote! { #scope_ident });
+                } else {
+                    implementation_args.push(quote! { &#scope_ident });
+                }
+            }
 
             // Generate wrapper function args with substituted types
             let wrapper_args: Vec<TokenStream2> = args
@@ -4135,7 +5770,8 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
                 #[unsafe(export_name = #export_name_str)]
                 #vis fn #wrapper_name(#(#wrapper_args),*) {
                     #(#entry_config_markers)*
-                    #fn_name::<#inst_type>(#(#arg_names),*);
+                    #(#scope_bindings)*
+                    #implementation_target::<#inst_type>(#(#implementation_args),*);
                 }
             }
         })
@@ -4143,15 +5779,16 @@ fn generate_generic_kernel(mut input: ItemFn, instantiate_types: Vec<Type>) -> T
 
     // Keep the original generic function (without #[no_mangle] - it's not an entry point)
     // and add all the wrapper kernels
-    let expanded = quote! {
+    quote! {
         #(#implementation_attrs)*
+        #helper_dead_code
         #[inline(always)]
         #input
 
-        #(#wrappers)*
-    };
+        #unchecked_impl_item
 
-    TokenStream::from(expanded)
+        #(#wrappers)*
+    }
 }
 
 /// Get a clean name from a type for use in function names
@@ -4196,6 +5833,13 @@ fn substitute_type(ty: &Type, param: &syn::Ident, replacement: &Type) -> TokenSt
 /// and `.minnctapersm` PTX directives. This helps the CUDA compiler optimize
 /// register allocation and occupancy.
 ///
+/// `.maxntid` bounds the product `x * y * z`, so a 256-thread maximum admits
+/// `(256, 1, 1)`, `(16, 16, 1)` and `(4, 8, 8)` alike. Use
+/// `#[launch_contract(block = (x, y, z))]` to require one exact shape; that
+/// emits `.reqntid` instead, which the driver enforces per axis. A kernel
+/// carrying both attributes emits `.reqntid` alone, because ptxas rejects an
+/// entry declaring both directives. `.minnctapersm` composes with either.
+///
 /// # Usage
 ///
 /// ```ignore
@@ -4208,12 +5852,29 @@ fn substitute_type(ty: &Type, param: &syn::Ident, replacement: &Type) -> TokenSt
 /// #[kernel]
 /// #[launch_bounds(256, 2)]           // Max 256 threads, min 2 blocks per SM
 /// pub fn optimized_kernel(output: DisjointSlice<f32>) { ... }
+///
+/// trait Policy {
+///     const MAX_THREADS: u32;
+///     const MIN_BLOCKS: u32;
+/// }
+///
+/// #[kernel]
+/// #[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+/// pub fn configured<P: Policy>(output: DisjointSlice<f32>) { ... }
 /// ```
 ///
 /// # Parameters
 ///
 /// - First parameter (required): Maximum threads per block
 /// - Second parameter (optional): Minimum blocks per SM for occupancy hints
+/// - Both parameters may be typed `u32` const expressions. Expressions that
+///   depend on a generic parameter currently require Rust's
+///   `generic_const_exprs` feature.
+///
+/// The first value is a maximum, not an exact launch shape. When a kernel also
+/// has `#[launch_contract(domain = ...)]`, each policy specialization carries
+/// its evaluated maximum into the host contract. Preparation rejects a larger
+/// block before the CUDA launch call.
 ///
 /// # Requirements
 ///
@@ -4238,12 +5899,15 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args: LaunchBoundsArgs = parse_macro_input!(attr as LaunchBoundsArgs);
     let mut input = parse_macro_input!(item as ItemFn);
 
-    let max_threads = args.max_threads;
-    let min_blocks = args.min_blocks;
+    let max_threads = &args.max_threads.expr;
+    let min_blocks = &args.min_blocks.expr;
+
+    add_const_evaluatable_bound(&mut input.sig.generics, &args.max_threads);
+    add_const_evaluatable_bound(&mut input.sig.generics, &args.min_blocks);
 
     // Inject the launch bounds config marker at the start of the function body
     let marker_call: syn::Stmt = syn::parse_quote! {
-        ::cuda_device::thread::__launch_bounds_config::<#max_threads, #min_blocks>();
+        ::cuda_device::thread::__launch_bounds_config::<{ #max_threads }, { #min_blocks }>();
     };
 
     // Prepend the marker to the function body
@@ -4266,16 +5930,18 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// use cuda_device::{kernel, launch_bounds, launch_contract, DisjointSlice};
 ///
-/// #[kernel]
+/// #[kernel(launch_context = launch_context)]
 /// #[launch_bounds(256)]
 /// #[launch_contract(
 ///     domain = 1,
+///     coordinates = u32,
 ///     block = (256, 1, 1),
 ///     dynamic_shared = 0,
 ///     min_compute_capability = (8, 0),
 /// )]
 /// pub fn map(mut output: DisjointSlice<f32>) {
-///     // ...
+///     let index = thread::index_1d_u32(launch_context);
+///     // use `index` with a proof-carrying view...
 /// }
 /// ```
 ///
@@ -4284,6 +5950,18 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[cuda_module]` cross-checks the declaration against `DisjointSlice` index
 /// spaces and the fixed cluster shape.
 ///
+/// `coordinates = u32` opts into narrow, proof-carrying coordinate APIs such
+/// as `thread::index_1d_u32(launch_context)`. The generated prepared launch checks each
+/// axis:
+///
+/// ```text
+/// grid_axis * block_axis <= 2^32
+/// ```
+///
+/// This keeps zero-based global coordinates representable by `u32`. Generated
+/// raw launch methods remain unsafe because their caller must uphold this and
+/// the rest of the declared contract without preparation.
+///
 /// Dynamic shared memory may be fixed with `dynamic_shared = BYTES` or bounded
 /// with `dynamic_shared_range = (MIN, MAX)`. The byte extent remains an author
 /// contract because arbitrary pointer arithmetic cannot be inferred. When the
@@ -4291,50 +5969,240 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// removed before code generation. The declared `dynamic_shared_alignment`
 /// therefore becomes a minimum alignment in generated PTX without adding
 /// kernel hot-path instructions.
+///
+/// A `#[launch_bounds(P::MAX_THREADS, ...)]` maximum may depend on a generic
+/// policy. The generated host contract evaluates it separately for each
+/// specialization. An explicit `block = (x, y, z)` remains exact and must fit
+/// within every policy maximum used with that specialization.
+/// A non-policy constant used for that maximum must be visible at module scope,
+/// because the host contract is generated beside the kernel function.
+///
+/// # Size requirements: `requires`
+///
+/// `requires = (relation, ...)` writes down, next to the kernel, the size
+/// relationships its buffers and scalars must satisfy for every access to be
+/// in bounds. The generated launcher checks them once per launch, on the
+/// CPU, and refuses to launch (with a typed error naming the failed
+/// relation) instead of letting an undersized buffer fault mid-kernel:
+///
+/// ```ignore
+/// #[launch_contract(domain = 2, coordinates = u32, block = (16, 16, 1),
+///     requires = (a.len() >= m * k, b.len() >= k * n, c.len() >= m * n))]
+/// ```
+///
+/// Each relation is one comparison (`>=`, `>`, `<=`, `<`, `==`, `!=`) between
+/// expressions built from slice or `DisjointSlice` parameters as
+/// `<param>.len()`, unsigned integer scalar parameters (`u8`/`u16`/`u32`/
+/// `u64`/`usize`) used directly, integer literals, parentheses, and the
+/// arithmetic operators `+`, `-`, `*`. Comma-separated relations are
+/// implicitly ANDed; each is checked separately with its own error.
+///
+/// The grammar is deliberately tiny rather than arbitrary Rust, for two
+/// reasons. Every identifier is validated against the kernel's actual
+/// parameter list, so a typo is a compile error instead of a check against
+/// the wrong value. And every `+`/`-`/`*` compiles to checked `u64`
+/// arithmetic, so a huge `m * k` cannot wrap around to a small number and
+/// falsely pass.
+///
+/// Every checked launcher generated by `#[cuda_module]` (the sync prepared
+/// launcher and, with the `async` feature, the `_async` and `_async_owned`
+/// twins) evaluates every relation once at launch time, before any argument
+/// is handed to the driver. Evaluation widens every operand to `u64` and uses checked
+/// arithmetic: a false relation fails with
+/// `LaunchContractError::SizeRequirementViolated` (carrying the relation's source
+/// text and both evaluated sides) and arithmetic leaving the `u64` range
+/// fails with `LaunchContractError::SizeRequirementOverflow`, so a bad launch is
+/// rejected on the CPU instead of trapping mid-kernel. The generated
+/// `_unchecked` escape hatches intentionally skip these checks, exactly as
+/// they skip the geometry checks; their safety contract passes the
+/// obligation to the caller.
+///
+/// The relations are **enforced only by `#[cuda_module]`-generated
+/// launchers**. On a kernel outside any `#[cuda_module]`, this attribute
+/// still validates every relation for well-formedness at compile time
+/// (unknown identifiers and unsupported grammar are errors at the attribute
+/// site), but no launcher exists to evaluate the relations at runtime. That
+/// is the same enforcement story as `dynamic_shared`.
+///
+/// An exact `block` is the one key that also holds without a generated
+/// launcher. The shape reaches the device compiler as `.reqntid x, y, z`, and
+/// the CUDA driver refuses any launch whose block differs on any axis, so a
+/// standalone contracted kernel and an `_unchecked` raw launch are both
+/// covered. `.reqntid` and `.maxntid` cannot appear on one entry, so a kernel
+/// declaring an exact `block` emits `.reqntid` in place of the maximum that
+/// `#[launch_bounds]` would otherwise contribute.
 #[proc_macro_attribute]
 pub fn launch_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as LaunchContractArgs);
     let mut input = parse_macro_input!(item as ItemFn);
 
-    inject_launch_contract_alignment_marker(&args, &mut input);
+    // Validate `requires` here too, so a standalone contract (outside any
+    // #[cuda_module]) rejects typos and bad grammar at the attribute site
+    // instead of silently dropping the relations. Inside a #[cuda_module]
+    // the module macro validates first against the source signature; a
+    // module-level rejection replaces the whole module with the error, so
+    // this attribute never expands there and the two validations cannot
+    // stack duplicate diagnostics.
+    if !args.requires.is_empty()
+        && let Some(params) = standalone_requires_params(&input)
+        && let Err(error) = validate_requires_relations(&args.requires, &params)
+    {
+        return error.to_compile_error().into();
+    }
+
+    inject_launch_contract_markers(&args, &mut input);
 
     quote! { #input }.into()
 }
 
-fn inject_launch_contract_alignment_marker(args: &LaunchContractArgs, input: &mut ItemFn) {
+/// Best-effort parameter model for validating `requires` relations on the
+/// function the `launch_contract` attribute macro receives.
+///
+/// Returns `None` when the function is a macro-generated generic entry
+/// wrapper: its parameters carry synthetic `__cuda_oxide_arg_*` names, so
+/// source-level relation identifiers cannot be resolved against it. Those
+/// relations were already validated against the source signature, either by
+/// the `#[cuda_module]` expansion or by `#[kernel]`'s generic routing (see
+/// [`validate_routed_launch_contract_requires`]). Parameter shapes the
+/// module marshaller rejects, reachable only outside `#[cuda_module]`, are
+/// modelled as opaque scalars: referencing one in `requires` then fails with
+/// the precise grammar error rather than a misleading "unknown identifier".
+fn standalone_requires_params(item_fn: &ItemFn) -> Option<Vec<CudaModuleParam>> {
+    requires_params_from_inputs(&item_fn.sig.inputs)
+}
+
+/// Shared core of [`standalone_requires_params`], usable with a saved copy
+/// of a kernel's original inputs before scope parameters are appended or
+/// wrapper signatures are synthesized.
+fn requires_params_from_inputs(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+) -> Option<Vec<CudaModuleParam>> {
+    let mut params = Vec::new();
+    for arg in inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            continue;
+        };
+        let Pat::Ident(pat_ident) = &*pat_type.pat else {
+            continue;
+        };
+        if pat_ident.ident.to_string().starts_with("__cuda_oxide_arg_") {
+            return None;
+        }
+        let ty = &pat_type.ty;
+        let param = cuda_module_param_from_typed(pat_type).unwrap_or_else(|_| CudaModuleParam {
+            name: pat_ident.ident.clone(),
+            sync_host_ty: quote! { #ty },
+            async_host_ty: quote! { #ty },
+            marshal: CudaModuleParamMarshal::Scalar,
+            mutable_slice: false,
+            disjoint_slice_ty: None,
+            disjoint_slice_elem: None,
+            uniform_ty: None,
+            uniform_scalar: None,
+            scalar_int: scalar_int_class(ty),
+        });
+        params.push(param);
+    }
+    Some(params)
+}
+
+/// Validate the `requires` relations of any `#[launch_contract]` attribute
+/// that `#[kernel]` is about to route onto a generated generic entry
+/// wrapper.
+///
+/// The wrapper's parameters carry synthetic `__cuda_oxide_arg_*` names, so
+/// when the attribute macro finally expands there it cannot resolve
+/// source-level identifiers and deliberately stands down (see
+/// [`standalone_requires_params`]). Without this check, a typo'd relation on
+/// a standalone generic kernel would compile clean while the identical
+/// non-generic kernel errors. Malformed argument lists are skipped here: the
+/// attribute macro reports those itself when it expands.
+fn validate_routed_launch_contract_requires(
+    attrs: &[syn::Attribute],
+    source_inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+) -> syn::Result<()> {
+    for attr in attrs {
+        if !attr_path_ends_with(attr, "launch_contract") {
+            continue;
+        }
+        let Ok(args) = attr.parse_args::<LaunchContractArgs>() else {
+            continue;
+        };
+        if args.requires.is_empty() {
+            continue;
+        }
+        if let Some(params) = requires_params_from_inputs(source_inputs) {
+            validate_requires_relations(&args.requires, &params)?;
+        }
+    }
+    Ok(())
+}
+
+fn inject_launch_contract_markers(args: &LaunchContractArgs, input: &mut ItemFn) {
+    let domain = args.domain;
+    let u32_coordinates = args.u32_coordinates;
+    let contract_marker: syn::Stmt = parse_quote! {
+        unsafe {
+            ::cuda_device::thread::__launch_contract_config::<#domain, #u32_coordinates>();
+        }
+    };
+    input.block.stmts.insert(0, contract_marker);
+    let mut next = 1;
+
+    // Give the exact block shape to the device compiler as well, so ptxas
+    // emits `.reqntid` and the driver rejects a mismatched block on every
+    // axis. Without this the shape is known only to the host check.
+    if let Some((x, y, z)) = args.exact_block {
+        let block_marker: syn::Stmt = parse_quote! {
+            ::cuda_device::thread::__launch_contract_block_config::<#x, #y, #z>();
+        };
+        input.block.stmts.insert(next, block_marker);
+        next += 1;
+    }
+
     if dynamic_shared_max(args.dynamic_shared) != 0 {
         let alignment = args.dynamic_shared_alignment as usize;
         let alignment_marker: syn::Stmt = parse_quote! {
             ::cuda_device::shared::__dynamic_shared_alignment::<#alignment>();
         };
-        input.block.stmts.insert(0, alignment_marker);
+        input.block.stmts.insert(next, alignment_marker);
     }
 }
 
 /// Arguments for `#[launch_bounds(...)]` attribute.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 struct LaunchBoundsArgs {
-    max_threads: u32,
-    min_blocks: u32,
+    max_threads: ConstU32Expr,
+    min_blocks: ConstU32Expr,
 }
 
 impl Parse for LaunchBoundsArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let args: Punctuated<syn::LitInt, Token![,]> = Punctuated::parse_terminated(input)?;
-        let values: Vec<u32> = args
-            .iter()
-            .map(|lit| lit.base10_parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?;
+        let args: Punctuated<Expr, Token![,]> = Punctuated::parse_terminated(input)?;
+        let values = args
+            .into_iter()
+            .map(ConstU32Expr::new)
+            .collect::<syn::Result<Vec<_>>>()?;
 
         match values.len() {
-            1 => Ok(LaunchBoundsArgs {
-                max_threads: values[0],
-                min_blocks: 0, // Unspecified
-            }),
-            2 => Ok(LaunchBoundsArgs {
-                max_threads: values[0],
-                min_blocks: values[1],
-            }),
+            1 => {
+                let max_threads = values.into_iter().next().unwrap();
+                validate_literal_max_threads(&max_threads)?;
+                Ok(LaunchBoundsArgs {
+                    max_threads,
+                    min_blocks: ConstU32Expr::literal(0),
+                })
+            }
+            2 => {
+                let mut values = values.into_iter();
+                let max_threads = values.next().unwrap();
+                let min_blocks = values.next().unwrap();
+                validate_literal_max_threads(&max_threads)?;
+                Ok(LaunchBoundsArgs {
+                    max_threads,
+                    min_blocks,
+                })
+            }
             _ => Err(syn::Error::new(
                 input.span(),
                 "launch_bounds expects 1 or 2 parameters: #[launch_bounds(max_threads)] or #[launch_bounds(max_threads, min_blocks)]",
@@ -4343,35 +6211,178 @@ impl Parse for LaunchBoundsArgs {
     }
 }
 
+/// A source expression whose expected type is `u32` at the generated marker.
+///
+/// Literal values are retained for early source-time diagnostics. Every other
+/// expression stays as typed Rust syntax: rustc, not this procedural macro,
+/// resolves associated constants and arithmetic for both device metadata and
+/// each monomorphized host launch contract.
+#[derive(Clone)]
+struct ConstU32Expr {
+    expr: Expr,
+    literal_value: Option<u32>,
+}
+
+impl ConstU32Expr {
+    fn new(expr: Expr) -> syn::Result<Self> {
+        let literal_value = match &expr {
+            Expr::Lit(expr_lit) => match &expr_lit.lit {
+                syn::Lit::Int(value) => Some(value.base10_parse::<u32>()?),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(Self {
+            expr,
+            literal_value,
+        })
+    }
+
+    fn literal(value: u32) -> Self {
+        Self {
+            expr: parse_quote! { #value },
+            literal_value: Some(value),
+        }
+    }
+}
+
+fn validate_literal_max_threads(value: &ConstU32Expr) -> syn::Result<()> {
+    if value.literal_value == Some(0) {
+        Err(syn::Error::new_spanned(
+            &value.expr,
+            "launch_bounds maximum threads must be greater than zero",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns whether an expression names one of the function's type or const
+/// parameters and therefore needs a signature-level evaluatability witness.
+///
+/// Non-generic paths deliberately return false. In particular, a const item
+/// declared inside the function body is in scope at the generated marker but
+/// is not in scope in the function signature.
+fn const_expr_depends_on_generics(expr: &Expr, generics: &syn::Generics) -> bool {
+    let generic_names: Vec<&Ident> = generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            GenericParam::Type(parameter) => Some(&parameter.ident),
+            GenericParam::Const(parameter) => Some(&parameter.ident),
+            GenericParam::Lifetime(_) => None,
+        })
+        .collect();
+    if generic_names.is_empty() {
+        return false;
+    }
+
+    struct GenericReference<'a> {
+        generic_names: &'a [&'a Ident],
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for GenericReference<'_> {
+        fn visit_path(&mut self, path: &'ast Path) {
+            if path.segments.iter().any(|segment| {
+                self.generic_names
+                    .iter()
+                    .any(|generic| segment.ident == **generic)
+            }) {
+                self.found = true;
+                return;
+            }
+            visit::visit_path(self, path);
+        }
+    }
+
+    let mut visitor = GenericReference {
+        generic_names: &generic_names,
+        found: false,
+    };
+    visitor.visit_expr(expr);
+    visitor.found
+}
+
+/// Make a generic constant expression evaluatable at each monomorphization.
+///
+/// rustc requires this bound for expressions such as `P::MAX_THREADS`. The
+/// marker itself supplies the expected `u32` type; the array length is only an
+/// evaluatability witness and never reaches device code.
+fn add_const_evaluatable_bound(generics: &mut syn::Generics, value: &ConstU32Expr) {
+    if value.literal_value.is_some() || !const_expr_depends_on_generics(&value.expr, generics) {
+        return;
+    }
+    let expr = &value.expr;
+    let predicate: syn::WherePredicate = parse_quote! {
+        [(); (#expr) as usize]:
+    };
+    generics.make_where_clause().predicates.push(predicate);
+}
+
+fn add_launch_bounds_evaluatability_from_attrs(input: &mut ItemFn) -> syn::Result<()> {
+    let matching: Vec<_> = input
+        .attrs
+        .iter()
+        .filter(|attr| attr_path_ends_with(attr, "launch_bounds"))
+        .collect();
+    if matching.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            matching[1],
+            "a kernel may have only one launch_bounds attribute",
+        ));
+    }
+    let Some(attr) = matching.first() else {
+        return Ok(());
+    };
+    let bounds = attr.parse_args::<LaunchBoundsArgs>()?;
+    let max_threads = bounds.max_threads.clone();
+    let min_blocks = bounds.min_blocks.clone();
+    add_const_evaluatable_bound(&mut input.sig.generics, &max_threads);
+    add_const_evaluatable_bound(&mut input.sig.generics, &min_blocks);
+    Ok(())
+}
+
 /// Arguments for the `#[unroll]` / `#[unroll(N)]` attribute.
 ///
 /// Bare `#[unroll]` parses to factor `0` (full unroll); `#[unroll(N)]` requires
 /// `N >= 2`.
 struct UnrollArgs {
-    factor: u32,
+    factor: ConstU32Expr,
 }
 
 impl Parse for UnrollArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         // Bare `#[unroll]` => full unroll (factor 0).
         if input.is_empty() {
-            return Ok(UnrollArgs { factor: 0 });
+            return Ok(UnrollArgs {
+                factor: ConstU32Expr::literal(0),
+            });
         }
 
-        let args: Punctuated<syn::LitInt, Token![,]> = Punctuated::parse_terminated(input)?;
-        let values: Vec<u32> = args
-            .iter()
-            .map(|lit| lit.base10_parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?;
+        let args: Punctuated<Expr, Token![,]> = Punctuated::parse_terminated(input)?;
+        let mut values = args
+            .into_iter()
+            .map(ConstU32Expr::new)
+            .collect::<syn::Result<Vec<_>>>()?;
 
         match values.len() {
-            1 if values[0] >= 2 => Ok(UnrollArgs { factor: values[0] }),
-            1 => Err(syn::Error::new_spanned(
-                args.first().unwrap(),
-                "partial unroll factor must be at least 2; use #[unroll] for full unrolling",
-            )),
-            _ => Err(syn::Error::new_spanned(
-                args.first().unwrap(),
+            1 => {
+                let factor = values.pop().unwrap();
+                match factor.literal_value {
+                    Some(0 | 1) => Err(syn::Error::new_spanned(
+                        &factor.expr,
+                        "partial unroll factor must be at least 2; use #[unroll] for full unrolling",
+                    )),
+                    Some(value) if value > 1024 => Err(syn::Error::new_spanned(
+                        &factor.expr,
+                        "partial unroll factor cannot exceed 1024",
+                    )),
+                    _ => Ok(UnrollArgs { factor }),
+                }
+            }
+            _ => Err(syn::Error::new(
+                input.span(),
                 "unroll expects no argument (full unroll) or one factor: #[unroll] or #[unroll(N)]",
             )),
         }
@@ -4407,6 +6418,7 @@ struct LoopUnrollAttrVisitor {
     /// First parse error encountered (e.g. a malformed `#[unroll(...)]`). The
     /// caller surfaces this as a compile error.
     error: Option<syn::Error>,
+    const_expressions: Vec<ConstU32Expr>,
 }
 
 impl LoopUnrollAttrVisitor {
@@ -4414,7 +6426,7 @@ impl LoopUnrollAttrVisitor {
     /// return the parsed factor. Returns `None` when no `unroll` attribute is
     /// present (leaving `attrs` untouched). Records a parse error and returns
     /// `None` if the attribute is malformed.
-    fn take_unroll_factor(&mut self, attrs: &mut Vec<syn::Attribute>) -> Option<u32> {
+    fn take_unroll_factor(&mut self, attrs: &mut Vec<syn::Attribute>) -> Option<ConstU32Expr> {
         let idx = attrs
             .iter()
             .position(|attr| attr.path().is_ident("unroll"))?;
@@ -4422,7 +6434,7 @@ impl LoopUnrollAttrVisitor {
 
         // `#[unroll]` (bare) is `Meta::Path`; `#[unroll(N)]` is `Meta::List`.
         let factor = match &attr.meta {
-            syn::Meta::Path(_) => 0u32,
+            syn::Meta::Path(_) => ConstU32Expr::literal(0),
             syn::Meta::List(list) => match list.parse_args::<UnrollArgs>() {
                 Ok(parsed) => parsed.factor,
                 Err(err) => {
@@ -4442,13 +6454,17 @@ impl LoopUnrollAttrVisitor {
                 return None;
             }
         };
+        if factor.literal_value.is_none() {
+            self.const_expressions.push(factor.clone());
+        }
         Some(factor)
     }
 
     /// Build the `__unroll_config::<FACTOR>()` marker statement.
-    fn marker_stmt(factor: u32) -> Stmt {
+    fn marker_stmt(factor: &ConstU32Expr) -> Stmt {
+        let expr = &factor.expr;
         parse_quote! {
-            cuda_device::thread::__unroll_config::<#factor>();
+            cuda_device::thread::__unroll_config::<{ #expr }>();
         }
     }
 }
@@ -4461,17 +6477,17 @@ impl VisitMut for LoopUnrollAttrVisitor {
         match expr {
             Expr::ForLoop(for_loop) => {
                 if let Some(factor) = self.take_unroll_factor(&mut for_loop.attrs) {
-                    for_loop.body.stmts.insert(0, Self::marker_stmt(factor));
+                    for_loop.body.stmts.insert(0, Self::marker_stmt(&factor));
                 }
             }
             Expr::While(while_loop) => {
                 if let Some(factor) = self.take_unroll_factor(&mut while_loop.attrs) {
-                    while_loop.body.stmts.insert(0, Self::marker_stmt(factor));
+                    while_loop.body.stmts.insert(0, Self::marker_stmt(&factor));
                 }
             }
             Expr::Loop(loop_expr) => {
                 if let Some(factor) = self.take_unroll_factor(&mut loop_expr.attrs) {
-                    loop_expr.body.stmts.insert(0, Self::marker_stmt(factor));
+                    loop_expr.body.stmts.insert(0, Self::marker_stmt(&factor));
                 }
             }
             _ => {}
@@ -4488,10 +6504,13 @@ impl VisitMut for LoopUnrollAttrVisitor {
 fn rewrite_loop_unroll_attrs(input: &mut ItemFn) -> syn::Result<()> {
     let mut visitor = LoopUnrollAttrVisitor::default();
     visitor.visit_block_mut(&mut input.block);
-    match visitor.error {
-        Some(err) => Err(err),
-        None => Ok(()),
+    if let Some(err) = visitor.error {
+        return Err(err);
     }
+    for expression in &visitor.const_expressions {
+        add_const_evaluatable_bound(&mut input.sig.generics, expression);
+    }
+    Ok(())
 }
 
 /// Specifies compile-time cluster dimensions for a kernel.
@@ -4706,8 +6725,8 @@ pub fn cooperative_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// test, an unchanging limit, and no exit besides the normal header test.
 ///
 /// One annotation may create at most 1,024 body copies, 8,192 cloned basic
-/// blocks, and 65,536 cloned operations. Unsupported or larger requests warn
-/// and are not unrolled.
+/// blocks, and 65,536 cloned operations. Factors above 1,024 are rejected;
+/// unsupported loop shapes warn and are not unrolled.
 ///
 /// # Example: Device Function Definition
 ///
@@ -4747,6 +6766,7 @@ pub fn cooperative_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    track_codegen_environment();
     // Try parsing as a function definition first
     if let Ok(input) = syn::parse::<ItemFn>(item.clone()) {
         return generate_device_function(input);
@@ -4790,7 +6810,7 @@ fn generate_device_function(mut input: ItemFn) -> TokenStream {
     if let Err(err) = rewrite_loop_unroll_attrs(&mut input) {
         return err.to_compile_error().into();
     }
-    inject_thread_index_scope(&mut input);
+    inject_device_thread_index_scope(&mut input);
 
     let fn_name = input.sig.ident.clone();
     let vis = input.vis.clone();
@@ -5266,14 +7286,6 @@ impl Parse for CudaLaunchInput {
             let _ = input.parse::<Token![,]>();
         }
 
-        if cluster_dim.is_some() && cooperative.is_some() {
-            return Err(syn::Error::new(
-                input.span(),
-                "cuda_launch!: `cluster_dim` and `cooperative` are mutually exclusive — \
-                 cooperative cluster launches are not yet supported by this macro",
-            ));
-        }
-
         Ok(CudaLaunchInput {
             kernel: kernel.ok_or_else(|| syn::Error::new(input.span(), "missing 'kernel'"))?,
             stream: stream.ok_or_else(|| syn::Error::new(input.span(), "missing 'stream'"))?,
@@ -5350,7 +7362,9 @@ impl Parse for CudaLaunchInput {
 /// | `cooperative` | `bool`            | *(optional)* Set `true` to launch via `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` (required for `grid::sync()`) |
 /// | `args`        | `[arg, ...]`      | Kernel arguments (see below)                  |
 ///
-/// `cluster_dim` and `cooperative` are mutually exclusive at this layer.
+/// `cluster_dim` and `cooperative` may be combined. When both are set and
+/// `cooperative` is `true`, the expansion calls
+/// `cuda_core::launch_kernel_ex_cooperative_on_stream`.
 ///
 /// # Argument forms
 ///
@@ -5367,8 +7381,12 @@ impl Parse for CudaLaunchInput {
 /// `stream.synchronize()` to wait for completion.
 #[proc_macro]
 pub fn cuda_launch(input: TokenStream) -> TokenStream {
+    track_codegen_environment();
     let input = parse_macro_input!(input as CudaLaunchInput);
+    expand_cuda_launch(input).into()
+}
 
+fn expand_cuda_launch(input: CudaLaunchInput) -> TokenStream2 {
     let stream = &input.stream;
     let module = &input.module;
     let config = &input.config;
@@ -5478,13 +7496,40 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
         format_ident!("{}{}", INSTANTIATE_PREFIX, kernel_base),
     );
 
-    // Generate the launch call — regular, cluster, or cooperative.
+    // Generate the launch call — regular, cluster, cooperative, or both.
     //
     // All paths use the stream-aware cuda_core helpers. Those helpers bind the
     // stream's owning CUDA context to the calling thread and then delegate to
     // the raw cuLaunchKernel/cuLaunchKernelEx wrappers.
-    let launch_call = if let Some(cdim) = cluster_dim {
-        quote! {
+    let launch_call = match (&cluster_dim, &cooperative) {
+        (Some(cdim), Some(coop)) => quote! {
+            {
+                let #config_ident = #config;
+                let #cooperative_ident: bool = #coop;
+                if #cooperative_ident {
+                    cuda_core::launch_kernel_ex_cooperative_on_stream(
+                        &#function_ident,
+                        #config_ident.grid_dim,
+                        #config_ident.block_dim,
+                        #config_ident.shared_mem_bytes,
+                        #cdim,
+                        (#stream).as_ref(),
+                        &mut #args_ident,
+                    )
+                } else {
+                    cuda_core::launch_kernel_ex_on_stream(
+                        &#function_ident,
+                        #config_ident.grid_dim,
+                        #config_ident.block_dim,
+                        #config_ident.shared_mem_bytes,
+                        #cdim,
+                        (#stream).as_ref(),
+                        &mut #args_ident,
+                    )
+                }
+            }
+        },
+        (Some(cdim), None) => quote! {
             {
                 let #config_ident = #config;
                 cuda_core::launch_kernel_ex_on_stream(
@@ -5497,9 +7542,8 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
                     &mut #args_ident,
                 )
             }
-        }
-    } else if let Some(coop) = cooperative {
-        quote! {
+        },
+        (None, Some(coop)) => quote! {
             {
                 let #config_ident = #config;
                 let #cooperative_ident: bool = #coop;
@@ -5523,9 +7567,8 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
                     )
                 }
             }
-        }
-    } else {
-        quote! {
+        },
+        (None, None) => quote! {
             {
                 let #config_ident = #config;
                 cuda_core::launch_kernel_on_stream(
@@ -5537,10 +7580,10 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
                     &mut #args_ident,
                 )
             }
-        }
+        },
     };
 
-    let expanded = if has_closure {
+    if has_closure {
         let closure_expr = closure_info.expect("has_closure but no closure_info");
 
         // The on-wire PTX name comes from the kernel's
@@ -5608,9 +7651,7 @@ pub fn cuda_launch(input: TokenStream) -> TokenStream {
                 #launch_call
             }
         }
-    };
-
-    TokenStream::from(expanded)
+    }
 }
 
 // ============================================================================
@@ -5781,6 +7822,7 @@ impl Parse for CudaLaunchAsyncInput {
 /// ```
 #[proc_macro]
 pub fn cuda_launch_async(input: TokenStream) -> TokenStream {
+    track_codegen_environment();
     let input = parse_macro_input!(input as CudaLaunchAsyncInput);
     expand_cuda_launch_async(input).into()
 }
@@ -5925,6 +7967,7 @@ fn expand_cuda_launch_async(input: CudaLaunchAsyncInput) -> TokenStream2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reserved_oxide_symbols::PTX_MERGE_REQUIRED_PREFIX;
 
     /// Expands a `#[cuda_module]` body and returns the generated tokens as a
     /// whitespace-free string, so tests can assert on call paths without
@@ -5934,6 +7977,108 @@ mod tests {
             .expect("cuda_module expansion failed")
             .to_string()
             .replace(' ', "")
+    }
+
+    /// Expands a `#[cuda_module]` body with the host surface suppressed.
+    fn expand_device_only_to_compact_string(module: ItemMod) -> String {
+        expand_cuda_module_inner(module, false)
+            .expect("cuda_module expansion failed")
+            .to_string()
+            .replace(' ', "")
+    }
+
+    fn one_kernel_module() -> ItemMod {
+        parse_quote! {
+            mod kernels {
+                #[kernel]
+                fn scale(out: *mut f32) {}
+            }
+        }
+    }
+
+    /// With the host surface off, nothing in the expansion may name the
+    /// `cuda-host` -> `cuda-core` -> `cuda-bindings` -> `cuda.h` stack. That is
+    /// the whole point of the feature: a crate that only compiles kernels
+    /// should not have to build it.
+    #[test]
+    fn device_only_cuda_module_names_no_host_crate() {
+        let expanded = expand_device_only_to_compact_string(one_kernel_module());
+        assert!(
+            !expanded.contains("cuda_host"),
+            "device-only expansion must not name cuda_host: {expanded}"
+        );
+        assert!(
+            !expanded.contains("cuda_core"),
+            "device-only expansion must not name cuda_core: {expanded}"
+        );
+        assert!(
+            !expanded.contains("LoadedModule"),
+            "device-only expansion must not emit the loader type: {expanded}"
+        );
+    }
+
+    /// Gating must remove only the host surface. The kernel itself still has
+    /// to reach the codegen collector.
+    #[test]
+    fn device_only_cuda_module_still_emits_the_kernel() {
+        let expanded = expand_device_only_to_compact_string(one_kernel_module());
+        assert!(
+            expanded.contains("#[kernel]fnscale"),
+            "the kernel must survive gating: {expanded}"
+        );
+    }
+
+    /// The default build is unchanged: this is the additive half of the
+    /// contract, and existing consumers depend on it.
+    #[test]
+    fn host_cuda_module_still_emits_the_loader() {
+        let expanded = expand_to_compact_string(one_kernel_module());
+        assert!(
+            expanded.contains("::cuda_host::") && expanded.contains("LoadedModule"),
+            "host expansion must keep the loader: {expanded}"
+        );
+    }
+
+    /// A nested inline module gets its own `LoadedModule`, so it needs the
+    /// same gate as the outer one.
+    #[test]
+    fn device_only_nested_module_emits_no_loader() {
+        let module: ItemMod = parse_quote! {
+            mod outer {
+                mod inner {
+                    #[kernel]
+                    fn scale(out: *mut f32) {}
+                }
+            }
+        };
+        let expanded = expand_device_only_to_compact_string(module);
+        assert!(
+            !expanded.contains("LoadedModule") && !expanded.contains("cuda_host"),
+            "nested device-only expansion must emit no loader: {expanded}"
+        );
+    }
+
+    /// A bare `#[kernel]` outside any `#[cuda_module]` carries its own
+    /// `CudaKernel` impl, the other reference a kernel-only crate cannot
+    /// resolve.
+    #[test]
+    fn bare_kernel_marker_impl_is_host_only() {
+        let func: ItemFn = parse_quote! {
+            fn scale(out: *mut f32) {}
+        };
+        let name = format_ident!("scale");
+
+        let device_only = generate_cuda_kernel_impl(&name, "scale", &func, false).to_string();
+        assert!(
+            device_only.is_empty(),
+            "device-only build must emit no marker impl: {device_only}"
+        );
+
+        let host = generate_cuda_kernel_impl(&name, "scale", &func, true).to_string();
+        assert!(
+            host.contains("CudaKernel"),
+            "host build must keep the marker impl: {host}"
+        );
     }
 
     #[test]
@@ -6052,6 +8197,81 @@ mod tests {
             expanded.contains("mixed_ptx_name::<T,N>()"),
             "typed launch must forward type and const arguments to the name helper:\n{expanded}"
         );
+        assert!(
+            expanded.contains(PTX_MERGE_REQUIRED_PREFIX),
+            "generic cuda_module must emit the compiler-visible PTX-merge marker:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn non_generic_cuda_module_does_not_emit_ptx_merge_marker() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn plain(output: &mut [u32]) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            !expanded.contains(PTX_MERGE_REQUIRED_PREFIX),
+            "non-generic cuda_module must remain eligible for cubin materialization:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn cfg_gated_generic_uses_the_same_gate_for_marker_and_loader() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn plain(output: &mut [u32]) {}
+
+                #[cfg(feature = "generic")]
+                #[kernel]
+                pub fn optional<T: Copy>(value: T) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        let marker = ptx_merge_required_marker("optional");
+
+        assert!(
+            expanded.contains(&format!(
+                "#[cfg(feature=\"generic\")]#[doc(hidden)]#[used]#[allow(dead_code,non_upper_case_globals)]static{marker}:u8=0"
+            )),
+            "marker must inherit the generic kernel's cfg:\n{expanded}"
+        );
+        assert!(
+            expanded.contains(
+                "#[cfg(feature=\"generic\")]let_={__cuda_oxide_has_enabled_generic_kernel=true;};"
+            ),
+            "loader selection must inherit the generic kernel's cfg:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("if__cuda_oxide_has_enabled_generic_kernel{let_=name;::cuda_host::load_all_ptx_bundles_merged(ctx)?}else{::cuda_host::load_embedded_module(ctx,name)?}"),
+            "loader must fall back to the embedded artifact when no generic kernel is enabled:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn nested_generic_marker_inherits_every_ancestor_cfg() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[cfg(feature = "outer")]
+                mod nested {
+                    #[cfg(target_os = "linux")]
+                    #[kernel]
+                    pub fn map<T: Copy>(value: T) {}
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        let marker = ptx_merge_required_marker("map");
+        assert!(
+            expanded.contains(&format!(
+                "#[cfg(feature=\"outer\")]#[cfg(target_os=\"linux\")]#[doc(hidden)]#[used]#[allow(dead_code,non_upper_case_globals)]static{marker}:u8=0"
+            )),
+            "root marker must use the nested kernel's effective cfg chain:\n{expanded}"
+        );
     }
 
     #[test]
@@ -6125,6 +8345,31 @@ mod tests {
         assert!(
             !expanded.contains("launch_kernel_ex_on_stream"),
             "cluster-only call should be replaced by the combined one:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn cuda_launch_accepts_combined_cluster_and_cooperative() {
+        let input: CudaLaunchInput = parse_quote! {
+            kernel: clustered_grid_sync_kernel,
+            stream: stream,
+            module: module,
+            config: config,
+            cluster_dim: (2, 1, 1),
+            cooperative: true,
+            args: []
+        };
+        assert!(input.cluster_dim.is_some());
+        assert!(input.cooperative.is_some());
+
+        let expanded = expand_cuda_launch(input).to_string().replace(' ', "");
+        assert!(
+            expanded.contains("launch_kernel_ex_cooperative_on_stream"),
+            "expected combined cluster+cooperative cuda_launch expansion:\n{expanded}"
+        );
+        assert!(
+            !expanded.contains("launch_kernel_cooperative_on_stream"),
+            "non-cluster cooperative helper must not be used when cluster_dim is set:\n{expanded}"
         );
     }
 
@@ -6286,7 +8531,8 @@ mod tests {
             }
         };
         let items = &module.content.expect("inline module").1;
-        let transformed = transform_cuda_module_items(items, &mut Vec::new(), &[], false).unwrap();
+        let transformed =
+            transform_cuda_module_items(items, &mut Vec::new(), &[], false, true).unwrap();
         let kernel = transformed
             .kernels
             .iter()
@@ -6337,6 +8583,7 @@ mod tests {
                 #[launch_bounds(256)]
                 #[launch_contract(
                     domain = 1,
+                    coordinates = u32,
                     block = (256, 1, 1),
                     dynamic_shared = 1024,
                     dynamic_shared_alignment = 128,
@@ -6364,6 +8611,423 @@ mod tests {
         assert!(expanded.contains("__cuda_oxide_config:::cuda_core::LaunchConfig"));
         assert!(expanded.contains("min_alignment:128u32"));
         assert!(expanded.contains("with_min_compute_capability(8u32,0u32)"));
+        assert!(expanded.contains("with_u32_coordinates()"));
+    }
+
+    #[test]
+    fn kernel_launch_context_uses_the_contract_domain_and_coordinate_width_in_either_order() {
+        let mut attributed: ItemFn = parse_quote! {
+            #[launch_contract(domain = 1, coordinates = u32, block = (64, 1, 1))]
+            fn attributed() {
+                let _ = thread::index_1d_u32(launch_context);
+            }
+        };
+        let scope = explicit_kernel_scope(&mut attributed, format_ident!("launch_context"));
+        attributed
+            .block
+            .stmts
+            .splice(0..0, explicit_kernel_scope_bindings(&scope));
+        let attributed = quote!(#attributed).to_string().replace(' ', "");
+        assert!(attributed.contains("make_kernel_scope::<::cuda_device::thread::__internal::Domain1,::cuda_device::thread::__internal::U32Coordinates>"));
+        assert!(attributed.contains("letlaunch_context:::cuda_device::thread::LaunchContextRef"));
+
+        let mut expanded_first: ItemFn = parse_quote! {
+            fn expanded_first() {
+                unsafe {
+                    ::cuda_device::thread::__launch_contract_config::<1, true>();
+                }
+                let _ = thread::index_1d_u32(launch_context);
+            }
+        };
+        let scope = explicit_kernel_scope(&mut expanded_first, format_ident!("launch_context"));
+        expanded_first
+            .block
+            .stmts
+            .splice(0..0, explicit_kernel_scope_bindings(&scope));
+        let expanded_first = quote!(#expanded_first).to_string().replace(' ', "");
+        assert!(expanded_first.contains("make_kernel_scope::<::cuda_device::thread::__internal::Domain1,::cuda_device::thread::__internal::U32Coordinates>"));
+
+        let mut two_dimensional: ItemFn = parse_quote! {
+            #[launch_contract(domain = 2, coordinates = u32, block = (8, 8, 1))]
+            fn two_dimensional() {
+                let _ = thread::coord_2d_u32(launch_context);
+            }
+        };
+        let scope = explicit_kernel_scope(&mut two_dimensional, format_ident!("launch_context"));
+        two_dimensional
+            .block
+            .stmts
+            .splice(0..0, explicit_kernel_scope_bindings(&scope));
+        let two_dimensional = quote!(#two_dimensional).to_string().replace(' ', "");
+        assert!(two_dimensional.contains("make_kernel_scope::<::cuda_device::thread::__internal::Domain2,::cuda_device::thread::__internal::U32Coordinates>"));
+    }
+
+    #[test]
+    fn kernel_launch_context_argument_composes_with_legacy_instantiations() {
+        let args: KernelArgs = syn::parse_str("f32, launch_context = launch_context, f64").unwrap();
+        assert_eq!(args.instantiate_types.len(), 2);
+        assert_eq!(args.launch_context.unwrap(), "launch_context");
+
+        let duplicate =
+            syn::parse_str::<KernelArgs>("launch_context = first, launch_context = second")
+                .err()
+                .unwrap();
+        assert!(duplicate.to_string().contains("duplicate `launch_context`"));
+
+        let unknown = syn::parse_str::<KernelArgs>("context = launch_context")
+            .err()
+            .unwrap();
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown #[kernel] named argument")
+        );
+    }
+
+    #[test]
+    fn kernel_unchecked_indexing_flag_parses_and_composes() {
+        let bare: KernelArgs = syn::parse_str("unchecked_indexing").unwrap();
+        assert!(bare.unchecked_indexing);
+        assert!(bare.instantiate_types.is_empty());
+        assert!(bare.launch_context.is_none());
+
+        let composed: KernelArgs =
+            syn::parse_str("f32, launch_context = launch_context, unchecked_indexing").unwrap();
+        assert!(composed.unchecked_indexing);
+        assert_eq!(composed.instantiate_types.len(), 1);
+        assert_eq!(composed.launch_context.unwrap(), "launch_context");
+
+        let leading: KernelArgs = syn::parse_str("unchecked_indexing, f32").unwrap();
+        assert!(leading.unchecked_indexing);
+        assert_eq!(leading.instantiate_types.len(), 1);
+
+        let default: KernelArgs = syn::parse_str("f32, launch_context = launch_context").unwrap();
+        assert!(!default.unchecked_indexing);
+
+        let duplicate = syn::parse_str::<KernelArgs>("unchecked_indexing, unchecked_indexing")
+            .err()
+            .unwrap();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate `unchecked_indexing`")
+        );
+
+        // The flag is a bare word, never a named argument.
+        let named = syn::parse_str::<KernelArgs>("unchecked_indexing = true")
+            .err()
+            .unwrap();
+        assert!(
+            named
+                .to_string()
+                .contains("unknown #[kernel] named argument")
+        );
+    }
+
+    #[test]
+    fn unchecked_indexing_marker_is_a_forwardable_configuration_marker() {
+        // The exact statement the `#[kernel]` macro injects must be recognized
+        // by the generic-entry marker forwarding, so the flag reaches the
+        // generated entry wrapper even when the implementation helper is
+        // translated separately.
+        let marker: Stmt = parse_quote! {
+            ::cuda_device::thread::__unchecked_indexing_config::<true>();
+        };
+        assert!(is_kernel_configuration_marker(&marker));
+        assert!(is_unchecked_indexing_config_marker(&marker));
+
+        let kernel: ItemFn = parse_quote! {
+            fn body() {
+                ::cuda_device::thread::__unchecked_indexing_config::<true>();
+                work();
+            }
+        };
+        let markers = top_level_kernel_configuration_markers(&kernel);
+        assert_eq!(markers.len(), 1);
+    }
+
+    /// Renders the function item named `name` from an expansion, panicking
+    /// with the full expansion when it is missing.
+    fn expansion_fn_source(expanded: &TokenStream2, name: &str) -> String {
+        let file: syn::File =
+            syn::parse2(expanded.clone()).expect("generated tokens must parse as items");
+        let function = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(item_fn) if item_fn.sig.ident == name => Some(item_fn),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expansion has no fn `{name}`:\n{expanded}"));
+        quote!(#function).to_string().replace(' ', "")
+    }
+
+    /// The kernel body exactly as `kernel()` hands it to the generic
+    /// expansion paths: the unchecked-indexing marker is already statement 0.
+    fn opted_generic_kernel() -> ItemFn {
+        parse_quote! {
+            pub fn scaled_gather<T: Copy>(a: &[T], mut c: DisjointSlice<T>) {
+                ::cuda_device::thread::__unchecked_indexing_config::<true>();
+                work(a, &mut c);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_expansion_confines_unchecked_marker_to_entry_and_hidden_twin() {
+        let expanded = generic_kernel_no_instantiation_tokens(opted_generic_kernel(), None);
+
+        // The user-named implementation helper is ordinary callable Rust and
+        // must NOT carry the marker: rustc may inline it into other kernels
+        // that never opted in.
+        let helper = expansion_fn_source(&expanded, "scaled_gather");
+        assert!(
+            !helper.contains("__unchecked_indexing_config"),
+            "helper leaked the marker:\n{helper}"
+        );
+
+        // The generated entry wrapper keeps the forwarded marker and calls
+        // the hidden unchecked twin instead of the user-named helper.
+        let entry = expansion_fn_source(&expanded, &format!("{KERNEL_PREFIX}scaled_gather"));
+        assert!(
+            entry.contains("__unchecked_indexing_config"),
+            "entry wrapper lost the marker:\n{entry}"
+        );
+        assert!(
+            entry.contains("__cuda_oxide_unchecked_impl_scaled_gather::<T>"),
+            "entry wrapper does not call the unchecked twin:\n{entry}"
+        );
+
+        let twin = expansion_fn_source(&expanded, "__cuda_oxide_unchecked_impl_scaled_gather");
+        assert!(twin.contains("__unchecked_indexing_config"));
+    }
+
+    #[test]
+    fn legacy_instantiation_confines_unchecked_marker_to_entry_and_hidden_twin() {
+        // Legacy `#[kernel(Type, ...)]` instantiation supports by-value
+        // parameters of the single type parameter (see
+        // `kernel_launch_context_api.rs`'s `explicit` kernel).
+        let kernel: ItemFn = parse_quote! {
+            pub fn scaled_gather<T: Copy>(value: T) {
+                ::cuda_device::thread::__unchecked_indexing_config::<true>();
+                work(value);
+            }
+        };
+        let expanded =
+            generic_kernel_instantiation_tokens(kernel, vec![parse_quote! { f32 }], None);
+
+        let helper = expansion_fn_source(&expanded, "scaled_gather");
+        assert!(
+            !helper.contains("__unchecked_indexing_config"),
+            "helper leaked the marker:\n{helper}"
+        );
+
+        let entry = expansion_fn_source(&expanded, &format!("{KERNEL_PREFIX}scaled_gather_f32"));
+        assert!(
+            entry.contains("__unchecked_indexing_config"),
+            "entry wrapper lost the marker:\n{entry}"
+        );
+        assert!(
+            entry.contains("__cuda_oxide_unchecked_impl_scaled_gather::<f32>"),
+            "entry wrapper does not call the unchecked twin:\n{entry}"
+        );
+
+        let twin = expansion_fn_source(&expanded, "__cuda_oxide_unchecked_impl_scaled_gather");
+        assert!(twin.contains("__unchecked_indexing_config"));
+    }
+
+    #[test]
+    fn non_opted_generic_expansion_has_no_unchecked_twin_or_marker() {
+        let kernel: ItemFn = parse_quote! {
+            pub fn plain<T: Copy>(a: &[T], mut c: DisjointSlice<T>) {
+                work(a, &mut c);
+            }
+        };
+        let expanded = generic_kernel_no_instantiation_tokens(kernel, None).to_string();
+        assert!(!expanded.contains("__unchecked_indexing_config"));
+        assert!(!expanded.contains("__cuda_oxide_unchecked_impl"));
+        assert!(!expanded.contains("dead_code"));
+    }
+
+    #[test]
+    fn unchecked_twin_carries_helper_lint_attributes() {
+        // A lint the author suppressed on the kernel must not re-fire on the
+        // byte-identical twin body (that would break -Dwarnings builds), and
+        // the user-named helper must be allowed to go dead: the generated
+        // entry calls the twin instead.
+        let kernel: ItemFn = parse_quote! {
+            #[allow(unused_variables)]
+            pub fn scaled_gather<T: Copy>(a: &[T], mut c: DisjointSlice<T>) {
+                ::cuda_device::thread::__unchecked_indexing_config::<true>();
+                work(a, &mut c);
+            }
+        };
+        let expanded = generic_kernel_no_instantiation_tokens(kernel, None);
+
+        let twin = expansion_fn_source(&expanded, "__cuda_oxide_unchecked_impl_scaled_gather");
+        assert!(
+            twin.contains("allow(unused_variables)"),
+            "twin dropped the helper's lint attributes:\n{twin}"
+        );
+
+        let helper = expansion_fn_source(&expanded, "scaled_gather");
+        assert!(helper.contains("allow(unused_variables)"));
+        assert!(
+            helper.contains("allow(dead_code)"),
+            "opted helper is not allowed to go dead:\n{helper}"
+        );
+
+        // The entry wrapper is the live path; it must not be dead-code
+        // suppressed.
+        let entry = expansion_fn_source(&expanded, &format!("{KERNEL_PREFIX}scaled_gather"));
+        assert!(!entry.contains("dead_code"));
+    }
+
+    #[test]
+    fn raw_identifier_kernel_names_build_a_valid_unchecked_twin() {
+        // `Display` of `r#gen` keeps the `r#` prefix, which `Ident::new`
+        // rejects; twin naming must strip it like `format_ident!` does.
+        let kernel: ItemFn = parse_quote! {
+            pub fn r#gen<T: Copy>(value: T) {
+                ::cuda_device::thread::__unchecked_indexing_config::<true>();
+                work(value);
+            }
+        };
+
+        let expanded = generic_kernel_no_instantiation_tokens(kernel.clone(), None);
+        let twin = expansion_fn_source(&expanded, "__cuda_oxide_unchecked_impl_gen");
+        assert!(twin.contains("__unchecked_indexing_config"));
+
+        let expanded =
+            generic_kernel_instantiation_tokens(kernel, vec![parse_quote! { f32 }], None);
+        let twin = expansion_fn_source(&expanded, "__cuda_oxide_unchecked_impl_gen");
+        assert!(twin.contains("__unchecked_indexing_config"));
+    }
+
+    #[test]
+    fn generic_kernels_validate_routed_launch_contract_requires_at_source_names() {
+        // A #[launch_contract] written below #[kernel] is routed onto the
+        // generated entry wrapper, whose synthetic parameter names defeat
+        // attribute-site validation; #[kernel] must validate the relations
+        // against the original signature instead.
+        let typo: ItemFn = parse_quote! {
+            #[cuda_device::launch_contract(
+                domain = 1,
+                block = (64, 1, 1),
+                requires = (input.len() >= n),
+            )]
+            pub fn scaled<T: Copy>(input: &[T]) {}
+        };
+        let expanded = generic_kernel_no_instantiation_tokens(typo.clone(), None).to_string();
+        assert!(expanded.contains("compile_error"), "{expanded}");
+        assert!(expanded.contains("unknown identifier `n`"), "{expanded}");
+
+        let expanded =
+            generic_kernel_instantiation_tokens(typo, vec![parse_quote! { f32 }], None).to_string();
+        assert!(expanded.contains("compile_error"), "{expanded}");
+        assert!(expanded.contains("unknown identifier `n`"), "{expanded}");
+
+        let well_formed: ItemFn = parse_quote! {
+            #[cuda_device::launch_contract(
+                domain = 1,
+                block = (64, 1, 1),
+                requires = (input.len() >= n),
+            )]
+            pub fn scaled<T: Copy>(n: u32, input: &[T]) {}
+        };
+        let expanded = generic_kernel_no_instantiation_tokens(well_formed, None).to_string();
+        assert!(!expanded.contains("compile_error"), "{expanded}");
+    }
+
+    #[test]
+    fn path_spelled_unchecked_indexing_still_parses_as_instantiation_type() {
+        // The bare word is reserved for the flag, but a type literally named
+        // `unchecked_indexing` remains reachable through any path spelling.
+        for spelling in [
+            "self::unchecked_indexing",
+            "crate::unchecked_indexing",
+            "types::unchecked_indexing",
+        ] {
+            let args: KernelArgs = syn::parse_str(spelling).unwrap();
+            assert!(!args.unchecked_indexing, "`{spelling}` parsed as the flag");
+            assert_eq!(
+                args.instantiate_types.len(),
+                1,
+                "`{spelling}` did not parse as an instantiation type"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_launch_contract_validates_requires_against_fn_signature() {
+        let kernel: ItemFn = parse_quote! {
+            pub fn scaled(n: u32, input: &[f32], mut output: DisjointSlice<f32>) {}
+        };
+        let params = standalone_requires_params(&kernel).expect("source-named params must model");
+
+        let good: LaunchContractArgs = syn::parse_str(
+            "domain = 1, block = (64, 1, 1), requires = (input.len() >= n, output.len() >= n)",
+        )
+        .unwrap();
+        assert!(validate_requires_relations(&good.requires, &params).is_ok());
+
+        let typo: LaunchContractArgs =
+            syn::parse_str("domain = 1, block = (64, 1, 1), requires = (input.len() >= m)")
+                .unwrap();
+        let error = validate_requires_relations(&typo.requires, &params).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown identifier `m`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn standalone_requires_validation_skips_generated_generic_entry_wrappers() {
+        // Generic entry wrappers carry synthetic parameter names; the source
+        // relations were already validated by #[cuda_module] (or are written
+        // against names this wrapper no longer has), so the attribute-site
+        // validation must stand down rather than reject valid contracts.
+        let wrapper: ItemFn = parse_quote! {
+            fn entry<T>(__cuda_oxide_arg_0: &[T], __cuda_oxide_arg_1: u32) {}
+        };
+        assert!(standalone_requires_params(&wrapper).is_none());
+    }
+
+    #[test]
+    fn standalone_requires_models_unmarshallable_params_as_opaque_scalars() {
+        // `&bool` is rejected by the cuda_module marshaller; standalone
+        // validation still names the parameter precisely instead of calling
+        // it an unknown identifier.
+        let kernel: ItemFn = parse_quote! {
+            pub fn odd(flag: &bool, n: u32) {}
+        };
+        let params = standalone_requires_params(&kernel).unwrap();
+        let args: LaunchContractArgs =
+            syn::parse_str("domain = 1, block = (64, 1, 1), requires = (n >= flag)").unwrap();
+        let error = validate_requires_relations(&args.requires, &params).unwrap_err();
+        assert!(
+            error.to_string().contains("not an unsigned integer scalar"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_fast_functions_are_not_syntax_rewritten() {
+        let mut function: ItemFn = parse_quote! {
+            #[launch_contract(domain = 1, coordinates = u32, block = (64, 1, 1))]
+            fn ordinary_names() {
+                let local = index_1d_u32();
+                let proof = alias(launch_context);
+                consume(local, proof);
+            }
+        };
+        let scope = explicit_kernel_scope(&mut function, format_ident!("launch_context"));
+        let expanded = quote!(#function).to_string().replace(' ', "");
+
+        assert!(expanded.contains("index_1d_u32()"));
+        assert!(expanded.contains("alias(launch_context)"));
+        assert!(!expanded.contains("__internal::index_1d_u32"));
+        assert_eq!(scope.ident, "launch_context");
     }
 
     #[test]
@@ -6457,7 +9121,11 @@ mod tests {
         assert!(expanded.contains("PreparedLaunch<__apply_CudaKernel<F>>"));
         assert!(expanded.contains("fnprepare_apply_for<F"));
         assert!(expanded.contains("__cuda_oxide_type_witness_0:&F"));
-        assert!(expanded.contains("BlockRequirement::MaxThreads(128u32)"));
+        assert!(
+            expanded.contains("let__cuda_oxide_max_threads:u32=128"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("BlockRequirement::MaxThreads(__cuda_oxide_max_threads)"));
     }
 
     #[test]
@@ -6502,6 +9170,10 @@ mod tests {
         let kernel: ItemFn = parse_quote! {
             fn map<T>() {
                 ::cuda_device::thread::__launch_bounds_config::<64, 2>();
+                unsafe {
+                    ::cuda_device::thread::__launch_contract_config::<1, true>();
+                }
+                ::cuda_device::thread::__launch_contract_block_config::<64, 1, 1>();
                 ::cuda_device::cluster::__cluster_config::<2, 1, 1>();
                 ::cuda_device::shared::__dynamic_shared_alignment::<128>();
                 cuda_device::thread::__launch_bounds_config::<4, 1>();
@@ -6517,8 +9189,10 @@ mod tests {
         let markers = top_level_kernel_configuration_markers(&kernel);
         let forwarded = quote!(#(#markers)*).to_string().replace(' ', "");
 
-        assert_eq!(markers.len(), 3);
+        assert_eq!(markers.len(), 5);
         assert!(forwarded.contains("__launch_bounds_config::<64,2>()"));
+        assert!(forwarded.contains("__launch_contract_config::<1,true>()"));
+        assert!(forwarded.contains("__launch_contract_block_config::<64,1,1>()"));
         assert!(forwarded.contains("__cluster_config::<2,1,1>()"));
         assert!(forwarded.contains("__dynamic_shared_alignment::<128>()"));
         assert!(!forwarded.contains("unrelated"));
@@ -6534,19 +9208,238 @@ mod tests {
             syn::parse_str("domain = 1, dynamic_shared = 256, dynamic_shared_alignment = 64")
                 .unwrap();
         let mut helper: ItemFn = parse_quote! { fn helper<T>() {} };
-        inject_launch_contract_alignment_marker(&args, &mut helper);
+        inject_launch_contract_markers(&args, &mut helper);
         let expanded = quote!(#helper).to_string();
+        assert_eq!(expanded.matches("__launch_contract_config").count(), 1);
         assert_eq!(expanded.matches("__dynamic_shared_alignment").count(), 1);
         assert!(expanded.contains("64usize"));
 
         let zero_args: LaunchContractArgs =
             syn::parse_str("domain = 1, dynamic_shared = 0").unwrap();
         let mut zero_helper: ItemFn = parse_quote! { fn zero_helper<T>() {} };
-        inject_launch_contract_alignment_marker(&zero_args, &mut zero_helper);
+        inject_launch_contract_markers(&zero_args, &mut zero_helper);
         assert!(
             !quote!(#zero_helper)
                 .to_string()
                 .contains("__dynamic_shared_alignment")
+        );
+        assert_eq!(
+            quote!(#zero_helper)
+                .to_string()
+                .matches("__launch_contract_config")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn launch_contract_injects_the_block_marker_only_for_an_exact_block() {
+        let exact: LaunchContractArgs =
+            syn::parse_str("domain = 2, block = (8, 8, 1), dynamic_shared = 0").unwrap();
+        let mut kernel: ItemFn = parse_quote! { fn kernel() {} };
+        inject_launch_contract_markers(&exact, &mut kernel);
+        let expanded = quote!(#kernel).to_string().replace(' ', "");
+        assert_eq!(
+            expanded.matches("__launch_contract_block_config").count(),
+            1
+        );
+        assert!(expanded.contains("__launch_contract_block_config::<8u32,8u32,1u32>"));
+
+        // Without an exact block the kernel keeps whatever `#[launch_bounds]`
+        // declares, so no exact shape reaches the device compiler.
+        let bounded: LaunchContractArgs = syn::parse_str("domain = 1, dynamic_shared = 0").unwrap();
+        let mut unbounded_kernel: ItemFn = parse_quote! { fn unbounded_kernel() {} };
+        inject_launch_contract_markers(&bounded, &mut unbounded_kernel);
+        assert!(
+            !quote!(#unbounded_kernel)
+                .to_string()
+                .contains("__launch_contract_block_config")
+        );
+    }
+
+    #[test]
+    fn launch_contract_keeps_every_marker_when_block_and_shared_are_both_declared() {
+        let args: LaunchContractArgs = syn::parse_str(
+            "domain = 1, block = (256, 1, 1), dynamic_shared = 128, dynamic_shared_alignment = 32",
+        )
+        .unwrap();
+        let mut kernel: ItemFn = parse_quote! { fn kernel() {} };
+        inject_launch_contract_markers(&args, &mut kernel);
+        let expanded = quote!(#kernel).to_string();
+        assert_eq!(expanded.matches("__launch_contract_config").count(), 1);
+        assert_eq!(
+            expanded.matches("__launch_contract_block_config").count(),
+            1
+        );
+        assert_eq!(expanded.matches("__dynamic_shared_alignment").count(), 1);
+    }
+
+    /// The `requires` demo module used by the size-requirement tests: two
+    /// relations, one with arithmetic, over a scalar pair and two buffers.
+    fn requires_demo_module() -> ItemMod {
+        parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(
+                    domain = 1,
+                    block = (128, 1, 1),
+                    requires = (input.len() >= n * stride, output.len() >= n),
+                )]
+                pub fn scaled_copy(
+                    n: u32,
+                    stride: u32,
+                    input: &[f32],
+                    mut output: DisjointSlice<f32>,
+                ) {
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn requires_relations_generate_overflow_safe_checks_in_checked_launchers_only() {
+        let expanded = expand_to_compact_string(requires_demo_module());
+
+        // Every operand is widened to u64 and arithmetic goes through
+        // checked ops with a typed overflow error.
+        assert!(expanded.contains("SizeRequirementViolated"), "{expanded}");
+        assert!(expanded.contains("SizeRequirementOverflow"), "{expanded}");
+        assert!(expanded.contains("checked_mul"), "{expanded}");
+        assert!(expanded.contains("(nasu64)"), "{expanded}");
+        // The relation's source text rides along for the error message.
+        // (`expand_to_compact_string` strips spaces inside string literals
+        // too, so the expected text is compacted.)
+        assert!(expanded.contains("\"input.len()>=n*stride\""), "{expanded}");
+        assert!(expanded.contains("\"output.len()>=n\""), "{expanded}");
+
+        // Each checked launcher evaluates both relations; the `_unchecked`
+        // escape hatches never do. Without the async feature only the sync
+        // prepared launcher exists (2 relations); with it, the `_async` and
+        // `_async_owned` twins check too (2 relations each).
+        #[cfg(not(feature = "async"))]
+        assert_eq!(
+            expanded.matches("SizeRequirementViolated").count(),
+            2,
+            "{expanded}"
+        );
+        #[cfg(feature = "async")]
+        assert_eq!(
+            expanded.matches("SizeRequirementViolated").count(),
+            6,
+            "{expanded}"
+        );
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn requires_relations_wrap_async_launchers_in_result() {
+        let expanded = expand_to_compact_string(requires_demo_module());
+
+        // The async launchers report a violated relation as a typed error
+        // instead of enqueueing, so their return types gain a Result.
+        assert!(
+            expanded.contains("::core::result::Result<::cuda_host::PreparedAsyncKernelLaunch<"),
+            "{expanded}"
+        );
+        assert!(
+            expanded
+                .contains("::core::result::Result<::cuda_host::PreparedOwnedAsyncKernelLaunch<"),
+            "{expanded}"
+        );
+        // Slice lengths come from the KernelSliceArg trait: by reference for
+        // the borrowed async launcher, by value for the owned one.
+        assert!(
+            expanded.contains("KernelSliceArg::len(input)"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("KernelSliceArg::len(&input)"),
+            "{expanded}"
+        );
+
+        // A contract without `requires` keeps the plain infallible async
+        // signatures.
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_contract(domain = 1, block = (128, 1, 1))]
+                pub fn plain(input: &[f32], mut output: DisjointSlice<f32>) {}
+            }
+        };
+        let plain = expand_to_compact_string(module);
+        assert!(
+            !plain.contains("Result<::cuda_host::PreparedAsyncKernelLaunch<"),
+            "{plain}"
+        );
+        assert!(
+            !plain.contains("Result<::cuda_host::PreparedOwnedAsyncKernelLaunch<"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn requires_rejects_relations_outside_the_v1_grammar() {
+        let expand_with_requires = |requires: &str| {
+            let attr = format!("domain = 1, block = (64, 1, 1), requires = ({requires})");
+            let attr: TokenStream2 = attr.parse().expect("attr tokens");
+            let module: ItemMod = parse_quote! {
+                mod kernels {
+                    #[kernel]
+                    #[launch_contract(#attr)]
+                    pub fn bad(n: u32, input: &[f32], mut output: DisjointSlice<f32>) {}
+                }
+            };
+            expand_cuda_module(module)
+        };
+        let reject = |requires: &str, expected: &str| {
+            let error = expand_with_requires(requires)
+                .expect_err(&format!("`{requires}` should be rejected"))
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "`{requires}` produced unexpected error: {error}"
+            );
+        };
+
+        reject("input.len() >= 1.5", "only integer literals");
+        reject("input.len() >= 1 && output.len() >= 1", "must compare with");
+        reject("input.len() + n", "must compare with");
+        reject("input", "must be a comparison");
+        reject("input.len() as u64 >= 1", "unsupported expression");
+        reject("input.capacity() >= n", "only the `.len()` method");
+        reject(
+            "input.len() >= (n >= 1)",
+            "nested comparisons are not supported",
+        );
+        reject("input.len() >= self::n", "bare kernel parameter names");
+
+        // The full accepted grammar expands cleanly.
+        expand_with_requires("(input.len() - 1) * 2 + 0 >= n * 3")
+            .expect("grammar-conformant relation must expand");
+    }
+
+    #[test]
+    fn requires_parser_accepts_relation_lists_and_rejects_degenerate_forms() {
+        let args: LaunchContractArgs =
+            syn::parse_str("domain = 1, requires = (a.len() >= n, b.len() >= n * 2)").unwrap();
+        assert_eq!(args.requires.len(), 2);
+
+        // `.err()` instead of `.unwrap_err()`: LaunchContractArgs holds
+        // syn::Expr, which has no Debug without syn's extra-traits feature.
+        let empty = syn::parse_str::<LaunchContractArgs>("domain = 1, requires = ()")
+            .err()
+            .expect("empty requires list must be rejected");
+        assert!(empty.to_string().contains("at least one relation"));
+
+        let duplicate = syn::parse_str::<LaunchContractArgs>(
+            "domain = 1, requires = (a.len() >= 1), requires = (b.len() >= 1)",
+        )
+        .err()
+        .expect("duplicate requires key must be rejected");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate launch_contract field")
         );
     }
 
@@ -6746,6 +9639,47 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_slice_packet_shape_is_bound_to_the_resolved_type() {
+        // The spelling `Rt` hides a runtime row width, so the macro selects
+        // the two-word host ABI. The generated launch methods must carry the
+        // semantic `HAS_ROW_WIDTH = false` bound for Rust to reject at the call
+        // site once `Rt` resolves to a runtime-width index space.
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                type Rt = RuntimeRowMajorTiles<1, 1>;
+
+                #[kernel]
+                pub fn alias_hides_row_width(mut out: DisjointSlice<f32, Rt>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(
+            expanded.contains(
+                "for<'__cuda_oxide_disjoint>DisjointSlice<'__cuda_oxide_disjoint,f32,Rt>:\
+                 ::cuda_device::__LaunchContractDisjointSliceAbi<f32,false>"
+            ),
+            "flat spelling must bind HAS_ROW_WIDTH = false: {expanded}"
+        );
+
+        // The direct spelling selects the three-word ABI and must bind
+        // `HAS_ROW_WIDTH = true`.
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                pub fn really_has_row_width(mut out: DisjointSlice<f32, Runtime2DIndex>) {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+        assert!(
+            expanded.contains(
+                "for<'__cuda_oxide_disjoint>DisjointSlice<'__cuda_oxide_disjoint,f32,\
+                 Runtime2DIndex>:::cuda_device::__LaunchContractDisjointSliceAbi<f32,true>"
+            ),
+            "runtime-width spelling must bind HAS_ROW_WIDTH = true: {expanded}"
+        );
+    }
+
+    #[test]
     fn aliased_disjoint_index_space_is_checked_by_rust_type_resolution() {
         let module: ItemMod = parse_quote! {
             mod kernels {
@@ -6939,7 +9873,7 @@ mod tests {
         let out = run_loop_unroll_visitor(func);
         // Bare #[unroll] => full unroll (factor 0).
         assert!(
-            out.contains("cuda_device::thread::__unroll_config::<0u32>()"),
+            out.contains("cuda_device::thread::__unroll_config::<{0u32}>()"),
             "expected factor-0 marker:\n{out}"
         );
         // The expression attribute must be stripped so rustc never sees it.
@@ -6959,7 +9893,7 @@ mod tests {
         };
         let out = run_loop_unroll_visitor(func);
         assert!(
-            out.contains("cuda_device::thread::__unroll_config::<4u32>()"),
+            out.contains("cuda_device::thread::__unroll_config::<{4}>()"),
             "expected factor-4 marker:\n{out}"
         );
         assert!(
@@ -6978,7 +9912,7 @@ mod tests {
         };
         let out = run_loop_unroll_visitor(func);
         assert!(
-            out.contains("cuda_device::thread::__unroll_config::<2u32>()"),
+            out.contains("cuda_device::thread::__unroll_config::<{2}>()"),
             "expected factor-2 marker on `loop`:\n{out}"
         );
     }
@@ -6997,7 +9931,7 @@ mod tests {
         };
         let out = run_loop_unroll_visitor(func);
         assert!(
-            out.contains("cuda_device::thread::__unroll_config::<3u32>()"),
+            out.contains("cuda_device::thread::__unroll_config::<{3}>()"),
             "expected marker injected into nested loop:\n{out}"
         );
     }
@@ -7047,6 +9981,216 @@ mod tests {
     fn partial_unroll_factor_must_be_at_least_two() {
         assert!(syn::parse_str::<UnrollArgs>("0").is_err());
         assert!(syn::parse_str::<UnrollArgs>("1").is_err());
-        assert_eq!(syn::parse_str::<UnrollArgs>("2").unwrap().factor, 2);
+        assert_eq!(
+            syn::parse_str::<UnrollArgs>("2")
+                .unwrap()
+                .factor
+                .literal_value,
+            Some(2)
+        );
+        assert!(syn::parse_str::<UnrollArgs>("1025").is_err());
+    }
+
+    #[test]
+    fn launch_bounds_keeps_policy_expressions_typed() {
+        let mut function: ItemFn = parse_quote! {
+            fn configured<P: Policy>() {}
+        };
+        let args: LaunchBoundsArgs = syn::parse_str("P::MAX_THREADS * 2, P::MIN_BLOCKS").unwrap();
+        add_const_evaluatable_bound(&mut function.sig.generics, &args.max_threads);
+        add_const_evaluatable_bound(&mut function.sig.generics, &args.min_blocks);
+
+        let max_threads = &args.max_threads.expr;
+        let min_blocks = &args.min_blocks.expr;
+        let marker: Stmt = parse_quote! {
+            ::cuda_device::thread::__launch_bounds_config::<
+                { #max_threads },
+                { #min_blocks },
+            >();
+        };
+        function.block.stmts.insert(0, marker);
+        let output = quote!(#function).to_string().replace(' ', "");
+
+        assert!(
+            output.contains("__launch_bounds_config"),
+            "missing marker: {output}"
+        );
+        assert!(output.contains("{P::MAX_THREADS*2}"), "{output}");
+        assert!(output.contains("{P::MIN_BLOCKS}"), "{output}");
+        assert!(output.contains("[();(P::MAX_THREADS*2)asusize]:"));
+        assert!(output.contains("[();(P::MIN_BLOCKS)asusize]:"));
+    }
+
+    #[test]
+    fn policy_unroll_expression_gets_marker_and_evaluatability_bound() {
+        let func: ItemFn = parse_quote! {
+            fn k<P: Policy>() {
+                let mut i = 0u32;
+                #[unroll(P::UNROLL)]
+                while i < 8 { i += 1; }
+            }
+        };
+        let output = run_loop_unroll_visitor(func);
+
+        assert!(output.contains("__unroll_config::<{P::UNROLL}>()"));
+        assert!(output.contains("[();(P::UNROLL)asusize]:"));
+    }
+
+    #[test]
+    fn function_local_unroll_const_stays_in_block_scope() {
+        let func: ItemFn = parse_quote! {
+            fn k() {
+                const FACTOR: u32 = 4;
+                let mut i = 0u32;
+                #[unroll(FACTOR)]
+                while i < 8 { i += 1; }
+            }
+        };
+        let output = run_loop_unroll_visitor(func);
+
+        assert!(output.contains("__unroll_config::<{FACTOR}>()"));
+        assert!(
+            !output.contains("[();(FACTOR)asusize]:"),
+            "a block-local const must not be copied into the function signature: {output}"
+        );
+    }
+
+    #[test]
+    fn cuda_module_host_methods_keep_policy_expression_bounds() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+                pub fn configured<P: Policy>() {
+                    let mut i = 0u32;
+                    #[unroll(P::UNROLL)]
+                    while i < 8 { i += 1; }
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("[();(P::MAX_THREADS)asusize]:"));
+        assert!(expanded.contains("[();(P::MIN_BLOCKS)asusize]:"));
+        assert!(expanded.contains("[();(P::UNROLL)asusize]:"));
+        assert!(expanded.contains("pubfnconfigured<P:Policy>"));
+    }
+
+    #[test]
+    fn nested_cuda_module_host_methods_keep_policy_expression_bounds() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                pub mod stage {
+                    use super::*;
+
+                    #[kernel]
+                    #[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+                    pub fn configured<P: Policy>() {
+                        let mut i = 0u32;
+                        #[unroll(P::UNROLL)]
+                        while i < 8 { i += 1; }
+                    }
+                }
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(expanded.contains("pubmodstage"));
+        assert!(expanded.contains("from_parent(parent:&super::LoadedModule"));
+        assert!(expanded.contains("[();(P::MAX_THREADS)asusize]:"));
+        assert!(expanded.contains("[();(P::MIN_BLOCKS)asusize]:"));
+        assert!(expanded.contains("[();(P::UNROLL)asusize]:"));
+        assert!(expanded.contains("pubfnconfigured<P:Policy>"));
+    }
+
+    #[test]
+    fn launch_contract_carries_deferred_launch_bounds_into_host_spec() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(P::MAX_THREADS)]
+                #[launch_contract(domain = 1)]
+                pub fn configured<P: Policy>() {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains("let__cuda_oxide_max_threads:u32=P::MAX_THREADS"),
+            "policy maximum must be part of the host contract: {expanded}"
+        );
+        assert!(
+            expanded.contains("__cuda_oxide_max_threads>0"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("BlockRequirement::MaxThreads(__cuda_oxide_max_threads)"));
+        assert!(expanded.contains("[();(P::MAX_THREADS)asusize]:"));
+    }
+
+    #[test]
+    fn exact_block_checks_a_deferred_launch_bound_per_specialization() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(P::MAX_THREADS)]
+                #[launch_contract(domain = 1, block = (64, 1, 1))]
+                pub fn configured<P: Policy>() {}
+            }
+        };
+        let expanded = expand_to_compact_string(module);
+
+        assert!(
+            expanded.contains("BlockRequirement::Exact((64u32,1u32,1u32))"),
+            "an explicit block must remain exact: {expanded}"
+        );
+        assert!(
+            expanded.contains("64u128<=(__cuda_oxide_max_threads)asu128"),
+            "the policy bound must be checked for each specialization: {expanded}"
+        );
+    }
+
+    #[test]
+    fn launch_contract_allows_deferred_minimum_blocks() {
+        let module: ItemMod = parse_quote! {
+            mod kernels {
+                #[kernel]
+                #[launch_bounds(256, P::MIN_BLOCKS)]
+                #[launch_contract(domain = 1)]
+                pub fn configured<P: Policy>() {}
+            }
+        };
+
+        expand_cuda_module(module).expect(
+            "minimum blocks affects device occupancy metadata, not the host launch contract",
+        );
+    }
+
+    /// The two hygiene regressions for the injected launch-context scope spell
+    /// `KERNEL_SCOPE_LOCAL`-derived names as *identifiers*, so no compiler
+    /// check ties them back to the constant. Rename the constant and both
+    /// fixtures quietly stop colliding with the generated bindings: they keep
+    /// passing while testing nothing, because there is no longer anything to
+    /// collide with. Pin the coupling so a rename fails here and names the
+    /// fixtures that have to move with it.
+    #[test]
+    fn hygiene_fixtures_still_collide_with_the_generated_scope_names() {
+        let storage = format!("{KERNEL_SCOPE_LOCAL}_storage");
+
+        let launch_context = include_str!("../tests/pass/kernel_launch_context_api.rs");
+        assert!(
+            launch_context.contains(&storage),
+            "tests/pass/kernel_launch_context_api.rs must bind `{storage}` so \
+             `generated_storage_name_is_hygienic` exercises the mixed-site \
+             hygiene of the generated storage binding"
+        );
+
+        let const_generic =
+            include_str!("../../rustc-codegen-cuda/examples/const_generic/src/main.rs");
+        assert!(
+            const_generic.contains(KERNEL_SCOPE_LOCAL),
+            "examples/const_generic must declare a const generic named \
+             `{KERNEL_SCOPE_LOCAL}` so `call_site_ident_avoiding_item` is \
+             forced down its rename path"
+        );
     }
 }

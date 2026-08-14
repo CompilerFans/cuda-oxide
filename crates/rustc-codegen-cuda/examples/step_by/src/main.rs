@@ -6,15 +6,17 @@
 //! Regression test for issue #21.
 //!
 //! `for i in (a..b).step_by(s)` lowers (after `StepBy::next` is inlined) to
-//! a Transmute between a niche-optimised `i64` and the un-niched aggregate
-//! representation of `Option<NonZeroUsize>`. Before the fix the build
-//! crashed inside llc with
+//! a Transmute involving the one-word, niche-optimised representation of
+//! `Option<NonZeroUsize>`. The historical synthetic-tag model turned the
+//! destination into an unrelated aggregate, and the build crashed in llc
+//! with
 //!
 //!   error: invalid cast opcode for cast from 'i64' to '{ i8, { { i64 } } }'
 //!     %v23 = bitcast i64 %v22 to { i8, { { i64 } } }
 //!
-//! After the fix cuda-oxide rebuilds that aggregate explicitly with an
-//! `icmp` + `select` + nested `insertvalue`, so the resulting PTX runs.
+//! cuda-oxide now records rustc's physical niche carrier directly and lowers
+//! the equal-size Transmute without assigning synthetic enum fields, so the
+//! resulting PTX keeps the original one-word representation.
 //!
 //! The kernel below uses `step_by`; the second kernel is the `while`-loop
 //! form from the original report and acts as a value-correctness control.
@@ -76,11 +78,7 @@ fn main() {
     println!("=== step_by regression (issue #21) ===\n");
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-    let ptx_path = concat!(env!("CARGO_MANIFEST_DIR"), "/step_by.ptx");
-    let module = ctx
-        .load_module_from_file(ptx_path)
-        .expect("Failed to load PTX");
-    let module = kernels::from_module(module).expect("Failed to initialize typed module");
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     let stream = ctx.default_stream();
 
     const BLOCK: u32 = 32;

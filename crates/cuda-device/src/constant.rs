@@ -8,7 +8,14 @@
 //! [`ConstantMemory<T>`] is a wrapper for module-scope statics that live in CUDA
 //! constant memory (PTX `.const`, address space 4). The host populates the
 //! storage via `cuMemcpyHtoD`; device code reads it as if it were an
-//! ordinary `static T`, returning a value-typed copy.
+//! ordinary `static T`.
+//!
+//! There are two accessors, and for anything bigger than a scalar the choice
+//! matters: [`ConstantMemory::get`] produces `T` by value, while
+//! [`ConstantMemory::get_ref`] borrows it in place. A value has no address, so
+//! indexing a `get()` copy at runtime spills the whole `T` to the thread's local
+//! depot first — one store per element in every thread. Use `get_ref` for
+//! tables, and see its docs for which address space suits which access pattern.
 //!
 //! # Usage
 //!
@@ -26,7 +33,7 @@
 //!
 //!     #[kernel]
 //!     pub fn apply(mut out: DisjointSlice<f32>) {
-//!         let c = COEFFS.get();        // safe read; returns [f32; 4]
+//!         let c = COEFFS.get_ref();    // safe borrow; no load yet
 //!         let i = thread::index_1d().get();
 //!         if let Some(e) = out.get_mut(thread::index_1d()) {
 //!             *e = c[0] + c[1] * (i as f32);
@@ -35,12 +42,23 @@
 //! }
 //! ```
 //!
-//! Host code overrides the initializer between launches with the
-//! macro-generated `set_<name>` methods on the loaded module:
+//! Host code populates the constant with the macro-generated `set_<name>`
+//! methods on the loaded module:
 //!
 //! ```ignore
 //! module.set_coeffs(&stream, &[10.0, 20.0, 30.0, 40.0])?;
 //! ```
+//!
+//! # Initialization limitation
+//!
+//! CUDA Oxide currently emits [`ConstantMemory::UNINIT`] as an all-zero
+//! placeholder. It does not lower arbitrary non-zero Rust static initializers
+//! into PTX constant-memory data.
+//!
+//! Populate the constant before any kernel reads it. Use `set_<name>` before
+//! the kernel launch on the same stream, or use `set_<name>_blocking`. The
+//! placeholder bytes are zero, and [`ConstantMemoryValue`] restricts `T` to
+//! types for which the all-zero bit pattern is valid.
 //!
 //! # Why a wrapper type instead of a bare `static`
 //!
@@ -136,22 +154,24 @@ pub struct ConstantMemory<T: ConstantMemoryValue>(UnsafeCell<T>);
 unsafe impl<T: ConstantMemoryValue + Send> Sync for ConstantMemory<T> {}
 
 impl<T: ConstantMemoryValue> ConstantMemory<T> {
-    /// Placeholder value for a `#[constant]` static. The host must call
-    /// the macro-generated `set_<name>` before any kernel reads the
-    /// constant; honoring arbitrary non-zero initializers in codegen is
-    /// not yet implemented.
+    /// All-zero placeholder for a `#[constant]` static.
     ///
-    /// Mirrors the convention used by [`SharedArray::UNINIT`](crate::SharedArray)
-    /// and [`Barrier::UNINIT`](crate::barrier::Barrier): a single placeholder
-    /// constant for a type that's expected to be populated out-of-band.
+    /// CUDA Oxide does not currently lower arbitrary non-zero Rust static
+    /// initializers into PTX constant-memory data. Populate the value before
+    /// any kernel reads it by calling the macro-generated `set_<name>` before
+    /// the kernel launch on the same stream, or by using
+    /// `set_<name>_blocking`.
     ///
-    /// # Note
+    /// This follows the placeholder convention used by
+    /// [`SharedArray::UNINIT`](crate::SharedArray) and
+    /// [`Barrier::UNINIT`](crate::barrier::Barrier).
     ///
-    /// The underlying bytes are zero. The [`ConstantMemoryValue`] bound is the
-    /// safety gate that rules out types where the all-zero placeholder would
-    /// violate Rust's validity invariants. Custom types can opt in with an
-    /// `unsafe impl ConstantMemoryValue` when their layout and zero value make
-    /// that promise true.
+    /// `UNINIT` means that the constant has not received its application value;
+    /// its underlying bytes are zero. The [`ConstantMemoryValue`] bound rules
+    /// out types for which this all-zero placeholder would violate Rust's
+    /// validity invariants. Custom types may opt in with an
+    /// `unsafe impl ConstantMemoryValue` only when their layout and zero value
+    /// satisfy that contract.
     #[allow(clippy::declare_interior_mutable_const)]
     pub const UNINIT: Self = ConstantMemory(UnsafeCell::new(unsafe {
         core::mem::MaybeUninit::<T>::zeroed().assume_init()
@@ -165,14 +185,11 @@ impl<T: ConstantMemoryValue> ConstantMemory<T> {
     ///
     /// The `UnsafeCell` interior prevents the compiler from hoisting reads
     /// across `set_<name>` boundaries, which means a `.get()` inside a hot
-    /// loop will re-read on every iteration. For large `T` (e.g.
-    /// `ConstantMemory<[f32; 1024]>`) call `.get()` once before the loop and
-    /// reuse the local:
+    /// loop will re-read on every iteration.
     ///
-    /// ```ignore
-    /// let coeffs = COEFFS.get();    // single load, hoisted by you
-    /// for i in 0..n { use(coeffs[i % 4]) }
-    /// ```
+    /// For anything larger than a scalar, prefer [`get_ref`](Self::get_ref):
+    /// `get` must produce the whole `T` as a value, and a value indexed at
+    /// runtime has to be spilled to the thread's local depot first.
     #[inline(always)]
     pub fn get(&self) -> T {
         // SAFETY: read-only from device, and `T: Copy` means we never alias
@@ -180,5 +197,72 @@ impl<T: ConstantMemoryValue> ConstantMemory<T> {
         // kernel launches via `cuMemcpyHtoD`, which is synchronized
         // out-of-band relative to device execution.
         unsafe { *self.0.get() }
+    }
+
+    /// Borrow the storage in place, reading nothing until something is read.
+    ///
+    /// This is the accessor to reach for whenever `T` is a table. [`get`](Self::get)
+    /// returns `T` *by value*, which is right for a scalar but leaves no way to
+    /// index a `ConstantMemory<[f32; N]>` at runtime without materializing the
+    /// whole array first: the copy has no address, so it is spilled to the
+    /// thread's local depot, one `st.local` per element in *every thread*, and
+    /// the lookup then reads thread-private memory.
+    ///
+    /// Borrowing instead keeps the address in constant space, so a runtime index
+    /// is one `ld.const`:
+    ///
+    /// ```ignore
+    /// #[constant]
+    /// static TABLE: ConstantMemory<[f32; 256]> = ConstantMemory::UNINIT;
+    ///
+    /// let t = TABLE.get_ref();          // no load yet
+    /// acc += t[i & 255];                // one ld.const
+    /// ```
+    ///
+    /// # Which address space to prefer
+    ///
+    /// Constant memory is served by a broadcast-oriented cache, so its cost
+    /// depends on how much the lanes of a warp agree. `.const` is not simply
+    /// "faster memory", and the qualifier is the wrong thing to choose by:
+    ///
+    /// - **warp-uniform index** — every lane wants the same entry, which is one
+    ///   broadcast. This is what constant memory is for, and it is the one case
+    ///   that beats global memory.
+    /// - **divergent index** — lanes want different entries, and the constant
+    ///   cache serves distinct addresses in sequence. A table read this way
+    ///   belongs in ordinary global memory, where a warp's accesses coalesce and
+    ///   a small table stays resident in L1. A plain `const TABLE: [f32; N]`
+    ///   already lowers to exactly that, so it needs no host upload and no
+    ///   `#[constant]` at all.
+    ///
+    /// Measured on an A10G (sm_86), 256-entry `f32` table, 64 dependent lookups
+    /// per thread over 8388608 threads, all variants bit-identical:
+    ///
+    /// | index        | `get()` | `get_ref()` | `const [f32; N]` (global) |
+    /// |--------------|--------:|------------:|--------------------------:|
+    /// | divergent    | 16048us |      7616us |                 **322us** |
+    /// | warp-uniform | 16065us |  **258us**  |                     322us |
+    ///
+    /// So `get_ref` is 2.1x the throughput of `get` on a divergent index and 62x
+    /// on a warp-uniform one — but on a divergent index constant memory is still
+    /// 23.7x behind a plain array constant, because that is the pattern its cache
+    /// cannot serve in one go.
+    ///
+    /// # Reads are not folded away
+    ///
+    /// The returned reference borrows through the [`UnsafeCell`], so the storage
+    /// stays mutable as far as the compiler is concerned and a `set_<name>`
+    /// between launches remains visible — the same property that makes the
+    /// wrapper necessary in the first place. Repeated reads of one entry within a
+    /// single launch may still be merged, which is sound: the host writes only
+    /// between launches.
+    #[inline(always)]
+    pub fn get_ref(&self) -> &T {
+        // SAFETY: device code only ever reads this storage, so no `&mut` to it
+        // exists to alias. The host updates it via `cuMemcpyHtoD` between kernel
+        // launches, synchronized out-of-band relative to device execution, which
+        // is the same contract `get` relies on; holding a shared reference for
+        // the duration of a launch observes no write that `get` would not.
+        unsafe { &*self.0.get() }
     }
 }

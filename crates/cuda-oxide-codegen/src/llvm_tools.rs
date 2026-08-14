@@ -33,6 +33,15 @@
 //!    every rejected candidate. The experimental API treats requested
 //!    optimization as strict; the legacy rustc path retains its unoptimized
 //!    fallback.
+//!
+//! `llvm-link` follows the same discovery and the same rule for an explicit
+//! override: `CUDA_OXIDE_LLVM_LINK` is respected, with a diagnostic when its
+//! major differs from the chosen `llc`'s. It writes the libdevice-linked module
+//! that `llc` then reads, so it is exposed to the same cross-major hazard as
+//! `opt`. Where it differs: absent any override, no same-major `llvm-link`
+//! resolves to `None` *silently*, because that is not an error -- the backend's
+//! path decision sees IR-level libdevice linking is unavailable and switches to
+//! the NVVM path.
 
 use crate::options::BackendOptions;
 use std::path::Path;
@@ -46,10 +55,10 @@ pub struct OptTool {
     pub major: Option<u32>,
 }
 
-/// The `opt` / `llc` pair the pipeline will use, resolved once per
-/// compilation so both `optimize_ll` and `generate_ptx` agree on it.
-/// Future version-conditional IR emission should key off `llc_major` here
-/// rather than re-probing binaries.
+/// The `opt` / `llc` / `llvm-link` set the pipeline will use, resolved once
+/// per compilation so `optimize_ll`, `generate_ptx`, and `link_libdevice`
+/// agree on it. Future version-conditional IR emission should key off
+/// `llc_major` here rather than re-probing binaries.
 // mir-importer pipeline plumbing; not part of the frontend contract.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -64,6 +73,12 @@ pub struct LlvmToolchain {
     /// The matched `opt` for the middle-end; `None` skips `opt -O2`
     /// (either `opts.no_opt` or no same-major `opt` exists).
     pub opt: Option<OptTool>,
+    /// The matched `llvm-link` for libdevice linking; `None` when no
+    /// same-major `llvm-link` is available. The backend decision probes the
+    /// same discovery ([`libdevice_ir_linking_available`]) and falls back to
+    /// the NVVM IR path, so libdevice kernels never reach `llc` with this
+    /// unset.
+    pub llvm_link: Option<OptTool>,
     /// Tool-selection diagnostics for the caller to report or retain.
     pub diagnostics: Vec<String>,
 }
@@ -78,7 +93,7 @@ impl LlvmToolchain {
     pub fn resolve(opts: &BackendOptions) -> Option<Self> {
         let (llc_path, llc_major, llc_from_env) = resolve_llc(opts)?;
 
-        let (opt, diagnostics) = if opts.no_opt {
+        let (opt, mut diagnostics) = if opts.no_opt {
             // Explicit user intent: skip the middle-end, no warning needed.
             (None, Vec::new())
         } else {
@@ -87,7 +102,7 @@ impl LlvmToolchain {
                 let major = probe_runnable(&path).and_then(|t| t.major);
                 OptTool { path, major }
             });
-            let sibling = sibling_opt_candidates(&llc_path)
+            let sibling = sibling_tool_candidates(&llc_path, "opt")
                 .into_iter()
                 .find_map(|c| probe_runnable(&c));
             let mut others: Vec<OptTool> = Vec::new();
@@ -106,11 +121,27 @@ impl LlvmToolchain {
             (choice.into_opt(), diagnostics)
         };
 
+        // Resolve llvm-link for libdevice linking. Same discovery pattern
+        // as opt: env var, sibling, sysroot, versioned on PATH. Silently
+        // None when absent (the backend decision then avoids the PTX path
+        // for libdevice kernels).
+        let llvm_link =
+            resolve_sibling_tool("llvm-link", "CUDA_OXIDE_LLVM_LINK", &llc_path, llc_major);
+        if let Some(warning) = llvm_link_mismatch_warning(
+            std::env::var("CUDA_OXIDE_LLVM_LINK").ok().as_deref(),
+            llvm_link.as_ref().and_then(|tool| tool.major),
+            &llc_path,
+            llc_major,
+        ) {
+            diagnostics.push(warning);
+        }
+
         Some(LlvmToolchain {
             llc_path,
             llc_major,
             llc_from_env,
             opt,
+            llvm_link,
             diagnostics,
         })
     }
@@ -265,11 +296,11 @@ pub(crate) fn parse_llvm_major(version_output: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// `opt` paths co-located with `llc_path`, most specific first: the
-/// version-suffixed twin (`/usr/bin/llc-21` -> `/usr/bin/opt-21`), then the
-/// plain `opt` in the same directory. A bare `llc` name (resolved through
-/// `PATH`) yields bare `opt` names.
-pub(crate) fn sibling_opt_candidates(llc_path: &str) -> Vec<String> {
+/// Paths co-located with `llc_path` for a given tool name, most specific
+/// first: the version-suffixed twin (`/usr/bin/llc-21` ->
+/// `/usr/bin/<tool>-21`), then the plain name in the same directory. A bare
+/// `llc` name (resolved through `PATH`) yields bare tool names.
+pub(crate) fn sibling_tool_candidates(llc_path: &str, tool: &str) -> Vec<String> {
     let p = Path::new(llc_path);
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty());
 
@@ -280,9 +311,9 @@ pub(crate) fn sibling_opt_candidates(llc_path: &str) -> Vec<String> {
         .and_then(|b| b.strip_prefix("llc"))
         && !suffix.is_empty()
     {
-        names.push(format!("opt{suffix}"));
+        names.push(format!("{tool}{suffix}"));
     }
-    names.push("opt".to_string());
+    names.push(tool.to_string());
 
     names
         .into_iter()
@@ -291,6 +322,103 @@ pub(crate) fn sibling_opt_candidates(llc_path: &str) -> Vec<String> {
             None => n,
         })
         .collect()
+}
+
+/// Resolve an LLVM tool (e.g., `llvm-link`) co-located with the chosen
+/// `llc`, matched to the same LLVM major. Discovery order:
+///
+/// 1. Explicit env var (always used if set)
+/// 2. Co-located binary next to `llc`
+/// 3. Sysroot llvm-tools, then versioned names on PATH
+///
+/// Returns `None` silently when no same-major candidate exists.
+pub(crate) fn resolve_sibling_tool(
+    tool: &str,
+    env_var: &str,
+    llc_path: &str,
+    llc_major: Option<u32>,
+) -> Option<OptTool> {
+    if let Ok(path) = std::env::var(env_var) {
+        return probe_runnable(&path);
+    }
+
+    // Co-located sibling next to llc.
+    let sibling = sibling_tool_candidates(llc_path, tool)
+        .into_iter()
+        .find_map(|c| probe_runnable(&c));
+    if let Some(ref s) = sibling
+        && (llc_major.is_none() || s.major == llc_major)
+    {
+        return sibling;
+    }
+
+    // Sysroot and versioned on PATH.
+    let mut candidates: Vec<OptTool> = Vec::new();
+    if let Some(p) = sysroot_tool(tool)
+        && let Some(t) = probe_runnable(&p)
+    {
+        candidates.push(t);
+    }
+    for name in [format!("{tool}-22"), format!("{tool}-21"), tool.to_string()] {
+        if let Some(t) = probe_runnable(&name) {
+            candidates.push(t);
+        }
+    }
+    if let Some(llc_m) = llc_major {
+        candidates.into_iter().find(|t| t.major == Some(llc_m))
+    } else {
+        candidates.into_iter().next()
+    }
+}
+
+/// Warning for an explicit `CUDA_OXIDE_LLVM_LINK` whose LLVM major differs from
+/// the chosen `llc`'s, or `None` when there is nothing to say.
+///
+/// [`resolve_sibling_tool`] returns an explicit override without checking its
+/// major, exactly as [`choose_opt`] returns an explicit `CUDA_OXIDE_OPT` -- but
+/// `choose_opt` warns about the mismatch and this path was silent. The hazard is
+/// the same one this module was written for: `llvm-link` writes the
+/// libdevice-linked module that `llc` then reads, so splitting a major across
+/// those two is precisely the "IR the older tool rejects" case.
+///
+/// `None` whenever the comparison cannot be made -- the variable is unset, the
+/// override was not runnable, or either major is unparseable -- which mirrors
+/// `choose_opt`'s `(Some, Some)` guard rather than guessing.
+pub(crate) fn llvm_link_mismatch_warning(
+    explicit_path: Option<&str>,
+    link_major: Option<u32>,
+    llc_path: &str,
+    llc_major: Option<u32>,
+) -> Option<String> {
+    let path = explicit_path?;
+    let (link_major, llc_major) = (link_major?, llc_major?);
+    if link_major == llc_major {
+        return None;
+    }
+    Some(format!(
+        "warning: LLVM version mismatch between llvm-link and llc:\n\
+         warning:   CUDA_OXIDE_LLVM_LINK = {path} (LLVM {link_major})\n\
+         warning:   llc                  = {llc_path} (LLVM {llc_major})\n\
+         warning: llvm-link writes the libdevice-linked module that llc reads, so mixing\n\
+         warning: majors can produce IR the older tool rejects.\n\
+         warning: proceeding anyway because CUDA_OXIDE_LLVM_LINK is an explicit override;\n\
+         warning: unset it (or point it at an LLVM {llc_major} llvm-link) to fix the mismatch."
+    ))
+}
+
+/// Decision-time capability probe for IR-level libdevice linking.
+///
+/// True only when the `llc` that [`LlvmToolchain::resolve`] would pick is
+/// runnable AND a same-major `llvm-link` resolves for it. The PTX-vs-NVVM
+/// backend decision is made before the toolchain itself is resolved, so it
+/// must probe the same discovery logic: committing to the PTX path on
+/// libdevice file existence alone would later emit PTX with unresolved
+/// `.extern .func __nv_*` whenever `llvm-link` turns out to be missing.
+pub(crate) fn libdevice_ir_linking_available(opts: &BackendOptions) -> bool {
+    let Some((llc_path, llc_major, _)) = resolve_llc(opts) else {
+        return false;
+    };
+    resolve_sibling_tool("llvm-link", "CUDA_OXIDE_LLVM_LINK", &llc_path, llc_major).is_some()
 }
 
 /// Runs `cmd --version` and, on success, returns the tool with its parsed
@@ -360,16 +488,33 @@ mod tests {
     #[test]
     fn sibling_candidates_mirror_the_llc_name() {
         assert_eq!(
-            sibling_opt_candidates("/usr/bin/llc-21"),
+            sibling_tool_candidates("/usr/bin/llc-21", "opt"),
             ["/usr/bin/opt-21", "/usr/bin/opt"]
         );
         assert_eq!(
-            sibling_opt_candidates("/usr/lib/llvm/21/bin/llc"),
+            sibling_tool_candidates("/usr/lib/llvm/21/bin/llc", "opt"),
             ["/usr/lib/llvm/21/bin/opt"]
         );
         // Bare PATH names stay bare so they resolve through PATH.
-        assert_eq!(sibling_opt_candidates("llc-22"), ["opt-22", "opt"]);
-        assert_eq!(sibling_opt_candidates("llc"), ["opt"]);
+        assert_eq!(sibling_tool_candidates("llc-22", "opt"), ["opt-22", "opt"]);
+        assert_eq!(sibling_tool_candidates("llc", "opt"), ["opt"]);
+    }
+
+    #[test]
+    fn sibling_tool_candidates_generates_versioned_and_plain() {
+        assert_eq!(
+            sibling_tool_candidates("/usr/bin/llc-21", "llvm-link"),
+            ["/usr/bin/llvm-link-21", "/usr/bin/llvm-link"]
+        );
+        assert_eq!(
+            sibling_tool_candidates("/usr/lib/llvm/21/bin/llc", "llvm-link"),
+            ["/usr/lib/llvm/21/bin/llvm-link"]
+        );
+        assert_eq!(
+            sibling_tool_candidates("llc-22", "llvm-link"),
+            ["llvm-link-22", "llvm-link"]
+        );
+        assert_eq!(sibling_tool_candidates("llc", "llvm-link"), ["llvm-link"]);
     }
 
     #[test]
@@ -497,5 +642,60 @@ mod tests {
         assert_eq!(choice, OptChoice::Skip);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("/custom/bin/llc (unknown LLVM version)"));
+    }
+    /// The explicit-override warning `choose_opt` has for `CUDA_OXIDE_OPT`, now
+    /// for `CUDA_OXIDE_LLVM_LINK`. Pinned one condition at a time, because the
+    /// silent cases are the point: this must stay quiet whenever the comparison
+    /// cannot actually be made.
+    #[test]
+    fn explicit_llvm_link_major_mismatch_is_reported() {
+        // Nothing set: the discovery path already filters to llc's major.
+        assert_eq!(
+            llvm_link_mismatch_warning(None, Some(21), "/usr/bin/llc-22", Some(22)),
+            None,
+            "an unset override is not an override"
+        );
+
+        // Set and matching.
+        assert_eq!(
+            llvm_link_mismatch_warning(
+                Some("/usr/bin/llvm-link-22"),
+                Some(22),
+                "/usr/bin/llc-22",
+                Some(22)
+            ),
+            None
+        );
+
+        // Set and mismatched: the case that was silent.
+        let warning = llvm_link_mismatch_warning(
+            Some("/usr/bin/llvm-link-21"),
+            Some(21),
+            "/usr/bin/llc-22",
+            Some(22),
+        )
+        .expect("a major mismatch on an explicit override must be reported");
+        assert!(warning.contains("CUDA_OXIDE_LLVM_LINK = /usr/bin/llvm-link-21 (LLVM 21)"));
+        assert!(warning.contains("/usr/bin/llc-22 (LLVM 22)"));
+        // The message has to say why it proceeded, as the opt one does.
+        assert!(warning.contains("explicit override"));
+        assert!(warning.contains("LLVM 22 llvm-link"));
+
+        // Either major unparseable: no comparison is possible, so no claim.
+        assert_eq!(
+            llvm_link_mismatch_warning(
+                Some("/custom/llvm-link"),
+                None,
+                "/usr/bin/llc-22",
+                Some(22)
+            ),
+            None,
+            "an unparseable llvm-link version cannot be shown to mismatch"
+        );
+        assert_eq!(
+            llvm_link_mismatch_warning(Some("/custom/llvm-link"), Some(21), "/custom/llc", None),
+            None,
+            "an unparseable llc version cannot be shown to mismatch"
+        );
     }
 }

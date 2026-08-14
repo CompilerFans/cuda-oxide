@@ -49,6 +49,7 @@ use pliron::identifier::Legaliser;
 use pliron::op::Op;
 use pliron::printable::Printable;
 use rustc_public::mir::mono::Instance;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 fn stderr_pipeline_trace(message: &str) {
@@ -64,6 +65,12 @@ fn stderr_pipeline_trace(message: &str) {
 pub struct CollectedFunction {
     /// The monomorphized stable_mir instance (includes concrete generic args).
     pub instance: Instance,
+    /// Number of blocks in the rustc MIR body from which `instance.body()` is
+    /// converted. The importer verifies that conversion preserved the CFG.
+    pub rustc_mir_block_count: usize,
+    /// Exact per-block rustc successors for this monomorphized instance under
+    /// CUDA Oxide's device runtime-check policy.
+    pub rustc_mono_successors: Vec<Vec<usize>>,
     /// True if this is a GPU kernel entry point (has `#[kernel]` attribute).
     pub is_kernel: bool,
     /// The name to export in PTX. For kernels, this is the user-visible name.
@@ -100,6 +107,15 @@ pub enum CompilationArtifactKind {
     MacaDeviceBinary,
 }
 
+/// Launch bounds attached to one kernel entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelLaunchBounds {
+    /// Maximum threads per block declared by `#[launch_bounds]`.
+    pub max_threads: u32,
+    /// Requested minimum resident blocks per SM, when explicitly provided.
+    pub min_blocks: Option<u32>,
+}
+
 /// Output paths, target, and artifact format from successful compilation.
 pub struct CompilationResult {
     /// Path to generated LLVM IR (`.ll` file).
@@ -115,6 +131,8 @@ pub struct CompilationResult {
     /// Floating-point contraction policy that later compilation stages must
     /// preserve.
     pub allow_fma_contraction: bool,
+    /// Per-kernel source launch bounds preserved for post-link diagnostics.
+    pub kernel_launch_bounds: BTreeMap<String, KernelLaunchBounds>,
 }
 
 /// Configuration for the compilation pipeline.
@@ -151,6 +169,14 @@ pub struct PipelineConfig {
     ///
     /// Normally set by `cargo oxide --arch` or `CUDA_OXIDE_TARGET`.
     pub target_arch: Option<String>,
+    /// Human-readable name for whatever set `target_arch`, used when a target
+    /// error has to say where the target came from.
+    ///
+    /// Defaults to `"PipelineConfig::target_arch"`. A caller that read the
+    /// target from somewhere the user would recognise sets its own label:
+    /// `rustc-codegen-cuda` reads `CUDA_OXIDE_TARGET` itself and says so.
+    /// Only meaningful when `target_arch` is `Some`.
+    pub target_arch_source: &'static str,
     /// Detected architecture of the local GPU (`CUDA_OXIDE_DEVICE_ARCH`).
     ///
     /// Used only when no explicit target is provided.
@@ -174,11 +200,33 @@ impl Default for PipelineConfig {
             show_llvm_dialect: false,
             emit_nvvm_ir: false,
             target_arch: None,
+            target_arch_source: "PipelineConfig::target_arch",
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
         }
     }
+}
+
+/// Merges `config` over the environment-derived backend defaults.
+///
+/// Environment-derived compatibility options are read once at the rustc
+/// frontend boundary. Explicit pipeline configuration retains precedence.
+fn backend_options_for(config: &PipelineConfig) -> BackendOptions {
+    let mut backend_options = BackendOptions::from_env();
+    if config.target_arch.is_some() {
+        backend_options.target_arch = config.target_arch.clone();
+        // The label travels with the value it describes. Overriding the
+        // target and leaving `from_env`'s "CUDA_OXIDE_TARGET" in place made
+        // every target error blame an env var the caller may never have set.
+        backend_options.target_arch_source = config.target_arch_source;
+    }
+    if config.device_arch_hint.is_some() {
+        backend_options.device_arch_hint = config.device_arch_hint.clone();
+    }
+    backend_options.verbose = backend_options.verbose || config.verbose;
+    backend_options.no_fma = !config.allow_fma_contraction;
+    backend_options
 }
 
 /// Runs the full compilation pipeline on collected functions.
@@ -232,6 +280,7 @@ pub fn run_pipeline(
     let module_op_ptr = module.get_operation();
 
     let mut legaliser = Legaliser::default();
+    let mut kernel_launch_bounds = BTreeMap::new();
 
     // Step 3: Translate all functions
     for func in functions {
@@ -256,6 +305,8 @@ pub fn run_pipeline(
             &mut ctx,
             &body,
             &func.instance,
+            func.rustc_mir_block_count,
+            &func.rustc_mono_successors,
             func.is_kernel,
             func.is_inline_always,
             Some(&func.export_name),
@@ -282,6 +333,12 @@ pub fn run_pipeline(
 
         verify_operation(&ctx, func_op_ptr, &func.export_name)?;
 
+        if func.is_kernel
+            && let Some(bounds) = launch_bounds_from_mir_func(&ctx, func_op_ptr)
+        {
+            kernel_launch_bounds.insert(func.export_name.clone(), bounds);
+        }
+
         // Append to module
         append_to_module(&ctx, module_op_ptr, func_op_ptr);
     }
@@ -295,19 +352,7 @@ pub fn run_pipeline(
         .join(format!("{}.devbin", config.output_name));
     let stale_artifacts = stale_compilation_artifact_paths(&config.output_dir, &config.output_name);
 
-    // Environment-derived compatibility options are read once at the rustc
-    // frontend boundary. Explicit pipeline configuration retains precedence.
-    let mut backend_options = BackendOptions::try_from_env().map_err(|message| {
-        PipelineError::Export(format!("invalid codegen configuration: {message}"))
-    })?;
-    if config.target_arch.is_some() {
-        backend_options.target_arch = config.target_arch.clone();
-    }
-    if config.device_arch_hint.is_some() {
-        backend_options.device_arch_hint = config.device_arch_hint.clone();
-    }
-    backend_options.verbose = backend_options.verbose || config.verbose;
-    backend_options.no_fma = !config.allow_fma_contraction;
+    let backend_options = backend_options_for(config);
 
     let request = ModulePipelineRequest::for_rust_pipeline(
         device_externs,
@@ -335,6 +380,7 @@ pub fn run_pipeline(
                 &config.output_dir,
                 &config.output_name,
                 config.allow_fma_contraction,
+                config.debug_kind,
             )?;
             // Publish the target last: its version marker is the completion record
             // that says the sibling options file is required.
@@ -346,6 +392,7 @@ pub fn run_pipeline(
                 ptx_path,
                 target: generated.target,
                 allow_fma_contraction: config.allow_fma_contraction,
+                kernel_launch_bounds,
             })
         }
         ModuleArtifactKind::Ptx => Ok(CompilationResult {
@@ -355,6 +402,7 @@ pub fn run_pipeline(
             ptx_path,
             target: generated.target,
             allow_fma_contraction: config.allow_fma_contraction,
+            kernel_launch_bounds,
         }),
         ModuleArtifactKind::MacaDeviceBinary => Ok(CompilationResult {
             artifact_path: maca_device_binary_path,
@@ -363,8 +411,32 @@ pub fn run_pipeline(
             ptx_path,
             target: generated.target,
             allow_fma_contraction: config.allow_fma_contraction,
+            kernel_launch_bounds,
         }),
     }
+}
+
+fn launch_bounds_from_mir_func(
+    ctx: &Context,
+    func_op: pliron::context::Ptr<pliron::operation::Operation>,
+) -> Option<KernelLaunchBounds> {
+    use pliron::builtin::attributes::IntegerAttr;
+
+    let max_key: pliron::identifier::Identifier = "maxntid".try_into().ok()?;
+    let min_key: pliron::identifier::Identifier = "minctasm".try_into().ok()?;
+    let attributes = &func_op.deref(ctx).attributes;
+    let max_threads = attributes
+        .get::<IntegerAttr>(&max_key)
+        .and_then(|attribute| u32::try_from(attribute.value().to_u64()).ok())?;
+    let min_blocks = attributes
+        .get::<IntegerAttr>(&min_key)
+        .and_then(|attribute| u32::try_from(attribute.value().to_u64()).ok())
+        .filter(|value| *value != 0);
+
+    Some(KernelLaunchBounds {
+        max_threads,
+        min_blocks,
+    })
 }
 
 /// Ensures the configured output directory exists before any emission step.
@@ -409,16 +481,23 @@ fn write_nvvm_target_sidecar(
     })
 }
 
-/// Records the compile-wide options (currently the fma-contraction policy) that
-/// downstream LTOIR builds must preserve, next to the emitted `.ll`.
+/// Records the compile-wide FMA and debug policies that downstream libNVVM and
+/// nvJitLink stages must preserve, next to the emitted `.ll`.
 fn write_nvvm_compile_options_sidecar(
     output_dir: &Path,
     output_name: &str,
     allow_fma_contraction: bool,
+    debug_kind: DebugKind,
 ) -> Result<(), PipelineError> {
     let path = output_dir.join(format!("{output_name}.options"));
-    let options =
-        oxide_artifacts::ArtifactCompileOptions::new().with_fma_contraction(allow_fma_contraction);
+    let debug_policy = match debug_kind {
+        DebugKind::Off => oxide_artifacts::ArtifactDebugPolicy::None,
+        DebugKind::LineTables => oxide_artifacts::ArtifactDebugPolicy::LineTables,
+        DebugKind::Full => oxide_artifacts::ArtifactDebugPolicy::Full,
+    };
+    let options = oxide_artifacts::ArtifactCompileOptions::new()
+        .with_fma_contraction(allow_fma_contraction)
+        .with_debug_policy(debug_policy);
     std::fs::write(&path, options.sidecar_text()).map_err(|error| {
         PipelineError::Export(format!(
             "failed to record NVVM compile options in {}: {error}",
@@ -433,6 +512,8 @@ fn stale_compilation_artifact_paths(
 ) -> Vec<std::path::PathBuf> {
     [
         "ll",
+        "linked.ll",
+        "linked.opt.ll",
         "ptx",
         "target",
         "options",
@@ -479,6 +560,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         for suffix in [
             "ll",
+            "linked.ll",
+            "linked.opt.ll",
             "ptx",
             "target",
             "options",
@@ -502,6 +585,7 @@ mod tests {
             show_llvm_dialect: false,
             emit_nvvm_ir: true,
             target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
@@ -510,7 +594,15 @@ mod tests {
 
         assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
         assert_ne!(fs::read(&result.ll_path).unwrap(), b"stale");
-        for suffix in ["ptx", "ltoir", "cubin", "cubin.target", "devbin"] {
+        for suffix in [
+            "linked.ll",
+            "linked.opt.ll",
+            "ptx",
+            "ltoir",
+            "cubin",
+            "cubin.target",
+            "devbin",
+        ] {
             assert!(!root.join(format!("kernel.{suffix}")).exists(), "{suffix}");
         }
         assert_ne!(fs::read(root.join("kernel.target")).unwrap(), b"stale");
@@ -546,6 +638,7 @@ mod tests {
             show_llvm_dialect: false,
             emit_nvvm_ir: true,
             target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
@@ -576,6 +669,47 @@ mod tests {
     }
 
     #[test]
+    fn nvvm_sidecar_preserves_deferred_debug_policy() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cuda_oxide_nvvm_debug_options_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        for (name, debug_kind, expected_debug) in [
+            (
+                "off",
+                DebugKind::Off,
+                oxide_artifacts::ArtifactDebugPolicy::None,
+            ),
+            (
+                "lines",
+                DebugKind::LineTables,
+                oxide_artifacts::ArtifactDebugPolicy::LineTables,
+            ),
+            (
+                "full",
+                DebugKind::Full,
+                oxide_artifacts::ArtifactDebugPolicy::Full,
+            ),
+        ] {
+            write_nvvm_compile_options_sidecar(&root, name, false, debug_kind).unwrap();
+            let text = fs::read_to_string(root.join(format!("{name}.options"))).unwrap();
+            let options =
+                oxide_artifacts::ArtifactCompileOptions::from_sidecar_text(&text).unwrap();
+            assert!(!options.fma_contraction_enabled());
+            assert_eq!(options.debug_policy(), expected_debug);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn structured_device_extern_survives_pre_lowering_insertion() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -594,6 +728,7 @@ mod tests {
             show_llvm_dialect: false,
             emit_nvvm_ir: true,
             target_arch: Some("sm_86".to_string()),
+            target_arch_source: "PipelineConfig::target_arch",
             device_arch_hint: None,
             debug_kind: DebugKind::Off,
             allow_fma_contraction: true,
@@ -618,5 +753,39 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).expect("clean up temp output dir");
+    }
+
+    #[test]
+    fn an_explicit_config_target_is_labelled_as_its_own_source() {
+        let config = PipelineConfig {
+            target_arch: Some("sm_86".to_string()),
+            ..PipelineConfig::default()
+        };
+        let options = backend_options_for(&config);
+        assert_eq!(options.target_arch.as_deref(), Some("sm_86"));
+        assert_eq!(options.target_arch_source, "PipelineConfig::target_arch");
+    }
+
+    #[test]
+    fn a_caller_supplied_label_survives_the_override() {
+        let config = PipelineConfig {
+            target_arch: Some("sm_86".to_string()),
+            target_arch_source: "cargo oxide --arch",
+            ..PipelineConfig::default()
+        };
+        assert_eq!(
+            backend_options_for(&config).target_arch_source,
+            "cargo oxide --arch"
+        );
+    }
+
+    #[test]
+    fn the_env_label_stands_when_the_config_sets_no_target() {
+        let config = PipelineConfig::default();
+        assert_eq!(config.target_arch, None);
+        assert_eq!(
+            backend_options_for(&config).target_arch_source,
+            "CUDA_OXIDE_TARGET"
+        );
     }
 }

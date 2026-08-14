@@ -296,19 +296,20 @@ If you need to install it manually:
 
 ```bash
 rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev rust-analyzer --toolchain nightly-2026-04-03
+rustup component add rust-src rustc-dev rust-analyzer llvm-tools --toolchain nightly-2026-04-03
 ```
 
-The two extra components are required by the codegen backend:
+These components are required by the codegen backend and doctor:
 
 - `rust-src` -- source of the Rust standard library, needed for cross-compiling to the NVPTX target.
 - `rustc-dev` -- compiler internals that the backend links against.
+- `llvm-tools` -- toolchain-bundled `llc` used to lower LLVM IR to PTX (doctor's floor check).
 
 ---
 
 ## cargo-oxide
 
-`cargo-oxide` is the cargo subcommand that drives the entire build pipeline (`cargo oxide run`, `build`, `debug`, `pipeline`, etc.).
+`cargo-oxide` is the cargo subcommand that drives the entire build pipeline (`cargo oxide run`, `build`, `debug`, `pipeline`, and the rest -- the Command reference at the end of this section lists all of them).
 
 **Inside the cuda-oxide repo**, it works out of the box via a workspace alias -- no extra install step.
 
@@ -319,6 +320,77 @@ cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend. Subsequent runs reuse the cached build.
+
+To discover the examples available in a cuda-oxide checkout:
+
+```bash
+cargo oxide list
+cargo oxide list --json
+```
+
+The command reports each example's purpose and any documented GPU, architecture,
+CUDA Toolkit, or external SDK requirements.
+
+Useful day-to-day helpers once you are building kernels:
+
+```bash
+# Print generated PTX without the full MIR/LLVM pipeline dump
+cargo oxide inspect vecadd
+
+# Remove local target/ dirs and generated device artifacts (PTX, LLVM IR,
+# LTOIR, cubin, and their sidecar metadata)
+cargo oxide clean
+```
+
+`inspect` is the lightweight counterpart to `cargo oxide pipeline`. `clean`
+only touches project-local outputs; it leaves the shared backend cache at
+`~/.cargo/cuda-oxide/` alone.
+
+### Command reference
+
+The full set, as `cargo oxide --help` reports it:
+
+| Command | Description |
+|---------|-------------|
+| `run` | Build and run an example or project |
+| `sanitize` | Build and run an example or project under NVIDIA Compute Sanitizer |
+| `build` | Build an example or project (compile only, don't run) |
+| `test` | Run Cargo tests through the cuda-oxide backend |
+| `emit-ltoir` | Compile a crate's device code to a binary LTOIR artifact in one step |
+| `pipeline` | Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output |
+| `debug` | Build with debug info and launch `cuda-gdb` |
+| `list` | List the examples bundled with the cuda-oxide workspace |
+| `inspect` | Build an example or project and print the generated PTX |
+| `fmt` | Format all crates (root workspace, codegen backend, examples) |
+| `new` | Scaffold a new standalone cuda-oxide project |
+| `clean` | Remove project-local build outputs and generated cuda-oxide artifacts |
+| `doctor` | Check that your environment is set up correctly |
+| `setup` | Build and cache the codegen backend |
+| `update` | Refresh the cached codegen backend (or run `setup` inside the workspace) |
+
+Four of these are worth calling out, because they do something `cargo` itself
+cannot:
+
+```bash
+# Run the test suite with device code compiled by the cuda-oxide backend.
+# Arguments after `--` go to cargo; with none it is a plain `cargo test`.
+cargo oxide test -- --lib
+
+# Format the root workspace, the codegen backend, and every example. Each has
+# its own [workspace], so a single `cargo fmt` at the root misses most of them.
+cargo oxide fmt
+cargo oxide fmt --check
+
+# Rebuild the cached backend after changing compiler crates or the toolchain
+# pin. Inside the workspace this advises `setup`; --force runs it.
+cargo oxide update
+
+# Produce the LTOIR a tile or C++ kernel links against. LTOIR is
+# architecture-specific, so --arch is required rather than inferred.
+cargo oxide emit-ltoir my_kernels --arch sm_90
+```
+
+Every command takes `--help`, which lists the flags each one accepts.
 
 ---
 
@@ -352,8 +424,8 @@ If everything is configured correctly, this compiles a Rust kernel to PTX, launc
 :::{tip}
 **Common issues:**
 
-- `No working llc-21 or llc-22 found on PATH` -- install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
+- `No working llc-21 or llc-22 found on PATH` -- prefer `rustup component add llvm-tools --toolchain nightly-2026-04-03`, or install LLVM 21+ (`sudo apt install llvm-21`), add `/usr/lib/llvm-21/bin` to your `PATH`, or set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 - `'stddef.h' file not found` when building host `cuda-bindings` -- install clang dev headers: `sudo apt install clang-21` (or `libclang-common-21-dev`).
 - `cuda.h not found` -- Set `CUDA_TOOLKIT_PATH` to your CUDA install root, or ensure `/usr/local/cuda/include/cuda.h` exists.
-- `rust-src component missing` -- Run `rustup component add rust-src --toolchain nightly-2026-04-03`.
+- `rust-src` / `llvm-tools` component missing -- Run `rustup component add rust-src llvm-tools --toolchain nightly-2026-04-03`.
 :::

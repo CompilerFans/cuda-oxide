@@ -23,14 +23,16 @@ use pliron::{
 
 use crate::{
     ops,
+    ops::GlobalOpExt,
     types::{ArrayType, FuncType, HalfType, PointerType, VoidType},
 };
 
 use super::{
+    ExportedModule,
     config::{DebugKind, ExportBackendConfig, NvvmIrDialect},
     externs::{DeviceExternDecl, DeviceExternType},
     metadata::{emit_nvvm_annotations, emit_nvvmir_version, needs_nvvm_annotations},
-    state::{GlobalSymbolInfo, ModuleExportState},
+    state::{GlobalSourceInfo, GlobalSymbolInfo, ModuleExportState},
 };
 
 fn validate_export_config(config: &dyn ExportBackendConfig) -> Result<(), String> {
@@ -55,17 +57,47 @@ fn index_module_symbols(
     };
     for operation in block.deref(state.ctx).iter(state.ctx) {
         if let Some(global) = Operation::get_op::<ops::GlobalOp>(operation, state.ctx) {
+            let symbol = global.get_symbol_name(state.ctx).to_string();
+            let value_type = global.get_type(state.ctx);
+            let address_space = global.address_space(state.ctx);
             state.global_symbols.insert(
-                global.get_symbol_name(state.ctx).to_string(),
+                symbol.clone(),
                 GlobalSymbolInfo {
-                    value_type: global.get_type(state.ctx),
-                    address_space: global.address_space(state.ctx),
+                    value_type,
+                    address_space,
                 },
             );
+            if global.is_retained(state.ctx) {
+                state.retained_globals.push(symbol.clone());
+            }
+
+            if let Some(source_key) = global.source_global_key(state.ctx) {
+                let initializer_size = global
+                    .initializer_hex(state.ctx)
+                    .and_then(|hex| u64::try_from(hex.len() / 2).ok());
+                let source_info = GlobalSourceInfo {
+                    symbol: symbol.clone(),
+                    value_type,
+                    address_space,
+                    initializer_size,
+                };
+                if let Some(existing) = state.global_sources.get(&source_key)
+                    && (existing.symbol != source_info.symbol
+                        || existing.value_type != source_info.value_type
+                        || existing.address_space != source_info.address_space
+                        || existing.initializer_size != source_info.initializer_size)
+                {
+                    return Err(format!(
+                        "multiple LLVM globals map to rustc global key `{source_key}`: `@{}` and `@{symbol}`",
+                        existing.symbol
+                    ));
+                }
+                state.global_sources.insert(source_key, source_info);
+            }
         } else if let Some(func) = Operation::get_op::<ops::FuncOp>(operation, state.ctx) {
             let raw_name = func.get_symbol_name(state.ctx);
             let exported_name = if raw_name.starts_with("llvm_") {
-                raw_name.replace('_', ".")
+                super::names::decode_intrinsic_identifier(&raw_name)
             } else {
                 super::names::strip_device_prefix(&raw_name)
             };
@@ -97,7 +129,9 @@ fn device_extern_type_matches_erased(
     let actual = actual.deref(ctx);
     match expected {
         DeviceExternType::Void => actual.is::<VoidType>(),
-        DeviceExternType::Integer(bits) => actual
+        DeviceExternType::Integer(bits)
+        | DeviceExternType::SignExtInteger(bits)
+        | DeviceExternType::ZeroExtInteger(bits) => actual
             .downcast_ref::<IntegerType>()
             .is_some_and(|ty| ty.width() == *bits),
         DeviceExternType::Float16 => actual.is::<HalfType>(),
@@ -163,31 +197,88 @@ fn validate_device_extern_function_shape(
     Ok(())
 }
 
+/// Names of the module's externally consumed function definitions: kernel
+/// entries plus `#[device]` exports. One shared list feeds both `@llvm.used`
+/// emission and the internalization public-API list so the two root sets can
+/// never drift apart. The union (rather than kernels-else-device-functions)
+/// keeps a `#[device]` export visible even when the module also has kernels;
+/// anonymous helpers carry neither marker and stay internalizable.
+fn root_function_names<'a>(state: &'a ModuleExportState<'_>) -> Vec<&'a str> {
+    let mut names: Vec<&str> = state
+        .all_kernels
+        .iter()
+        .map(|kernel| kernel.name.as_str())
+        .chain(state.device_functions.iter().map(String::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 fn emit_llvm_used(output: &mut String, state: &ModuleExportState<'_>) -> Result<(), String> {
-    let names: Vec<&str> = if !state.all_kernels.is_empty() {
-        state
-            .all_kernels
-            .iter()
-            .map(|kernel| kernel.name.as_str())
-            .collect()
-    } else {
-        state.device_functions.iter().map(String::as_str).collect()
-    };
-    if names.is_empty() {
+    let function_names = root_function_names(state);
+    let mut global_names = state
+        .retained_globals
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    global_names.sort_unstable();
+    global_names.dedup();
+    if function_names.is_empty() && global_names.is_empty() {
         return Ok(());
     }
 
-    let mut used_refs = Vec::with_capacity(names.len());
+    let mut used_refs = Vec::with_capacity(function_names.len() + global_names.len());
     let element_type = if state.legacy_typed_pointers() {
-        for name in names {
+        for name in function_names {
             let mut reference = String::from("i8* bitcast (");
             state.export_function_pointer_type(state.function_type(name)?, &mut reference)?;
             write!(&mut reference, " @{name} to i8*)").unwrap();
             used_refs.push(reference);
         }
+        for name in global_names {
+            let info = state
+                .global_symbols
+                .get(name)
+                .ok_or_else(|| format!("retained global `@{name}` was not indexed"))?;
+            let mut reference = String::from("i8* ");
+            if info.address_space == 0 {
+                reference.push_str("bitcast (");
+                state.export_type(info.value_type, &mut reference)?;
+                write!(&mut reference, "* @{name} to i8*)").unwrap();
+            } else {
+                reference.push_str("addrspacecast (");
+                state.export_type(info.value_type, &mut reference)?;
+                write!(
+                    &mut reference,
+                    " addrspace({})* @{name} to i8*)",
+                    info.address_space
+                )
+                .unwrap();
+            }
+            used_refs.push(reference);
+        }
         "i8*"
     } else {
-        used_refs.extend(names.into_iter().map(|name| format!("ptr @{name}")));
+        used_refs.extend(
+            function_names
+                .into_iter()
+                .map(|name| format!("ptr @{name}")),
+        );
+        for name in global_names {
+            let info = state
+                .global_symbols
+                .get(name)
+                .ok_or_else(|| format!("retained global `@{name}` was not indexed"))?;
+            if info.address_space == 0 {
+                used_refs.push(format!("ptr @{name}"));
+            } else {
+                used_refs.push(format!(
+                    "ptr addrspacecast (ptr addrspace({}) @{name} to ptr)",
+                    info.address_space
+                ));
+            }
+        }
         "ptr"
     };
 
@@ -252,6 +343,15 @@ fn validate_device_extern_decl(
     {
         return Err(format!(
             "device extern `@{}` uses `half`, which is not supported by the CUDA 12 legacy LLVM 7 NVVM dialect",
+            decl.export_name
+        ));
+    }
+    if legacy_typed_pointers
+        && (decl.return_type.ext_attr().is_some()
+            || decl.param_types.iter().any(|ty| ty.ext_attr().is_some()))
+    {
+        return Err(format!(
+            "device extern `@{}` passes a sub-32-bit integer or `bool` by value, which is not supported by the CUDA 12 legacy LLVM 7 NVVM dialect; use i32/u32 or pass a pointer",
             decl.export_name
         ));
     }
@@ -360,7 +460,7 @@ pub(super) fn export_module_with_externs_impl(
     module: &ModuleOp,
     device_externs: &[DeviceExternDecl],
     config: &dyn ExportBackendConfig,
-) -> Result<String, String> {
+) -> Result<ExportedModule, String> {
     validate_export_config(config)?;
     let mut output = String::new();
     let emit_all_annotations = config.emit_all_kernel_annotations();
@@ -425,6 +525,10 @@ pub(super) fn export_module_with_externs_impl(
                 continue;
             }
             write!(&mut output, "declare ").unwrap();
+            // Return-position attributes precede the type: `declare signext i8 @f()`.
+            if let Some(attr) = decl.return_type.ext_attr() {
+                write!(&mut output, "{attr} ").unwrap();
+            }
             decl.return_type
                 .write_llvm(&mut output, state.legacy_typed_pointers())?;
             write!(&mut output, " @{}(", decl.export_name).unwrap();
@@ -432,7 +536,7 @@ pub(super) fn export_module_with_externs_impl(
                 if index != 0 {
                     write!(&mut output, ", ").unwrap();
                 }
-                param.write_llvm(&mut output, state.legacy_typed_pointers())?;
+                param.write_llvm_with_attr(&mut output, state.legacy_typed_pointers())?;
             }
             writeln!(&mut output, ")").unwrap();
         }
@@ -527,7 +631,21 @@ pub(super) fn export_module_with_externs_impl(
     }
 
     verify_legacy_text(&output, &state)?;
-    Ok(output)
+    Ok(ExportedModule {
+        llvm_ir: output,
+        public_symbols: public_symbols(&state),
+    })
+}
+
+fn public_symbols(state: &ModuleExportState<'_>) -> Vec<String> {
+    let mut symbols: Vec<String> = root_function_names(state)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    symbols.extend(state.public_globals.iter().cloned());
+    symbols.sort_unstable();
+    symbols.dedup();
+    symbols
 }
 
 /// Export a module op to a String containing LLVM IR with custom backend configuration.

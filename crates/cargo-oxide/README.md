@@ -25,39 +25,53 @@ cargo oxide new my_project          # scaffold a new cuda-oxide project
 cargo oxide new my_project --async  # scaffold with async template (tokio + cuda-async)
 cargo oxide run vecadd              # build + run an example
 cargo oxide build vecadd            # compile only (no run)
+cargo oxide build vecadd --materialize-cubin --arch sm_120  # embed native cubin
 cargo oxide emit-ltoir vecadd --arch sm_100  # device code -> .ltoir (Tile/SIMT interop)
 cargo oxide build -- -p my_app      # arbitrary cargo build through cuda-oxide
 cargo oxide test                    # cargo test with cuda-oxide defaults
 cargo oxide test -- -p my_app       # arbitrary cargo test through cuda-oxide
 cargo oxide pipeline vecadd         # verbose pipeline dump
                                     # (MIR -> dialect-mir -> LLVM dialect -> LLVM IR -> PTX)
+cargo oxide inspect vecadd          # build + print generated PTX
 cargo oxide sanitize vecadd         # build + run under NVIDIA Compute Sanitizer
 cargo oxide debug vecadd --tui      # build + launch cuda-gdb
 cargo oxide fmt                     # format all crates
 cargo oxide fmt --check             # check formatting
+cargo oxide list                    # list examples and requirements
+cargo oxide list --json             # stable machine-readable output
+cargo oxide clean                   # remove local build outputs / generated artifacts
 cargo oxide doctor                  # validate environment
 cargo oxide setup                   # explicitly build the codegen backend
+cargo oxide update                  # refresh cached backend (external projects)
+cargo oxide update --force          # inside the workspace, run setup via update
 ```
 
 ### Flags
 
 | Flag                         | Applies to                       | Description                                     |
 |------------------------------|----------------------------------|-------------------------------------------------|
+| `--materialize-cubin`        | run, sanitize, build, test, pipeline, debug | Finalize and embed target-specific native GPU code during the host build |
 | `--emit-nvvm-ir`             | run, build, pipeline             | Generate NVVM IR for libNVVM                    |
-| `--arch <sm_XX>`             | run, sanitize, build, test, pipeline, emit-ltoir | Target architecture override |
-| `--features <F>`             | run, sanitize, debug, build, build passthrough, emit-ltoir | Comma-separated cargo features to enable |
+| `--arch <sm_XX>`             | run, sanitize, build, test, pipeline, emit-ltoir, inspect, debug | Target architecture override |
+| `--features <F>`             | run, sanitize, debug, build, build passthrough, emit-ltoir, inspect | Comma-separated cargo features to enable |
+| `--device-features <F>`      | run, build                       | Comma-separated features for metadata-declared device crates only |
 | `--bin <NAME>`               | run, sanitize, debug                | Specific binary target to build/run      |
 | `--tool <T>`                 | sanitize                         | Compute Sanitizer tool: `memcheck`, `racecheck`, `initcheck`, or `synccheck` |
 | `-o, --output <P>`           | emit-ltoir                       | Output path for the `.ltoir` artifact           |
 | `--cargo-target-dir <PATH>`  | build/test passthrough           | Cargo target directory                          |
 | `--device-codegen-crate <LIST>` | build/test passthrough        | Comma-separated device owner crate filter       |
 | `--device-cfg <NAME>`        | build/test passthrough           | Append `--cfg NAME` to rustflags                |
-| `-v, --verbose`              | run, sanitize, build, test, emit-ltoir | Show detailed compilation output           |
-| `--no-fmad`                  | run, sanitize, build, emit-ltoir, pipeline | Keep ordinary multiply and add/subtract operations separate |
+| `-v, --verbose`              | run, sanitize, build, test, emit-ltoir, inspect | Show detailed compilation output           |
+| `--no-fmad`                  | run, sanitize, build, test, emit-ltoir, pipeline, inspect | Keep ordinary multiply and add/subtract operations separate |
+| `--unchecked-indexing`       | run, sanitize, build, test, emit-ltoir, pipeline, inspect | Elide device slice/array bounds checks (UB on OOB) |
+| `--lineinfo`                 | run, sanitize, build, test, emit-ltoir, pipeline, inspect | Emit device line-number info for profilers (nvcc `-lineinfo`) |
+| `--device-debug`             | run, sanitize, build, test, emit-ltoir, pipeline, inspect | Emit full device debug info; disables libNVVM optimization (nvcc `-G`) |
+| `--force`                    | update                           | Inside the workspace, run `setup` instead of advising it |
 | `--async`                    | new                              | Use the async template                          |
 | `--cgdb`                     | debug                            | Use cgdb instead of cuda-gdb                    |
 | `--tui`                      | debug                            | Use GDB's TUI interface                         |
 | `--check`                    | fmt                              | Check formatting only                           |
+| `--json`                     | list                             | Emit stable machine-readable output             |
 
 `--arch` is required for `emit-ltoir` and explicit NVVM IR output because those
 artifacts are architecture-specific. Without an override, `run` detects the
@@ -72,7 +86,56 @@ and versioned `.target` files and passes `-fma=0` through libNVVM and
 nvJitLink. Keep both sidecars with the artifact when another build system
 consumes it.
 
+`--lineinfo` and `--device-debug` select the device debug policy, mirroring nvcc's
+`-lineinfo` and `-G`. `--lineinfo` preserves source line mappings with optimization
+intact and reaches nvJitLink as `-lineinfo`; `--device-debug` emits full debug
+information and additionally passes `-g` with `-opt=0` to libNVVM, so device
+optimization is disabled. Asking for both yields full debug, because full debug
+already carries line tables.
+
+Both are equivalent to `CUDA_OXIDE_DEBUG=line` and `CUDA_OXIDE_DEBUG=full`, and an
+explicit flag outranks that variable. Omitting the flags exports nothing rather than
+`off`, so an absent flag never cancels a debug level the environment or
+`cuda-oxide.toml` already requested. Because the policy changes what the CUDA compiler
+stages are asked to do, it participates in the codegen fingerprint: switching it
+rebuilds device code instead of reusing artifacts compiled under a different policy.
+
+`--materialize-cubin` moves the remaining libNVVM and nvJitLink work into the
+host build. The executable embeds a native cubin, so deployment does not need
+libNVVM, nvJitLink, or a first-load compilation step. This trades portability
+for startup simplicity: the cubin is pinned to the requested architecture and
+cannot use cuda-oxide's load-time PTX bridge on a newer GPU.
+
+```bash
+cargo oxide build vecadd --materialize-cubin --arch sm_120
+```
+
+A concrete architecture and a build-host CUDA Toolkit (libNVVM, nvJitLink, and
+libdevice) are required. cargo-oxide fingerprints the exact compiler inputs and
+rechecks them inside the backend; use the wrapper flag instead of setting
+`CUDA_OXIDE_MATERIALIZE_CUBIN` around raw Cargo. That variable is an internal
+wrapper/backend signal, not a supported user interface: raw Cargo may reuse a
+previous artifact without running the backend, and a backend invocation without
+the wrapper's fingerprint is rejected. Generic `#[cuda_module]` kernels and
+`#[device] extern` declarations are rejected because their run-time
+multi-artifact linking is not yet represented by this single-cubin path.
+Metadata-interop projects keep rejecting this global flag; they can instead
+request one independently finalized cubin per declared device crate with
+`artifact-kind = "cubin"`, as described below. Materialization is also a
+final-output mode, so it cannot be combined with `--emit-nvvm-ir` or
+`emit-ltoir`.
+
 ## Commands
+
+### `cargo oxide list [--json]`
+
+Lists every example bundled with the cuda-oxide workspace, including its short
+description and any hardware or toolkit requirements documented in its README.
+
+```bash
+cargo oxide list
+cargo oxide list --json
+```
 
 ### `cargo oxide run <example>`
 
@@ -94,11 +157,55 @@ cargo oxide run cutile_inter_kernel
 Interop examples can declare extra cuda-oxide device crates with
 `[[package.metadata.cuda-oxide.device-crates]]`, plus optional
 `[package.metadata.cuda-oxide.interop]` metadata. `cargo oxide run` builds those
-device crates with `rustc-codegen-cuda`, writes their PTX to the
-configured location, and then builds/runs the host crate normally.
+device crates with `rustc-codegen-cuda`, writes each configured artifact, and
+then builds/runs the host crate normally. PTX remains the default;
 `cutile_inter_kernel` uses this path:
 the host crate is a cutile-rs program, while `simt/` is a cuda-oxide SIMT PTX
 crate loaded by the host at runtime.
+
+Device crates that need a deployment-time native artifact can opt into the
+same libNVVM and nvJitLink finalizer used by cuda-oxide's embedded
+materialization path. When a device package defines multiple binary targets,
+select one explicitly with `bin`:
+
+```toml
+[[package.metadata.cuda-oxide.device-crates]]
+manifest-path = "device/Cargo.toml"
+artifact-dir = "device"
+artifact-name = "simt_device"
+artifact-kind = "cubin"
+source-identity = true
+bin = "simt-device"
+```
+
+`artifact-kind` accepts `ptx` (the default) or `cubin`. Cubin export requires a
+concrete target from `--arch`, `CUDA_OXIDE_TARGET`, project configuration, or
+the device detected by `run`; that requirement is checked before the device
+build. The cubin itself is always finalized for the target the backend records
+in the emitted `<name>.target` sidecar, which can differ from the request hint
+when the kernel needs a newer architecture than the detected device. When
+`source-identity` is true, cargo-oxide also writes `<artifact>.identity`
+containing the built target (read back from the `.target` sidecar, or from the
+PTX's own `.target` directive for `ptx` artifacts), the normalized
+`--device-features` selection, the artifact digest, and Cargo depfile-derived
+source digests. Paths in that sidecar are relative to the artifact directory.
+
+Use `--device-features` when the nested device crate and host crate have
+different feature sets:
+
+```bash
+cargo oxide build interop-app --arch sm_120a \
+  --features host-integration \
+  --device-features tensor-cores
+```
+
+`inspect` accepts only PTX interop artifacts; use the declared cubin file
+directly for native artifact inspection.
+
+`cargo oxide` validates `bin`, builds only that target with `cargo build
+--bin`, and uses the selected binary name for the artifact unless
+`artifact-name` is set. Omitting `bin` preserves the package-default build
+behavior.
 
 ### `cargo oxide sanitize <example>`
 
@@ -166,10 +273,12 @@ package with several targets, embedded bundles still use the package name, so
 an excluded target's loader could otherwise find a selected sibling target's
 bundle.
 
-Passthrough builds include the effective codegen settings and backend build in
-Cargo's rustc fingerprint. Changing the target, output mode, FMA policy, owner
-list, configured codegen environment, or backend `.so` therefore regenerates
-device artifacts instead of reusing a stale Cargo result.
+Passthrough builds use two Cargo cache boundaries. The exact backend `.so`
+identity is global because that backend compiles every crate. CUDA procedural
+macros track target, output mode, FMA policy, owner list, materializer
+provenance, and configured codegen environment only in crates that can own or
+instantiate device code. Changing those settings therefore regenerates device
+artifacts without recompiling unrelated host-only dependencies.
 
 ### `cargo oxide emit-ltoir <crate>`
 
@@ -244,7 +353,9 @@ Formats all crates in the workspace: root workspace, `rustc-codegen-cuda`, and a
 Validates that your environment is correctly set up: Rust nightly toolchain,
 CUDA headers (`cuda.h`), CUDA toolkit (`nvcc`, libNVVM, nvJitLink,
 libdevice), LLVM (`llc`), clang/libclang, the NVIDIA driver / GPU, and the
-codegen backend `.so`. Every check reports what was found or how to fix it.
+codegen backend `.so`. Optional probes cover `cuda-gdb` (for `debug`) and
+`compute-sanitizer` (for `sanitize`). Every check reports what was found or
+how to fix it.
 
 `cargo-oxide` itself builds and runs without the CUDA toolkit and without an
 NVIDIA driver, and `doctor` never builds anything first, so it works on a
@@ -256,6 +367,18 @@ anyway).
 ### `cargo oxide setup`
 
 Explicitly builds (or rebuilds) the codegen backend. Normally this happens automatically on every `run`/`build`/`pipeline` command, but `setup` is useful after pulling new changes or for CI.
+
+### `cargo oxide update [--force]`
+
+Refreshes the shared codegen backend cache used by projects outside this
+repository (`~/.cargo/cuda-oxide/`). Inside the cuda-oxide workspace the local
+source tree is authoritative, so the default path prints how to run
+`cargo oxide setup`; pass `--force` to run setup from this command.
+
+```bash
+cargo oxide update
+cargo oxide update --force
+```
 
 ## Backend Discovery
 
@@ -279,6 +402,13 @@ extra-rustflags = ["--cfg", "my_device_cfg"]
 MY_BUILD_FLAG = "1"
 ```
 
+`cargo oxide doctor` validates this file when present: malformed TOML,
+wrong-shaped fields, or a `default-arch` the CUDA arch parser rejects fail
+the check (doctor exits non-zero but still completes the full scan), while
+ignored `[env]` keys such as `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` and
+non-`sm_XX` `default-arch` spellings (`compute_90`, bare `90`) are reported
+as warnings. Build commands remain strict and refuse to run with an invalid
+config.
 Relative backend paths are resolved from the `.cargo` directory containing the
 config file. Each `extra-rustflags` array element remains one rustc argument,
 including values that contain spaces.
@@ -312,7 +442,3 @@ crates/cargo-oxide/
 | Command                         | Description                                             |
 |---------------------------------|---------------------------------------------------------|
 | `cargo oxide bench <example>`   | GPU profiling (nsys/ncu integration), report TFLOPS     |
-| `cargo oxide clean`             | Remove generated PTX/LL/LTOIR artifacts and build caches|
-| `cargo oxide update`            | Update the cached codegen backend to latest version     |
-| `cargo oxide list`              | List examples with descriptions and hardware reqs       |
-| `cargo oxide inspect <example>` | Show generated PTX without the full pipeline dump       |

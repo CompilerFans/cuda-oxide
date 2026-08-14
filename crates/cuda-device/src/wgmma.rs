@@ -3,11 +3,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Warpgroup Matrix Multiply-Accumulate (WGMMA) for Hopper+ architectures.
+//! Warpgroup Matrix Multiply-Accumulate (WGMMA) for Hopper `sm_90a`.
 //!
 //! WGMMA operates at the warpgroup level (128 threads = 4 warps) to perform
 //! efficient tensor core matrix multiplication. Unlike WMMA which operates
 //! per-warp (32 threads), WGMMA leverages the full warpgroup for larger tiles.
+//!
+//! The control and descriptor helpers are available. The
+//! `m64n64k16.f32.bf16.bf16` MMA variant has value-threaded lowering for
+//! several deliberately restricted, provably safe region shapes:
+//!
+//! - linear full-drain regions ending in `wgmma_wait_group::<0>()`;
+//! - a canonical counted K-loop with affine descriptor recurrences;
+//! - straight-line partial-wait pipelines with a static `wait_group<N>` and
+//!   `N + 1` independent accumulator slots.
+//!
+//! Every accepted asynchronous lifetime is fused into one convergent inline-PTX
+//! scope and ends in `wait_group<0>` before accumulator values become visible to
+//! LLVM again. Unsupported full-drain pointer shapes retain the deferred
+//! pointer-form fallback. F16 and TF32 MMA calls remain unsupported.
 //!
 //! # Architecture
 //!
@@ -29,7 +43,7 @@
 //!
 //! Each thread in the 128-thread warpgroup holds 32 floats:
 //! ```rust,ignore
-//! let mut acc: [[f32; 8]; 4] = [[0.0; 8]; 4];  // 32 floats per thread
+//! let mut acc: [[f32; 8]; 4] = [[0.0; 8]; 4];
 //! // Total: 128 threads × 32 = 4096 floats = 64×64 tile
 //! ```
 //!
@@ -38,103 +52,48 @@
 //! ```rust,ignore
 //! use cuda_device::wgmma::*;
 //!
-//! // Initialize accumulator to zero
 //! let mut acc: [[f32; 8]; 4] = [[0.0; 8]; 4];
-//!
-//! // Create descriptors for shared memory tiles
 //! let desc_a = make_smem_desc(a_smem_ptr);
 //! let desc_b = make_smem_desc(b_smem_ptr);
 //!
-//! // Fence before WGMMA
 //! wgmma_fence();
-//!
-//! // Issue WGMMA (K=16 per instruction, so 4 calls for K=64)
 //! wgmma_mma_m64n64k16_f32_bf16(&mut acc, desc_a, desc_b);
-//!
-//! // Commit the group
 //! wgmma_commit_group();
-//!
-//! // Wait for completion
 //! wgmma_wait_group::<0>();
+//!
+//! // `acc` may be read only after the wait.
 //! ```
+//!
+//! # Current Lowering Contract
+//!
+//! The compiler selects a value-threaded path only when it can prove the whole
+//! asynchronous accumulator lifetime.
+//!
+//! - **Linear full drain:** one canonical `[[f32; 8]; 4]` accumulator, one
+//!   commit, and a final `wgmma_wait_group::<0>()`.
+//! - **Canonical counted K-loop:** one MMA per iteration, compile-time trip
+//!   count, and `u64` descriptor recurrences of the form `desc + const`. The
+//!   fence-to-final-wait lifetime is fused so the accumulator is loaded and
+//!   stored once for the whole loop rather than once per iteration.
+//! - **Partial-wait pipeline:** a static `wgmma_wait_group::<N>()` with
+//!   `1 <= N <= 7`, exactly `N + 1` distinct canonical accumulator slots, one
+//!   MMA per committed group, round-robin slot reuse only after the matching
+//!   partial wait, and a mandatory final `wgmma_wait_group::<0>()`.
+//! - Accumulator values must not be read or written while their asynchronous
+//!   lifetime is pending.
+//! - Unsupported full-drain accumulator pointer shapes retain the deferred
+//!   pointer-form lowering. Dynamic partial waits, unsupported control flow,
+//!   malformed pipeline schedules, and F16/TF32 MMA variants are rejected.
 //!
 //! # Hardware Support
 //!
-//! - **sm_90 (Hopper)**: H100, H200
-//! - **sm_100+ (Blackwell)**: B100, B200
-//! - **sm_120 (Blackwell)**: RTX 5090
+//! - **sm_90a (Hopper)**: H100, H200
 
 // =============================================================================
 // WGMMA Synchronization Primitives
 // =============================================================================
 
-/// Fence to ensure memory consistency before WGMMA operations.
-///
-/// Must be called before issuing `wgmma_mma_*` instructions. This ensures
-/// that shared memory writes are visible to the tensor core hardware.
-///
-/// # PTX
-///
-/// ```ptx
-/// wgmma.fence.sync.aligned;
-/// ```
-#[inline(never)]
-pub fn wgmma_fence() {
-    // Lowered to: call void @llvm.nvvm.wgmma.fence.sync.aligned()
-    unreachable!("wgmma_fence called outside CUDA kernel context")
-}
-
-/// Commit all pending WGMMA operations to a group.
-///
-/// After issuing one or more `wgmma_mma_*` instructions, call this to
-/// commit them as a group. The group can then be waited on with
-/// `wgmma_wait_group`.
-///
-/// # PTX
-///
-/// ```ptx
-/// wgmma.commit_group.sync.aligned;
-/// ```
-#[inline(never)]
-pub fn wgmma_commit_group() {
-    // Lowered to: call void @llvm.nvvm.wgmma.commit_group.sync.aligned()
-    unreachable!("wgmma_commit_group called outside CUDA kernel context")
-}
-
-/// Wait for WGMMA groups to complete.
-///
-/// Waits until at most N groups of WGMMA operations are still pending.
-/// Use N=0 to wait for ALL pending groups to complete.
-///
-/// # Type Parameters
-///
-/// - `N`: Maximum number of pending groups allowed (0-7). Use 0 to wait for all.
-///
-/// # PTX
-///
-/// ```ptx
-/// wgmma.wait_group.sync.aligned N;
-/// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// // Issue multiple WGMMA groups
-/// wgmma_mma_m64n64k16_f32_bf16(&mut acc, desc_a1, desc_b1);
-/// wgmma_commit_group();
-///
-/// wgmma_mma_m64n64k16_f32_bf16(&mut acc, desc_a2, desc_b2);
-/// wgmma_commit_group();
-///
-/// // Wait for all to complete
-/// wgmma_wait_group::<0>();
-/// ```
-#[inline(never)]
-pub fn wgmma_wait_group<const N: u32>() {
-    let _ = N;
-    // Lowered to: call void @llvm.nvvm.wgmma.wait_group.sync.aligned(i64 N)
-    unreachable!("wgmma_wait_group called outside CUDA kernel context")
-}
+include!("generated/wgmma_control.rs");
 
 // =============================================================================
 // SMEM Descriptor Creation
@@ -142,12 +101,9 @@ pub fn wgmma_wait_group<const N: u32>() {
 
 /// Create a 64-bit shared memory descriptor for WGMMA input matrices.
 ///
-/// This descriptor tells the tensor core hardware how to interpret the
-/// matrix data in shared memory. It encodes:
-/// - Base address in shared memory
-/// - Leading dimension (stride between rows/columns)
-/// - Overall stride
-/// - Swizzling mode (128-byte swizzle for bank conflict avoidance)
+/// This helper creates the fixed-layout descriptor used by the current
+/// lowering. It combines the shared-memory address with fixed stride and
+/// swizzle fields.
 ///
 /// # Parameters
 ///
@@ -157,13 +113,10 @@ pub fn wgmma_wait_group<const N: u32>() {
 ///
 /// A 64-bit descriptor suitable for WGMMA instructions.
 ///
-/// # Descriptor Layout
+/// # Encoding
 ///
-/// ```text
-/// Bits [0:17]   - Base address (shifted right by 4)
-/// Bits [16:33]  - Leading dimension (shifted right by 4)
-/// Bits [32:49]  - Stride (shifted right by 4)
-/// Bit  [62]     - 128-byte swizzle enable
+/// ```rust,ignore
+/// ((shared_address >> 4) & 0x3fff) | 0xC000000800080000
 /// ```
 ///
 /// # Safety
@@ -173,27 +126,25 @@ pub fn wgmma_wait_group<const N: u32>() {
 ///
 /// # PTX
 ///
-/// Uses `cvta.shared.u32` to convert generic pointer to shared memory address.
+/// Uses `cvta.to.shared.u64` to convert the generic pointer.
 #[inline(never)]
 pub unsafe fn make_smem_desc(ptr: *const u8) -> u64 {
     let _ = ptr;
     // Lowered to inline PTX:
     // {
-    //   .reg .u32 addr;
-    //   .reg .u64 desc;
-    //   cvta.shared.u32 addr, %ptr;
-    //   shr.u32 addr, addr, 4;
-    //   and.b32 addr, addr, 0x3FFFF;
-    //   cvt.u64.u32 desc, addr;
-    //   ... (encode leading dim, stride, swizzle)
-    //   mov.u64 %result, desc;
+    //   .reg .u64 addr;
+    //   cvta.to.shared.u64 addr, %ptr;
+    //   shr.u64 addr, addr, 4;
+    //   and.b64 addr, addr, 0x3fff;
+    //   or.b64 %result, addr, 0xC000000800080000;
     // }
     unreachable!("make_smem_desc called outside CUDA kernel context")
 }
 
-/// Create an SMEM descriptor with custom leading dimension and stride.
+/// Compatibility entry point for a custom SMEM descriptor.
 ///
-/// For advanced use cases where the default layout doesn't apply.
+/// This function does not have an importer or lowering path yet. It remains
+/// public to avoid breaking existing source code.
 ///
 /// # Parameters
 ///
@@ -221,7 +172,7 @@ pub unsafe fn make_smem_desc_custom(
 // WGMMA Matrix Multiply-Accumulate Instructions
 // =============================================================================
 
-/// Warpgroup matrix multiply-accumulate: D += A × B
+/// Warpgroup matrix multiply-accumulate: D += A × B.
 ///
 /// Performs a 64×64×16 matrix multiplication using tensor cores at the
 /// warpgroup level. All 128 threads in the warpgroup participate.
@@ -252,59 +203,64 @@ pub unsafe fn make_smem_desc_custom(
 ///     1, 1, 1, 0, 0;
 /// ```
 ///
+/// # Lowering Contract
+///
+/// This function must participate in one compiler-supported WGMMA region.
+/// Linear full-drain regions use one commit and `wgmma_wait_group::<0>()`;
+/// proven partial-wait pipelines may use multiple commits and a static
+/// `wgmma_wait_group::<N>()` before the mandatory final full wait. Canonical
+/// counted K-loops may also be fused across iterations. The compiler rejects
+/// regions whose accumulator lifetime it cannot prove safe.
+///
 /// # Safety
 ///
 /// - Descriptors must be valid SMEM descriptors
 /// - Must be called by all threads in a warpgroup
-/// - Must be called from within a CUDA kernel context on sm_90a+
+/// - Must be called from within a CUDA kernel context on sm_90a
+/// - `acc` must not be read or written until the region's final
+///   `wgmma_wait_group::<0>()` returns
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// // Process a 64×64 K-tile (requires 4 WGMMA calls since K=16 per call)
-/// for k in 0..4 {
-///     let offset = k * 16 * elem_size;
-///     wgmma_mma_m64n64k16_f32_bf16(
-///         &mut acc,
-///         desc_a + offset as u64,
-///         desc_b + offset as u64,
-///     );
-/// }
+/// wgmma_fence();
+/// wgmma_mma_m64n64k16_f32_bf16(&mut acc, desc_a, desc_b);
 /// wgmma_commit_group();
 /// wgmma_wait_group::<0>();
 /// ```
 #[inline(never)]
 pub unsafe fn wgmma_mma_m64n64k16_f32_bf16(acc: &mut [[f32; 8]; 4], desc_a: u64, desc_b: u64) {
     let _ = (acc, desc_a, desc_b);
-    // Lowered to inline PTX with 32 accumulator registers + 2 descriptors + 5 immediates
     unreachable!("wgmma_mma_m64n64k16_f32_bf16 called outside CUDA kernel context")
 }
 
-/// WGMMA with f32 accumulator and f16 (IEEE half) inputs.
+/// WGMMA with f32 accumulator and f16 inputs.
 ///
-/// Same as `wgmma_mma_m64n64k16_f32_bf16` but uses f16 input format.
+/// This variant is public for source compatibility but remains unsupported by
+/// the importer and lowering pipeline.
 ///
 /// # Safety
 ///
 /// - Descriptors must be valid SMEM descriptors
 /// - Must be called by all threads in a warpgroup
-/// - Must be called from within a CUDA kernel context on sm_90a+
+/// - Must be called from within a CUDA kernel context on sm_90a
 #[inline(never)]
 pub unsafe fn wgmma_mma_m64n64k16_f32_f16(acc: &mut [[f32; 8]; 4], desc_a: u64, desc_b: u64) {
     let _ = (acc, desc_a, desc_b);
     unreachable!("wgmma_mma_m64n64k16_f32_f16 called outside CUDA kernel context")
 }
 
-/// WGMMA with f32 accumulator and tf32 (TensorFloat-32) inputs.
+/// Compatibility entry point for TF32 WGMMA.
 ///
-/// TF32 uses 19 bits (1 sign + 8 exponent + 10 mantissa), providing
-/// better precision than bf16 while maintaining tensor core throughput.
+/// This variant is public for source compatibility but remains unsupported by
+/// the importer and lowering pipeline. PTX hardware shapes for TF32 use K=8,
+/// so this legacy K=16 API also requires a separate compatibility decision.
 ///
 /// # Safety
 ///
 /// - Descriptors must be valid SMEM descriptors
 /// - Must be called by all threads in a warpgroup
-/// - Must be called from within a CUDA kernel context on sm_90a+
+/// - Must be called from within a CUDA kernel context on sm_90a
 #[inline(never)]
 pub unsafe fn wgmma_mma_m64n64k16_f32_tf32(acc: &mut [[f32; 8]; 4], desc_a: u64, desc_b: u64) {
     let _ = (acc, desc_a, desc_b);

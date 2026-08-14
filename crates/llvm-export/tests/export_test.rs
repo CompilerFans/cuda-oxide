@@ -9,15 +9,17 @@ use llvm_export::{
         DebugKind, DeviceExternAttrs, DeviceExternDecl, DeviceExternType, ExportBackendConfig,
         MacaExportConfig, NvvmExportConfig, NvvmIrDialect, PtxExportConfig,
         export_module_to_string, export_module_to_string_with_config, export_module_with_externs,
+        export_module_with_externs_and_roots,
     },
     op_interfaces::CastOpInterface,
     ops::{
         AddrSpaceCastOp, AddressOfOp, AllocaOp, BitcastOp, BrOp, CallOp, CondBrOp, ConstantOp,
         DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourcePosition, DebugSourceScope,
         DebugSourceScopeLocation, DebugSourceScopeMap, DebugValueOp, FuncOp, GepIndex,
-        GetElementPtrOp, GlobalOp, GlobalOpExt, InlineAsmOp, LoadOp, ReturnOp, SelectOp, StoreOp,
+        GetElementPtrOp, GlobalInitializerRelocation, GlobalOp, GlobalOpExt, InlineAsmOp, LoadOp,
+        ReturnOp, SelectOp, StoreOp, UndefOp, encode_global_initializer_relocations,
     },
-    types::{ArrayType, FuncType, PointerType, VoidType},
+    types::{ArrayType, FuncType, HalfType, PointerType, StructType, VoidType},
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -312,6 +314,46 @@ fn legacy_gep_rejects_a_result_address_space_different_from_its_base() {
 }
 
 #[test]
+fn gep_inbounds_marker_controls_exported_pointer_semantics() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "gep_semantics".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let pointer = PointerType::get(&ctx, 0);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+    let func_ty = FuncType::get(&ctx, void_ty.into(), vec![pointer.into()], false);
+    let func = FuncOp::new(&mut ctx, "offsets".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let base = entry.deref(&ctx).get_argument(0);
+
+    let ordinary = GetElementPtrOp::new(&mut ctx, base, vec![GepIndex::Constant(1)], i32_ty.into());
+    ordinary.get_operation().insert_at_back(entry, &ctx);
+
+    let wrapping = GetElementPtrOp::new(&mut ctx, base, vec![GepIndex::Constant(2)], i32_ty.into());
+    llvm_export::ops::set_gep_inbounds(&mut ctx, wrapping.get_operation(), false);
+    wrapping.get_operation().insert_at_back(entry, &ctx);
+
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("GEP export succeeds");
+    let gep_lines: Vec<_> = ir
+        .lines()
+        .filter(|line| line.contains("getelementptr"))
+        .collect();
+    assert_eq!(gep_lines.len(), 2, "{ir}");
+    assert!(gep_lines[0].contains("getelementptr inbounds"), "{ir}");
+    assert!(
+        gep_lines[1].contains("getelementptr i32")
+            && !gep_lines[1].contains("getelementptr inbounds"),
+        "{ir}"
+    );
+}
+
+#[test]
 fn legacy_pointer_select_keeps_one_canonical_type() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "legacy_pointer_select".try_into().unwrap());
@@ -493,6 +535,74 @@ fn exporter_deduplicates_identical_values_on_duplicate_conditional_edges() {
 }
 
 #[test]
+fn phi_can_reference_undef_from_a_later_block() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "later_undef_phi".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let func_ty = FuncType::get(
+        &ctx,
+        i32_ty.into(),
+        vec![i1_ty.into(), i32_ty.into()],
+        false,
+    );
+    let func = FuncOp::new(&mut ctx, "choose_undef".try_into().unwrap(), func_ty);
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    let condition = entry.deref(&ctx).get_argument(0);
+    let fallback = entry.deref(&ctx).get_argument(1);
+    let region = func.get_operation().deref(&ctx).get_region(0);
+
+    // The join precedes both predecessors in print order, so its PHI depends
+    // on the exporter's whole-function value-name pre-pass.
+    let join = BasicBlock::new(&mut ctx, None, vec![i32_ty.into()]);
+    join.insert_at_back(region, &ctx);
+    let undef_block = BasicBlock::new(&mut ctx, None, vec![]);
+    undef_block.insert_at_back(region, &ctx);
+    let value_block = BasicBlock::new(&mut ctx, None, vec![]);
+    value_block.insert_at_back(region, &ctx);
+
+    CondBrOp::new(
+        &mut ctx,
+        condition,
+        undef_block,
+        vec![],
+        value_block,
+        vec![],
+    )
+    .get_operation()
+    .insert_at_back(entry, &ctx);
+
+    let undef = UndefOp::new(&mut ctx, i32_ty.into());
+    let undef_value = undef.get_operation().deref(&ctx).get_result(0);
+    undef.get_operation().insert_at_back(undef_block, &ctx);
+    BrOp::new(&mut ctx, join, vec![undef_value])
+        .get_operation()
+        .insert_at_back(undef_block, &ctx);
+    BrOp::new(&mut ctx, join, vec![fallback])
+        .get_operation()
+        .insert_at_back(value_block, &ctx);
+
+    let result = join.deref(&ctx).get_argument(0);
+    ReturnOp::new(&mut ctx, Some(result))
+        .get_operation()
+        .insert_at_back(join, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    )
+    .expect("later-block undef must be available while exporting an earlier PHI");
+    assert!(
+        ir.lines()
+            .any(|line| line.contains(" = phi i32 ") && line.contains("[ undef,")),
+        "{ir}"
+    );
+}
+
+#[test]
 fn indirect_call_rejects_non_program_address_space() {
     let mut ctx = Context::new();
     let module = ModuleOp::new(&mut ctx, "invalid_indirect_callee".try_into().unwrap());
@@ -525,6 +635,48 @@ fn indirect_call_rejects_non_program_address_space() {
         assert!(error.contains("address space 3"), "{error}");
         assert!(error.contains("function pointers"), "{error}");
     }
+}
+
+#[test]
+fn intrinsic_export_preserves_legacy_dots_and_literal_underscores() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "intrinsic_names".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let void_ty = VoidType::get(&ctx);
+    let function_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+    let legacy = "llvm_nvvm_wgmma_fence_sync_aligned";
+    let escaped = "llvm__nvvm_dwgmma_dcommit_ugroup_dsync_daligned";
+
+    for name in [legacy, escaped] {
+        FuncOp::new(&mut ctx, name.try_into().unwrap(), function_ty)
+            .get_operation()
+            .insert_at_back(module_block, &ctx);
+    }
+
+    let caller = FuncOp::new(&mut ctx, "caller".try_into().unwrap(), function_ty);
+    let entry = caller.get_or_create_entry_block(&mut ctx);
+    for name in [legacy, escaped] {
+        CallOp::new(
+            &mut ctx,
+            CallOpCallable::Direct(name.try_into().unwrap()),
+            function_ty,
+            vec![],
+        )
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    }
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string(&ctx, &module).expect("intrinsic export succeeds");
+    assert!(ir.contains("@llvm.nvvm.wgmma.fence.sync.aligned"), "{ir}");
+    assert!(
+        ir.contains("@llvm.nvvm.wgmma.commit_group.sync.aligned"),
+        "{ir}"
+    );
+    assert!(!ir.contains("@llvm.nvvm.wgmma.commit.group"), "{ir}");
 }
 
 #[test]
@@ -663,11 +815,11 @@ fn modern_function_address_uses_the_normalized_definition_name() {
     let module_block = module_top_block(&mut ctx, &module);
     let void_ty = VoidType::get(&ctx);
     let callee_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
-    let prefixed_name = "cuda_oxide_device_246e25db_target";
+    let prefixed_name = reserved_oxide_symbols::device_symbol("target");
 
     let caller = FuncOp::new(&mut ctx, "caller".try_into().unwrap(), callee_ty);
     let caller_entry = caller.get_or_create_entry_block(&mut ctx);
-    let address = AddressOfOp::new(&mut ctx, prefixed_name.try_into().unwrap(), 0);
+    let address = AddressOfOp::new(&mut ctx, prefixed_name.as_str().try_into().unwrap(), 0);
     let address_value = address.get_operation().deref(&ctx).get_result(0);
     address.get_operation().insert_at_back(caller_entry, &ctx);
     CallOp::new(
@@ -683,7 +835,11 @@ fn modern_function_address_uses_the_normalized_definition_name() {
         .insert_at_back(caller_entry, &ctx);
     caller.get_operation().insert_at_back(module_block, &ctx);
 
-    let target = FuncOp::new(&mut ctx, prefixed_name.try_into().unwrap(), callee_ty);
+    let target = FuncOp::new(
+        &mut ctx,
+        prefixed_name.as_str().try_into().unwrap(),
+        callee_ty,
+    );
     let target_entry = target.get_or_create_entry_block(&mut ctx);
     ReturnOp::new(&mut ctx, None)
         .get_operation()
@@ -698,7 +854,7 @@ fn modern_function_address_uses_the_normalized_definition_name() {
     .expect("modern function-address export succeeds");
     assert!(ir.contains("define void @target()"), "{ir}");
     assert!(ir.contains("call void @target()"), "{ir}");
-    assert!(!ir.contains(prefixed_name), "{ir}");
+    assert!(!ir.contains(&prefixed_name), "{ir}");
 }
 
 #[test]
@@ -1265,6 +1421,131 @@ fn kernel_calling_convention_matches_export_backend() {
     );
 }
 
+fn llvm_used_roots_only_explicitly_retained_globals() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "retained_globals".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+
+    let retained = GlobalOp::new(&mut ctx, "IKET_META".try_into().unwrap(), i32_ty.into());
+    retained.set_address_space(&mut ctx, 1);
+    retained.mark_retained(&mut ctx);
+    retained.get_operation().insert_at_back(module_block, &ctx);
+
+    let ordinary = GlobalOp::new(&mut ctx, "ORDINARY".try_into().unwrap(), i32_ty.into());
+    ordinary.set_address_space(&mut ctx, 1);
+    ordinary.get_operation().insert_at_back(module_block, &ctx);
+
+    let ir = export_module_to_string_with_config(&ctx, &module, &PtxExportConfig)
+        .expect("retained global export succeeds");
+    assert!(
+        ir.contains(
+            "@llvm.used = appending global [1 x ptr] [ptr addrspacecast (ptr addrspace(1) @IKET_META to ptr)], section \"llvm.metadata\""
+        ),
+        "{ir}"
+    );
+    assert!(!ir.contains("@ORDINARY to ptr"), "{ir}");
+}
+
+#[test]
+fn legacy_llvm_used_roots_retained_address_space_global() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "legacy_retained_global".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let retained = GlobalOp::new(&mut ctx, "IKET_META".try_into().unwrap(), i32_ty.into());
+    retained.set_address_space(&mut ctx, 1);
+    retained.mark_retained(&mut ctx);
+    retained.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7);
+    let ir = export_module_to_string_with_config(&ctx, &module, &config)
+        .expect("legacy retained global export succeeds");
+    assert!(
+        ir.contains(
+            "@llvm.used = appending global [1 x i8*] [i8* addrspacecast (i32 addrspace(1)* @IKET_META to i8*)], section \"llvm.metadata\""
+        ),
+        "{ir}"
+    );
+}
+
+#[test]
+fn ptx_export_records_kernel_roots_for_internalization() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "ptx_roots".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let global = GlobalOp::new(&mut ctx, "COEFFS".try_into().unwrap(), i32_ty.into());
+    global.set_address_space(&mut ctx, 4);
+    global.get_operation().insert_at_back(module_block, &ctx);
+    let func_ty = FuncType::get(&ctx, VoidType::get(&ctx).into(), vec![], false);
+    let func = FuncOp::new(&mut ctx, "entry_kernel".try_into().unwrap(), func_ty);
+    func.get_operation().deref_mut(&ctx).attributes.set(
+        "gpu_kernel".try_into().unwrap(),
+        StringAttr::new("true".into()),
+    );
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let exported = export_module_with_externs_and_roots::<DeviceExternDecl>(
+        &ctx,
+        &module,
+        &[],
+        &PtxExportConfig,
+    )
+    .expect("PTX export succeeds");
+    let ir = exported.llvm_ir;
+    assert!(
+        ir.contains(
+            "@llvm.used = appending global [1 x ptr] [ptr @entry_kernel], section \"llvm.metadata\""
+        ),
+        "{ir}"
+    );
+    assert_eq!(exported.public_symbols, ["COEFFS", "entry_kernel"]);
+}
+
+#[test]
+fn ptx_export_records_standalone_device_function_roots_for_internalization() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "ptx_device_root".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let func_ty = FuncType::get(&ctx, VoidType::get(&ctx).into(), vec![], false);
+    let prefixed_name = format!(
+        "{}standalone_export",
+        reserved_oxide_symbols::LEGACY_DEVICE_PREFIX
+    );
+    let func = FuncOp::new(
+        &mut ctx,
+        prefixed_name.as_str().try_into().unwrap(),
+        func_ty,
+    );
+    let entry = func.get_or_create_entry_block(&mut ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    let exported = export_module_with_externs_and_roots::<DeviceExternDecl>(
+        &ctx,
+        &module,
+        &[],
+        &PtxExportConfig,
+    )
+    .expect("standalone PTX export succeeds");
+    assert_eq!(exported.public_symbols, ["standalone_export"]);
+    assert!(
+        exported.llvm_ir.contains(
+            "@llvm.used = appending global [1 x ptr] [ptr @standalone_export], section \"llvm.metadata\""
+        ),
+        "{}",
+        exported.llvm_ir
+
+    );
+}
+
 #[test]
 fn legacy_export_rejects_debug_metadata() {
     let mut ctx = Context::new();
@@ -1433,6 +1714,76 @@ fn export_addressof_uses_symbol_when_definition_block_prints_later() {
     assert_no_undefined_temporaries(&legacy);
 }
 
+/// Export a module holding one shared global, optionally labelled with the
+/// Rust path of the `static` it came from.
+fn export_shared_global_with_source_name(source_name: Option<&str>) -> String {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let array_ty = ArrayType::get(&ctx, i32_ty.to_handle(), 64);
+    let global = GlobalOp::new(
+        &mut ctx,
+        "__shared_mem_7".try_into().unwrap(),
+        array_ty.to_handle(),
+    );
+    global.set_address_space(&mut ctx, 3);
+    if let Some(source_name) = source_name {
+        global.set_shared_source_name(&mut ctx, source_name);
+    }
+    global.get_operation().insert_at_back(module_block, &ctx);
+
+    export_module_to_string(&ctx, &module).expect("export succeeds")
+}
+
+#[test]
+fn shared_global_source_name_is_exported_as_a_comment_above_the_definition() {
+    let ir = export_shared_global_with_source_name(Some("my_kernel::TILE"));
+
+    let definition_index = ir
+        .find("@__shared_mem_7 = addrspace(3) global")
+        .expect("module must declare the shared global");
+    let comment_index = ir
+        .find("; shared source: my_kernel::TILE")
+        .unwrap_or_else(|| panic!("shared global must name its Rust source:\n{ir}"));
+    assert!(
+        comment_index < definition_index,
+        "the source comment must precede the definition it describes:\n{ir}"
+    );
+}
+
+#[test]
+fn shared_global_without_a_source_name_exports_no_comment() {
+    let ir = export_shared_global_with_source_name(None);
+
+    assert!(
+        ir.contains("@__shared_mem_7 = addrspace(3) global"),
+        "module must declare the shared global:\n{ir}"
+    );
+    assert!(
+        !ir.contains("; shared source:"),
+        "an unlabelled global must not gain a comment:\n{ir}"
+    );
+}
+
+#[test]
+fn shared_global_source_name_cannot_escape_its_comment_line() {
+    // A newline in the label would end the comment and leave the remainder to
+    // be parsed as IR. Nothing in the current pipeline produces such a name,
+    // so this pins the exporter's own guarantee rather than a live bug.
+    let ir = export_shared_global_with_source_name(Some("EVIL\n@injected = addrspace(3) global"));
+
+    assert!(
+        ir.lines().all(|line| !line.starts_with("@injected")),
+        "a control character in the label must not open a new IR line:\n{ir}"
+    );
+    assert!(
+        ir.contains("; shared source: EVIL @injected = addrspace(3) global"),
+        "the label must survive on one line with controls flattened:\n{ir}"
+    );
+}
+
 #[test]
 fn nvvm_export_rejects_invalid_global_address_spaces() {
     let mut ctx = Context::new();
@@ -1510,6 +1861,240 @@ fn initialized_globals_export_exact_bytes() {
             "repr(C) layout bytes changed:\n{ir}"
         );
     }
+}
+
+#[test]
+fn immutable_globals_export_the_constant_keyword() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "constant_keyword".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let table_ty = ArrayType::get(&ctx, i8_ty.into(), 4);
+
+    // The compiler's own promoted table: marked never-written, so it must
+    // export as `constant`. That keyword is the whole point of the marker:
+    // it is what lets `opt` treat reads as invariant (deleting a copy into a
+    // stack slot) and what makes `llc` select `ld.global.nc`.
+    let promoted = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "promoted_table".try_into().unwrap(),
+        table_ty.into(),
+        4,
+    );
+    promoted.set_address_space(&mut ctx, 1);
+    promoted.set_initializer_hex(&mut ctx, "01020304");
+    promoted.mark_immutable(&mut ctx);
+    promoted.get_operation().insert_at_back(module_block, &ctx);
+
+    // An identically shaped global without the marker: the host may still
+    // write such storage by symbol, so it must keep `global`. Immutability is
+    // opt-in per global, never inferred from the shape of the initializer.
+    let plain = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "plain_static".try_into().unwrap(),
+        table_ty.into(),
+        4,
+    );
+    plain.set_address_space(&mut ctx, 1);
+    plain.set_initializer_hex(&mut ctx, "01020304");
+    plain.get_operation().insert_at_back(module_block, &ctx);
+
+    for config in [
+        NvvmExportConfig::new(NvvmIrDialect::Modern),
+        NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    ] {
+        let ir = export_module_to_string_with_config(&ctx, &module, &config)
+            .expect("immutable global export succeeds");
+        assert!(
+            ir.contains(
+                r#"@promoted_table = addrspace(1) constant [4 x i8] c"\01\02\03\04", align 4"#
+            ),
+            "promoted global lost the constant keyword:\n{ir}"
+        );
+        assert!(
+            ir.contains(r#"@plain_static = addrspace(1) global [4 x i8] c"\01\02\03\04", align 4"#),
+            "unmarked global must not become constant:\n{ir}"
+        );
+    }
+}
+
+#[test]
+fn initialized_global_exports_static_pointer_relocation() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "static_relocation".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+
+    // Insert the reference first. Module symbol indexing must make relocation
+    // resolution independent of textual global order.
+    let reference_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into()]);
+    let reference = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "reference".try_into().unwrap(),
+        reference_ty.into(),
+        8,
+    );
+    reference.set_address_space(&mut ctx, 1);
+    reference.set_source_global_key(&mut ctx, "REFERENCE");
+    reference.set_initializer_hex(&mut ctx, "0000000000000000");
+    let encoded = encode_global_initializer_relocations(&[GlobalInitializerRelocation {
+        source_offset: 0,
+        width_bytes: 8,
+        target_address_space: 1,
+        target_addend: 0,
+        target_key: "TARGET".to_string(),
+    }]);
+    reference.set_initializer_relocations(&mut ctx, &encoded);
+    reference.get_operation().insert_at_back(module_block, &ctx);
+
+    let target_ty = ArrayType::get(&ctx, i8_ty.into(), 4);
+    let target =
+        GlobalOp::new_with_alignment(&mut ctx, "target".try_into().unwrap(), target_ty.into(), 4);
+    target.set_address_space(&mut ctx, 1);
+    target.set_source_global_key(&mut ctx, "TARGET");
+    target.set_initializer_hex(&mut ctx, "78563412");
+    target.get_operation().insert_at_back(module_block, &ctx);
+
+    let modern = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("modern relocated initializer export succeeds");
+    assert!(
+        modern.contains(
+            "@reference = addrspace(1) global { i64 } { i64 ptrtoint (ptr addrspacecast (ptr addrspace(1) @target to ptr) to i64) }, align 8"
+        ),
+        "{modern}"
+    );
+
+    let legacy = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    )
+    .expect("legacy relocated initializer export succeeds");
+    assert!(
+        legacy.contains(
+            "@reference = addrspace(1) global { i64 } { i64 ptrtoint (i8* addrspacecast (i8 addrspace(1)* bitcast ([4 x i8] addrspace(1)* @target to i8 addrspace(1)*) to i8*) to i64) }, align 8"
+        ),
+        "{legacy}"
+    );
+}
+
+#[test]
+fn initialized_global_exports_multiple_relocations_and_addends() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "multiple_static_relocations".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+
+    let target_a_ty = ArrayType::get(&ctx, i8_ty.into(), 16);
+    let target_a = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "target_a".try_into().unwrap(),
+        target_a_ty.into(),
+        8,
+    );
+    target_a.set_address_space(&mut ctx, 1);
+    target_a.set_source_global_key(&mut ctx, "TARGET_A");
+    target_a.set_initializer_hex(&mut ctx, "000102030405060708090a0b0c0d0e0f");
+    target_a.get_operation().insert_at_back(module_block, &ctx);
+
+    let target_b_ty = ArrayType::get(&ctx, i8_ty.into(), 8);
+    let target_b = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "target_b".try_into().unwrap(),
+        target_b_ty.into(),
+        8,
+    );
+    target_b.set_address_space(&mut ctx, 4);
+    target_b.set_source_global_key(&mut ctx, "TARGET_B");
+    target_b.set_initializer_hex(&mut ctx, "1011121314151617");
+    target_b.get_operation().insert_at_back(module_block, &ctx);
+
+    let table_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into(), i64_ty.into()]);
+    let table = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "reference_table".try_into().unwrap(),
+        table_ty.into(),
+        8,
+    );
+    table.set_address_space(&mut ctx, 1);
+    table.set_source_global_key(&mut ctx, "REFERENCE_TABLE");
+    table.set_initializer_hex(&mut ctx, "00000000000000000000000000000000");
+    let encoded = encode_global_initializer_relocations(&[
+        GlobalInitializerRelocation {
+            source_offset: 0,
+            width_bytes: 8,
+            target_address_space: 1,
+            target_addend: 4,
+            target_key: "TARGET_A".to_string(),
+        },
+        GlobalInitializerRelocation {
+            source_offset: 8,
+            width_bytes: 8,
+            target_address_space: 4,
+            target_addend: 0,
+            target_key: "TARGET_B".to_string(),
+        },
+    ]);
+    table.set_initializer_relocations(&mut ctx, &encoded);
+    table.get_operation().insert_at_back(module_block, &ctx);
+
+    for dialect in [NvvmIrDialect::Modern, NvvmIrDialect::LegacyLlvm7] {
+        let ir =
+            export_module_to_string_with_config(&ctx, &module, &NvvmExportConfig::new(dialect))
+                .expect("relocated initializer export succeeds");
+        assert!(
+            ir.contains("@reference_table = addrspace(1) global { i64, i64 }"),
+            "{ir}"
+        );
+        assert!(ir.contains("getelementptr (i8"), "{ir}");
+        assert!(ir.contains("@target_a"), "{ir}");
+        assert!(ir.contains("@target_b"), "{ir}");
+        assert!(!ir.contains("inttoptr"), "{ir}");
+    }
+}
+
+#[test]
+fn initialized_global_relocation_rejects_unknown_target_key() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "unknown_relocation_target".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    let i64_ty = IntegerType::get(&ctx, 64, Signedness::Signless);
+    let reference_ty = StructType::get_unnamed(&ctx, vec![i64_ty.into()]);
+    let reference = GlobalOp::new_with_alignment(
+        &mut ctx,
+        "reference".try_into().unwrap(),
+        reference_ty.into(),
+        8,
+    );
+    reference.set_address_space(&mut ctx, 1);
+    reference.set_source_global_key(&mut ctx, "REFERENCE");
+    reference.set_initializer_hex(&mut ctx, "0000000000000000");
+    let encoded = encode_global_initializer_relocations(&[GlobalInitializerRelocation {
+        source_offset: 0,
+        width_bytes: 8,
+        target_address_space: 1,
+        target_addend: 0,
+        target_key: "MISSING".to_string(),
+    }]);
+    reference.set_initializer_relocations(&mut ctx, &encoded);
+    reference.get_operation().insert_at_back(module_block, &ctx);
+
+    let error = export_module_to_string_with_config(
+        &ctx,
+        &module,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect_err("unknown relocation target must fail");
+    assert!(
+        error.contains("unknown rustc global key `MISSING`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1637,11 +2222,15 @@ fn nvvm_metadata_version_uses_next_allocated_metadata_id() {
         .expect("NVVM export succeeds");
 
     assert!(
-        ir.contains("!nvvm.annotations = !{!0, !1, !2, !3}"),
-        "launch-bounds annotations should occupy !0..!3:\n{ir}"
+        ir.contains("!0 = !{ptr @bounded_kernel, !\"kernel\", i32 1}"),
+        "a launch-bounded kernel still needs its kernel annotation:\n{ir}"
     );
     assert!(
-        ir.contains("!nvvmir.version = !{!4}\n!4 = !{i32 2, i32 0, i32 3, i32 2}"),
+        ir.contains("!nvvm.annotations = !{!0, !1, !2, !3, !4}"),
+        "kernel identity plus launch-bounds annotations should occupy !0..!4:\n{ir}"
+    );
+    assert!(
+        ir.contains("!nvvmir.version = !{!5}\n!5 = !{i32 2, i32 0, i32 3, i32 2}"),
         "version metadata should use the next allocated ID:\n{ir}"
     );
 }
@@ -2709,5 +3298,479 @@ fn export_emits_fast_math_flags_only_on_flagged_float_ops() {
     assert!(
         !fmul_line.contains("fast"),
         "a float binop with no fast-math flags must not gain them:\n{ir}"
+    );
+}
+
+#[test]
+fn modern_device_extern_emits_signext_zeroext_for_small_integer_params() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "small_types_extern".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    // The extern takes (i8 signext, i16 zeroext, i1 zeroext, half) and
+    // returns void. The declared IR types stay NARROW (matching cuda-oxide's
+    // own i8/i16/i1 SSA values and the clang-compiled LTOIR definition); the
+    // ABI extension attributes live only in the DeviceExternType metadata.
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let i16_ty = IntegerType::get(&ctx, 16, Signedness::Signless);
+    let i1_ty = IntegerType::get(&ctx, 1, Signedness::Signless);
+    let half_ty = HalfType::get(&ctx);
+    let void_ty = VoidType::get(&ctx);
+
+    let external_ty = FuncType::get(
+        &ctx,
+        void_ty.into(),
+        vec![i8_ty.into(), i16_ty.into(), i1_ty.into(), half_ty.into()],
+        false,
+    );
+    FuncOp::new(&mut ctx, "small_types_fn".try_into().unwrap(), external_ty)
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    // Caller that forwards its own narrow parameters to the extern with no
+    // value conversions.
+    let caller_ty = FuncType::get(
+        &ctx,
+        void_ty.into(),
+        vec![i8_ty.into(), i16_ty.into(), i1_ty.into(), half_ty.into()],
+        false,
+    );
+    let caller = FuncOp::new(&mut ctx, "caller".try_into().unwrap(), caller_ty);
+    let entry = caller.get_or_create_entry_block(&mut ctx);
+    let arg0 = entry.deref(&ctx).get_argument(0);
+    let arg1 = entry.deref(&ctx).get_argument(1);
+    let arg2 = entry.deref(&ctx).get_argument(2);
+    let arg3 = entry.deref(&ctx).get_argument(3);
+    CallOp::new(
+        &mut ctx,
+        CallOpCallable::Direct("small_types_fn".try_into().unwrap()),
+        external_ty,
+        vec![arg0, arg1, arg2, arg3],
+    )
+    .get_operation()
+    .insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    let externs = [DeviceExternDecl {
+        export_name: "small_types_fn".to_string(),
+        param_types: vec![
+            DeviceExternType::SignExtInteger(8), // i8, sign-extended by NVPTX
+            DeviceExternType::ZeroExtInteger(16), // u16, zero-extended by NVPTX
+            DeviceExternType::ZeroExtInteger(1), // bool
+            DeviceExternType::Float16,           // f16 as native half
+        ],
+        return_type: DeviceExternType::Void,
+        attrs: DeviceExternAttrs::default(),
+    }];
+
+    let ir = export_module_with_externs(
+        &ctx,
+        &module,
+        &externs,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("modern extern with small types export succeeds");
+
+    // Declaration: narrow types with parameter-position attributes.
+    assert!(
+        ir.contains("declare void @small_types_fn(i8 signext, i16 zeroext, i1 zeroext, half)"),
+        "declaration should keep narrow types with signext/zeroext attributes:\n{ir}"
+    );
+
+    // Call site keeps the narrow types and attributes too.
+    assert!(
+        ir.contains("i8 signext %v0"),
+        "call should use signext on first arg:\n{ir}"
+    );
+    assert!(
+        ir.contains("i16 zeroext %v1"),
+        "call should use zeroext on second arg:\n{ir}"
+    );
+    assert!(
+        ir.contains("i1 zeroext %v2"),
+        "call should use zeroext on the bool arg:\n{ir}"
+    );
+    assert!(
+        ir.contains("half %v3"),
+        "call should use half for the f16 arg:\n{ir}"
+    );
+}
+
+#[test]
+fn modern_device_extern_signext_return_type() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "signext_return".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let i8_ty = IntegerType::get(&ctx, 8, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+
+    // Extern returns i8 with signext. The declared type stays i8; only the
+    // attribute marks the NVPTX widening, and in return position LLVM's
+    // grammar requires the attribute BEFORE the type.
+    let external_ty = FuncType::get(&ctx, i8_ty.into(), vec![], false);
+    FuncOp::new(&mut ctx, "get_small_val".try_into().unwrap(), external_ty)
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    // Caller that calls the extern and discards the result.
+    let caller_ty = FuncType::get(&ctx, void_ty.into(), vec![], false);
+    let caller = FuncOp::new(&mut ctx, "caller".try_into().unwrap(), caller_ty);
+    let entry = caller.get_or_create_entry_block(&mut ctx);
+    CallOp::new(
+        &mut ctx,
+        CallOpCallable::Direct("get_small_val".try_into().unwrap()),
+        external_ty,
+        vec![],
+    )
+    .get_operation()
+    .insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    let externs = [DeviceExternDecl {
+        export_name: "get_small_val".to_string(),
+        param_types: vec![],
+        return_type: DeviceExternType::SignExtInteger(8),
+        attrs: DeviceExternAttrs::default(),
+    }];
+
+    let ir = export_module_with_externs(
+        &ctx,
+        &module,
+        &externs,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("modern extern with signext return export succeeds");
+
+    // Declaration: attribute precedes the narrow return type.
+    assert!(
+        ir.contains("declare signext i8 @get_small_val()"),
+        "declaration should have signext BEFORE the return type:\n{ir}"
+    );
+
+    // Call site uses the same return-position placement.
+    assert!(
+        ir.contains("call signext i8 @get_small_val()"),
+        "call should have signext BEFORE the return type:\n{ir}"
+    );
+}
+
+#[test]
+fn plain_integer_device_extern_has_no_extension_attributes() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "plain_int".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+
+    let i32_ty = IntegerType::get(&ctx, 32, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+
+    let external_ty = FuncType::get(&ctx, void_ty.into(), vec![i32_ty.into()], false);
+    FuncOp::new(&mut ctx, "plain_int_fn".try_into().unwrap(), external_ty)
+        .get_operation()
+        .insert_at_back(module_block, &ctx);
+
+    let caller = FuncOp::new(&mut ctx, "caller".try_into().unwrap(), external_ty);
+    let entry = caller.get_or_create_entry_block(&mut ctx);
+    let arg0 = entry.deref(&ctx).get_argument(0);
+    CallOp::new(
+        &mut ctx,
+        CallOpCallable::Direct("plain_int_fn".try_into().unwrap()),
+        external_ty,
+        vec![arg0],
+    )
+    .get_operation()
+    .insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    let externs = [DeviceExternDecl {
+        export_name: "plain_int_fn".to_string(),
+        param_types: vec![DeviceExternType::Integer(32)],
+        return_type: DeviceExternType::Void,
+        attrs: DeviceExternAttrs::default(),
+    }];
+
+    let ir = export_module_with_externs(
+        &ctx,
+        &module,
+        &externs,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("plain int extern export succeeds");
+
+    // Plain i32 should have no signext/zeroext.
+    assert!(
+        ir.contains("declare void @plain_int_fn(i32)"),
+        "declaration should have plain i32 without attributes:\n{ir}"
+    );
+    assert!(
+        !ir.contains("signext") && !ir.contains("zeroext"),
+        "plain i32 should have no extension attributes:\n{ir}"
+    );
+}
+
+#[test]
+fn legacy_device_extern_rejects_small_integers_by_value() {
+    let mut ctx = Context::new();
+    let empty = ModuleOp::new(&mut ctx, "empty".try_into().unwrap());
+    let externs = [DeviceExternDecl {
+        export_name: "takes_small".to_string(),
+        param_types: vec![DeviceExternType::SignExtInteger(8)],
+        return_type: DeviceExternType::ZeroExtInteger(16),
+        attrs: DeviceExternAttrs::default(),
+    }];
+    let err = export_module_with_externs(
+        &ctx,
+        &empty,
+        &externs,
+        &NvvmExportConfig::new(NvvmIrDialect::LegacyLlvm7),
+    )
+    .expect_err("legacy sub-32-bit by-value externs must fail cleanly");
+    assert!(
+        err.contains("CUDA 12 legacy") && err.contains("sub-32-bit"),
+        "{err}"
+    );
+}
+
+/// Build a module whose externs carry small params AND a small return, in
+/// both declare and call positions, so the emitted attribute placement can
+/// be checked against a real LLVM parser.
+fn small_type_extern_module(ctx: &mut Context) -> (ModuleOp, Vec<DeviceExternDecl>) {
+    let module = ModuleOp::new(ctx, "small_types_parse_gate".try_into().unwrap());
+    let module_block = module_top_block(ctx, &module);
+
+    let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+    let i16_ty = IntegerType::get(ctx, 16, Signedness::Signless);
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let half_ty = HalfType::get(ctx);
+    let void_ty = VoidType::get(ctx);
+
+    let take_small_ty = FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![i8_ty.into(), i16_ty.into(), i1_ty.into(), half_ty.into()],
+        false,
+    );
+    FuncOp::new(ctx, "take_small".try_into().unwrap(), take_small_ty)
+        .get_operation()
+        .insert_at_back(module_block, &*ctx);
+
+    let give_small_ty = FuncType::get(ctx, i8_ty.into(), vec![], false);
+    FuncOp::new(ctx, "give_small".try_into().unwrap(), give_small_ty)
+        .get_operation()
+        .insert_at_back(module_block, &*ctx);
+
+    let caller_ty = FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![i8_ty.into(), i16_ty.into(), i1_ty.into(), half_ty.into()],
+        false,
+    );
+    let caller = FuncOp::new(ctx, "caller".try_into().unwrap(), caller_ty);
+    let entry = caller.get_or_create_entry_block(ctx);
+    let arg0 = entry.deref(ctx).get_argument(0);
+    let arg1 = entry.deref(ctx).get_argument(1);
+    let arg2 = entry.deref(ctx).get_argument(2);
+    let arg3 = entry.deref(ctx).get_argument(3);
+    CallOp::new(
+        ctx,
+        CallOpCallable::Direct("take_small".try_into().unwrap()),
+        take_small_ty,
+        vec![arg0, arg1, arg2, arg3],
+    )
+    .get_operation()
+    .insert_at_back(entry, &*ctx);
+    CallOp::new(
+        ctx,
+        CallOpCallable::Direct("give_small".try_into().unwrap()),
+        give_small_ty,
+        vec![],
+    )
+    .get_operation()
+    .insert_at_back(entry, &*ctx);
+    ReturnOp::new(ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &*ctx);
+    caller.get_operation().insert_at_back(module_block, &*ctx);
+
+    let externs = vec![
+        DeviceExternDecl {
+            export_name: "take_small".to_string(),
+            param_types: vec![
+                DeviceExternType::SignExtInteger(8),
+                DeviceExternType::ZeroExtInteger(16),
+                DeviceExternType::ZeroExtInteger(1),
+                DeviceExternType::Float16,
+            ],
+            return_type: DeviceExternType::Void,
+            attrs: DeviceExternAttrs::default(),
+        },
+        DeviceExternDecl {
+            export_name: "give_small".to_string(),
+            param_types: vec![],
+            return_type: DeviceExternType::SignExtInteger(8),
+            attrs: DeviceExternAttrs::default(),
+        },
+    ];
+    (module, externs)
+}
+
+/// Parse gate: the emitted attribute placement (`i8 signext` in parameter
+/// position, `signext i8` in return position, for both `declare` and `call`)
+/// must be accepted by a real LLVM parser, not just string-matched.
+#[test]
+fn small_type_extern_module_parses_with_llvm_as() {
+    let mut ctx = Context::new();
+    let (module, externs) = small_type_extern_module(&mut ctx);
+    let ir = export_module_with_externs(
+        &ctx,
+        &module,
+        &externs,
+        &NvvmExportConfig::new(NvvmIrDialect::Modern),
+    )
+    .expect("modern small-type extern export succeeds");
+
+    // Belt-and-braces string checks before the external parse.
+    assert!(
+        ir.contains("declare void @take_small(i8 signext, i16 zeroext, i1 zeroext, half)"),
+        "{ir}"
+    );
+    assert!(ir.contains("declare signext i8 @give_small()"), "{ir}");
+    assert!(ir.contains("call signext i8 @give_small()"), "{ir}");
+
+    let Some(llvm_as) = ["llvm-as-22", "llvm-as-21", "llvm-as"]
+        .into_iter()
+        .find(|tool| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    else {
+        eprintln!("skipping llvm-as parse gate: no llvm-as-22/llvm-as-21/llvm-as on PATH");
+        return;
+    };
+
+    let ll_path = std::env::temp_dir().join(format!(
+        "cuda_oxide_small_type_parse_gate_{}.ll",
+        std::process::id()
+    ));
+    std::fs::write(&ll_path, &ir).expect("write temp .ll");
+    let output = std::process::Command::new(llvm_as)
+        .arg("-o")
+        .arg("/dev/null")
+        .arg(&ll_path)
+        .output()
+        .expect("run llvm-as");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_file(&ll_path);
+    assert!(
+        output.status.success(),
+        "{llvm_as} rejected the emitted module:\n{stderr}\n--- module ---\n{ir}"
+    );
+}
+
+/// Builds a `void` function taking pointer parameters in the given address
+/// spaces, with an empty body, optionally carrying the `gpu_kernel` marker
+/// the exporter uses to distinguish an entry from a device function.
+fn pointer_param_function(
+    ctx: &mut Context,
+    module_block: Ptr<BasicBlock>,
+    name: &str,
+    address_spaces: &[u32],
+    is_kernel: bool,
+) {
+    let params: Vec<_> = address_spaces
+        .iter()
+        .map(|space| PointerType::get(ctx, *space).into())
+        .collect();
+    let void_ty = VoidType::get(ctx);
+    let func_ty = FuncType::get(ctx, void_ty.into(), params, false);
+    let func = FuncOp::new(ctx, name.try_into().unwrap(), func_ty);
+    if is_kernel {
+        let kernel_key: Identifier = "gpu_kernel".try_into().unwrap();
+        func.get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(kernel_key, StringAttr::new("true".to_string()));
+    }
+    let entry = func.get_or_create_entry_block(ctx);
+    ReturnOp::new(ctx, None)
+        .get_operation()
+        .insert_at_back(entry, ctx);
+    func.get_operation().insert_at_back(module_block, ctx);
+}
+
+/// A kernel receives its parameters in `.param` space from the host, which
+/// holds no shared-memory address to pass. The exporter must refuse the
+/// signature instead of emitting `.ptr .shared`, which ptxas accepts but the
+/// driver rejects at module load, taking every kernel in the module down.
+#[test]
+fn kernel_rejects_a_shared_memory_pointer_parameter() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "kernel_shared_param".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    pointer_param_function(&mut ctx, module_block, "shared_param", &[0, 3], true);
+
+    let error = export_module_to_string(&ctx, &module)
+        .expect_err("export must refuse a kernel parameter in shared memory");
+    assert!(
+        error.contains(
+            "kernel `@shared_param` parameter 1 is a pointer into shared memory (address space 3)"
+        ),
+        "{error}"
+    );
+}
+
+/// Local memory is per-thread, so the host has no address in it to pass
+/// either; the exporter refuses it on the same grounds as shared.
+#[test]
+fn kernel_rejects_a_local_memory_pointer_parameter() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "kernel_local_param".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    pointer_param_function(&mut ctx, module_block, "local_param", &[5], true);
+
+    let error = export_module_to_string(&ctx, &module)
+        .expect_err("export must refuse a kernel parameter in local memory");
+    assert!(
+        error.contains(
+            "kernel `@local_param` parameter 0 is a pointer into local memory (address space 5)"
+        ),
+        "{error}"
+    );
+}
+
+/// The refusal is scoped to what the host cannot supply. Generic, global,
+/// and constant pointer parameters are host-addressable and stay accepted on
+/// kernels, and a device (non-kernel) function may carry any state space on
+/// its parameters, shared included.
+#[test]
+fn kernel_keeps_host_addressable_pointer_parameters_and_device_functions_keep_shared() {
+    let mut ctx = Context::new();
+    let module = ModuleOp::new(&mut ctx, "kernel_allowed_params".try_into().unwrap());
+    let module_block = module_top_block(&mut ctx, &module);
+    pointer_param_function(&mut ctx, module_block, "allowed_param", &[0, 1, 4], true);
+    pointer_param_function(&mut ctx, module_block, "device_shared", &[3], false);
+
+    let ir = export_module_to_string(&ctx, &module)
+        .expect("generic/global/constant kernel parameters and device shared must export");
+    assert!(
+        ir.contains(
+            "define ptx_kernel void @allowed_param(ptr %v0, ptr addrspace(1) %v1, ptr addrspace(4) %v2)"
+        ),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("define void @device_shared(ptr addrspace(3) %v0)"),
+        "{ir}"
     );
 }

@@ -26,6 +26,8 @@
 //! 2. Write a `pub(crate) fn convert_*` function in the relevant submodule.
 //! 3. Add an `#[op_interface_impl]` block in [`interface_impls`].
 
+pub(crate) mod enum_payload_storage;
+mod generated_intrinsics;
 pub mod interface_impls;
 pub mod intrinsics;
 pub mod ops;

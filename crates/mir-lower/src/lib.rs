@@ -128,7 +128,9 @@ pub mod conversion_interface;
 pub mod convert;
 pub mod helpers;
 pub mod lowering;
+pub mod scalarize_block_args;
 pub mod type_conversion_interface;
+mod wgmma_deferred_accumulator;
 
 use rustc_hash::FxHashMap;
 
@@ -140,9 +142,11 @@ use pliron::{
         DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
     },
     linked_list::ContainsLinkedList,
+    irbuild::{listener::Recorder, rewriter::IRRewriter},
     location::Located,
     op::{Op, op_cast},
     operation::Operation,
+    opts::simplify_cfg::remove_blocks_inside_op,
     result::Result,
     r#type::{TypeHandle, Typed, type_impls},
 };
@@ -156,7 +160,7 @@ use type_conversion_interface::MirConvertibleType;
 // DialectConversion driver
 // ============================================================================
 
-/// Target backend for intrinsic lowering.
+/// Target hardware backend for intrinsic lowering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendTarget {
     /// NVIDIA CUDA (NVVM/PTX) — the default.
@@ -164,6 +168,21 @@ pub enum BackendTarget {
     Cuda,
     /// MetaX GPU (MXMACA).
     Maca,
+}
+
+/// Backend whose intrinsic ABI the lowering pass must emit.
+///
+/// LLVM's NVPTX backend and NVIDIA's libNVVM accept overlapping but not
+/// identical intrinsic signatures. The pipeline chooses this once, before
+/// any typed MIR operation is lowered, so generated intrinsic conversions do
+/// not have to guess from environment variables or partially lowered IR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IntrinsicBackend {
+    /// Emit intrinsic forms consumed by LLVM's NVPTX backend (`llc`).
+    #[default]
+    LlvmNvptx,
+    /// Emit intrinsic forms consumed by NVIDIA's libNVVM compiler.
+    LibNvvm,
 }
 
 /// Options controlling the `dialect-mir` to LLVM dialect lowering pass.
@@ -174,8 +193,10 @@ pub struct LoweringOptions {
     ///
     /// This does not affect explicit fused operations such as `f32::mul_add`.
     pub allow_fma_contraction: bool,
-    /// Target backend for intrinsic lowering.
+    /// Target hardware backend for intrinsic lowering.
     pub backend: BackendTarget,
+    /// Intrinsic ABI expected by the selected LLVM-to-device backend.
+    pub intrinsic_backend: IntrinsicBackend,
 }
 
 impl Default for LoweringOptions {
@@ -183,6 +204,7 @@ impl Default for LoweringOptions {
         Self {
             allow_fma_contraction: true,
             backend: BackendTarget::Cuda,
+            intrinsic_backend: IntrinsicBackend::LlvmNvptx,
         }
     }
 }
@@ -202,6 +224,18 @@ pub struct MirToLlvmConversionDriver {
     pub device_globals: DeviceGlobalsMap,
     /// Per-owning-function dynamic shared memory alignment tracking.
     pub dynamic_smem_alignments: DynamicSmemAlignmentMap,
+    /// Next `__shared_mem_N` index. Scoped to one driver instance (one
+    /// `lower_mir_to_llvm` call, i.e. one module), not a process-global
+    /// counter, so the assigned index is a function of this module's own
+    /// MIR walk order rather than of how many OTHER modules have lowered a
+    /// shared allocation earlier in the process. See #706.
+    pub next_shared_mem_index: usize,
+    /// Next `__device_global_N` index. Scoped to one driver instance for the
+    /// same reason as `next_shared_mem_index`: the assigned index is a
+    /// function of this module's own MIR walk order rather than of how many
+    /// OTHER modules have lowered a device global earlier in the process.
+    /// See #706.
+    pub next_device_global_index: usize,
 }
 
 fn is_mir_or_nvvm_op(ctx: &Context, op: Ptr<Operation>) -> bool {
@@ -285,6 +319,7 @@ impl DialectConversion for MirToLlvmConversionDriver {
                 op,
                 operands_info,
                 &mut self.shared_globals,
+                &mut self.next_shared_mem_index,
             );
         }
         if opid == dialect_mir::ops::MirGlobalAllocOp::get_opid_static() {
@@ -294,6 +329,7 @@ impl DialectConversion for MirToLlvmConversionDriver {
                 op,
                 operands_info,
                 &mut self.device_globals,
+                &mut self.next_device_global_index,
             );
         }
         if opid == dialect_mir::ops::MirExternSharedOp::get_opid_static() {
@@ -348,6 +384,13 @@ pub fn lower_mir_to_llvm_with_options(
     options: LoweringOptions,
 ) -> Result<()> {
     context::set_lowering_options(ctx, options);
+    // WGMMA pointer-form MMA operations are only sound when their complete
+    // asynchronous lifetime can be closed before LLVM sees pending accumulator
+    // state. Canonical [[f32; 8]; 4] accumulators use explicit SSA values for
+    // linear groups, counted K-loops, and proven static partial-wait pipelines;
+    // unsupported pointer shapes retain the deferred pointer-group fallback.
+    // Run this while MIR control flow and unsigned constants are still intact.
+    wgmma_deferred_accumulator::fuse_deferred_accumulators(ctx, module_op)?;
     // Dynamic shared-memory operations may live in device helpers. Compute
     // every kernel-to-helper requirement while the complete MIR call graph is
     // still available; function conversion removes that graph incrementally.
@@ -356,6 +399,8 @@ pub fn lower_mir_to_llvm_with_options(
         shared_globals: FxHashMap::default(),
         device_globals: FxHashMap::default(),
         dynamic_smem_alignments: FxHashMap::default(),
+        next_shared_mem_index: 0,
+        next_device_global_index: 0,
     };
     // pliron's DialectConversion now reports an IRStatus (Changed/Unchanged);
     // lowering only cares about success, so discard it.
@@ -364,6 +409,21 @@ pub fn lower_mir_to_llvm_with_options(
         hoist_allocas_to_entry_blocks(ctx, module_op);
         reject_maca_unsupported_ir(ctx, module_op)?;
     }
+    // Conversions of diverging ops (e.g. `nvvm.assertfail`) erase everything
+    // after the noreturn call, including the block's terminator. A successor
+    // whose only predecessor was that terminator is now unreachable, and if it
+    // still carries block arguments it cannot be exported (a PHI needs one
+    // incoming value per predecessor). Erase every block the entry can no
+    // longer reach.
+    let mut rewriter = IRRewriter::<Recorder>::default();
+    remove_blocks_inside_op(module_op, ctx, &mut rewriter);
+    // mem2reg promotes enum/struct slots into whole-aggregate block arguments,
+    // which export as PHIs of first-class aggregates. LLVM's -O2 pipeline
+    // cannot split those (SROA only handles allocas), so e.g. an iterator
+    // loop merging `Option<(f32, f32)>` keeps a materialized discriminant and
+    // an extra branch per iteration. Split such arguments into scalar leaves
+    // so the exported IR carries scalar PHIs, as SROA would produce.
+    scalarize_block_args::scalarize_aggregate_block_args(ctx, module_op)?;
     Ok(())
 }
 
@@ -458,9 +518,13 @@ fn hoist_allocas_in_func(ctx: &mut Context, func_op: Ptr<Operation>) {
 }
 
 fn reject_maca_unsupported_ir(ctx: &Context, op: Ptr<Operation>) -> Result<()> {
-    if Operation::get_op::<llvm_export::ops::InlineAsmOp>(op, ctx).is_some() {
+    if let Some(asm) = Operation::get_op::<llvm_export::ops::InlineAsmOp>(op, ctx) {
+        let template = asm
+            .get_attr_inline_asm_template(ctx)
+            .map(|v| String::from((*v).clone()))
+            .unwrap_or_else(|| "<no template>".into());
         return pliron::input_err_noloc!(
-            "MACA lowering produced unsupported inline PTX; add a native C500 lowering for this operation"
+            "MACA lowering produced unsupported inline PTX `{template}`; add a native C500 lowering for this operation"
         );
     }
     if let Some(function) = Operation::get_op::<llvm_export::ops::FuncOp>(op, ctx) {

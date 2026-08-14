@@ -274,9 +274,8 @@ pub(crate) fn convert_shuffle_f32(
 /// shuffles. We emit a single inline-PTX block that unpacks the value into
 /// `{lo, hi}` halves with `mov.b64`, runs `shfl.sync.<mode>.b32` on each half
 /// with the shared lane and membermask operands, then repacks the result.
-/// Keeping both halves inside one convergent asm block keeps the pair a single
-/// fused warp collective, the same way the elect.sync lowering uses inline PTX
-/// to dodge a missing intrinsic.
+/// Keeping both halves in one compiler-visible convergent block prevents code
+/// motion between them. Hardware still executes two sequential `b32` shuffles.
 ///
 /// The shfl `c` (clamp/segmentation) operand is baked into the template per
 /// mode: `31` for idx/bfly/down and `0` for up — exactly the value the 32-bit
@@ -357,7 +356,7 @@ pub(crate) fn convert_shuffle_i64(
         vec![val, lane_or_delta, mask],
         &asm_template,
         "=l,l,r,r",
-    )?;
+    );
     rewriter.replace_operation(ctx, op, asm_op);
     Ok(())
 }
@@ -842,11 +841,32 @@ pub(crate) fn convert_active_mask(
     }
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
 
-    let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
-
-    let call_op = call_intrinsic(ctx, rewriter, op, "llvm_nvvm_activemask", func_ty, vec![])?;
-    rewriter.replace_operation(ctx, op, call_op);
+    // libNVVM has no activemask intrinsic; the generated-catalog backend
+    // route uses exact convergent inline PTX there. The op result is a
+    // 64-bit wave mask, so both paths zero-extend the i32 hardware result.
+    let mask_i32 = if lowering_options(ctx).intrinsic_backend
+        == crate::IntrinsicBackend::LibNvvm
+    {
+        inline_asm_convergent(
+            ctx,
+            rewriter,
+            i32_ty.into(),
+            vec![],
+            "activemask.b32 $0;",
+            "=r,~{memory}",
+        )
+        .deref(ctx)
+        .get_result(0)
+    } else {
+        let func_ty = llvm_types::FuncType::get(ctx, i32_ty.into(), vec![], false);
+        let call_op = call_intrinsic(ctx, rewriter, op, "llvm_nvvm_activemask", func_ty, vec![])?;
+        call_op.deref(ctx).get_result(0)
+    };
+    let extended = llvm::ZExtOp::new_with_nneg(ctx, mask_i32, i64_ty.into(), true);
+    rewriter.insert_operation(ctx, extended.get_operation());
+    rewriter.replace_operation(ctx, op, extended.get_operation());
     Ok(())
 }
 
@@ -967,14 +987,47 @@ pub(crate) fn convert_match_all(
     Ok(())
 }
 
-/// Convert an `elect.sync` op to inline PTX.
-///
-/// `elect.sync` is Hopper-only (sm_90+). LLVM declares the
-/// `@llvm.nvvm.elect.sync` intrinsic but the NVPTX backend ships **no
-/// instruction-selection pattern** for it (llc dies with "Cannot select:
-/// intrinsic %llvm.nvvm.elect.sync" even with `-mcpu=sm_90`), so we emit the
-/// instruction directly as convergent inline PTX instead — the same approach
-/// the tcgen05 ops use to dodge missing intrinsic lowerings.
+/// Convert `elect.sync` through LLVM's typed NVVM intrinsic.
+pub(crate) fn convert_elect_sync_typed(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+    intrinsic_name: &str,
+) -> Result<()> {
+    use llvm_export::ops::ExtractValueOp;
+
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    if operands.len() != 1 {
+        return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
+    }
+
+    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i1_ty.into()]);
+    let func_ty = llvm_types::FuncType::get(ctx, struct_ty.into(), vec![i32_ty.into()], false);
+    let call = call_intrinsic(
+        ctx,
+        rewriter,
+        op,
+        intrinsic_name,
+        func_ty,
+        vec![operands[0]],
+    )?;
+    let result = call.deref(ctx).get_result(0);
+    let leader = ExtractValueOp::new(ctx, result, vec![0])
+        .map_err(|error| pliron::input_error_noloc!("elect.sync extractvalue: {}", error))?;
+    rewriter.insert_operation(ctx, leader.get_operation());
+    let elected = ExtractValueOp::new(ctx, result, vec![1])
+        .map_err(|error| pliron::input_error_noloc!("elect.sync extractvalue: {}", error))?;
+    rewriter.insert_operation(ctx, elected.get_operation());
+    let leader = leader.get_operation().deref(ctx).get_result(0);
+    let elected = elected.get_operation().deref(ctx).get_result(0);
+    rewriter.replace_operation_with_values(ctx, op, vec![leader, elected]);
+    Ok(())
+}
+
+/// Convert `elect.sync` to convergent inline PTX.
 ///
 /// PTX `elect.sync d|p, membermask;` writes the leader lane id into `d` and the
 /// per-lane "I am the leader" predicate into `p`. Inline asm can't yield a
@@ -982,7 +1035,7 @@ pub(crate) fn convert_match_all(
 /// The op has two results — leader (i32) and is_elected (i1) — bound to the two
 /// asm outputs. The single operand (the membermask) is the asm input; either
 /// result may be unused at the call site and is then removed by LLVM DCE.
-pub(crate) fn convert_elect_sync(
+pub(crate) fn convert_elect_sync_inline(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
@@ -1014,7 +1067,7 @@ pub(crate) fn convert_elect_sync(
         vec![mask],
         asm_template,
         "=r,=r,r",
-    )?;
+    );
     let struct_result = asm_op.deref(ctx).get_result(0);
 
     // Field 0 → leader lane id (result 0). Field 1 → predicate as 0/1 i32,

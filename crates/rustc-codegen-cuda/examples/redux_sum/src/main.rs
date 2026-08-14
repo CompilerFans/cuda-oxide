@@ -7,7 +7,7 @@
 //!
 //! Whereas `warp_reduce` builds a log-tree sum out of 5 `shfl` + 5 `add`, this
 //! example performs the whole warp reduction with one hardware instruction:
-//! PTX `redux.sync.add.u32`, lowered from `warp::redux_sync_add`.
+//! PTX `redux.sync.add.s32` (bit-identical wrapping sum for `u32`), lowered from `warp::redux_sync_add`.
 //!
 //! Build and run with:
 //!   cargo oxide run redux_sum
@@ -95,11 +95,7 @@ fn main() {
     const WARPS: usize = N / 32;
     const EXPECTED: u32 = 496; // 0 + 1 + ... + 31
 
-    let module = ctx
-        .load_module_from_file("redux_sum.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     let cfg = LaunchConfig {
         block_dim: (32, 1, 1),
         grid_dim: (WARPS as u32, 1, 1),

@@ -20,14 +20,15 @@
 //! op/type matrix. The generated `coop_groups_demo.ptx` is also handy
 //! for inspecting how each kernel actually lowers.
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig, LaunchConfig1D};
 use cuda_device::cooperative_groups::{
-    ThreadGroup, WarpCollective, block_reduce, block_scan,
+    ThreadGroup, WarpCollective, block_reduce, block_scan, coalesced_threads,
     ops::{BitAnd, BitOr, BitXor, Max, Min, Sum},
     this_grid, this_thread_block, warp_reduce, warp_scan,
 };
 use cuda_device::{
-    DisjointSlice, SharedArray, cluster_launch, cooperative_launch, grid, kernel, thread, warp,
+    DisjointSlice, SharedArray, cluster_launch, cooperative_launch, grid, kernel, launch_bounds,
+    launch_contract, thread, warp,
 };
 use cuda_host::{cuda_launch, cuda_module};
 
@@ -145,22 +146,53 @@ mod grid_sync_kernels {
         }
     }
 
-    /// Compile-only pin: `#[cluster_launch]` and `#[cooperative_launch]` may
-    /// be combined, because `cuLaunchKernelEx` accepts the cluster-dimension
-    /// and cooperative attributes in the same call. The generated launch
-    /// methods route through
-    /// `cuda_core::launch_kernel_ex_cooperative_on_stream`. This kernel is
-    /// never launched at runtime here; it only pins that the combination
-    /// keeps compiling end to end (macro expansion, host launch methods, and
-    /// device PTX).
+    /// Combined cluster + cooperative launch: each cluster of 2 blocks writes
+    /// markers, then `grid::sync()` publishes them to every block. Preparation
+    /// must accept both attributes and prove the grid fits in concurrent
+    /// cluster capacity (Hopper+).
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[cooperative_launch]
-    pub fn test_cluster_coop_compile_only(mut out: DisjointSlice<u32>) {
-        let gid = thread::index_1d();
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, block = (128, 1, 1))]
+    pub fn test_cluster_coop_grid_sync(
+        mut markers: DisjointSlice<u32>,
+        mut out: DisjointSlice<u32>,
+    ) {
+        let block_id = thread::blockIdx_x();
+        let n = thread::gridDim_x();
+
+        if thread::threadIdx_x() == 0 {
+            // SAFETY: the host sizes `markers` to exactly gridDim.x elements,
+            // so `block_id` indexes in bounds, and only thread 0 of each
+            // block writes its own slot, so the writes are disjoint.
+            unsafe {
+                *markers.get_unchecked_mut(block_id as usize) = block_id + 1;
+            }
+        }
+
         grid::sync();
-        if let Some(slot) = out.get_mut(gid) {
-            *slot = 1;
+
+        if thread::threadIdx_x() == 0 {
+            let base = markers.as_mut_ptr() as *const u32;
+            let mut sum: u32 = 0;
+            let mut i: u32 = 0;
+            while i < n {
+                // SAFETY: `i < n = gridDim.x` and `markers` holds gridDim.x
+                // elements, so `base.add(i)` stays in bounds. Every block's
+                // marker write happened before `grid::sync()`, so the
+                // cross-block reads are data-race free.
+                unsafe {
+                    sum = sum.wrapping_add(*base.add(i as usize));
+                }
+                i += 1;
+            }
+            // SAFETY: the host sizes `out` to exactly gridDim.x elements, so
+            // `block_id` indexes in bounds, and only thread 0 of each block
+            // writes its own slot.
+            unsafe {
+                *out.get_unchecked_mut(block_id as usize) = sum;
+            }
         }
     }
 }
@@ -195,17 +227,53 @@ pub fn test_typed_warp16_ballot(mut out: DisjointSlice<u64>) {
     }
 }
 
-/// `WarpTile<16>::shfl(my_lane_id, 0)` broadcasts each tile's lane-0
-/// value to every lane in that tile. Tile 0 (lanes 0..16) should all
-/// see `0`; tile 1 (lanes 16..32) should all see `16`.
+/// Check tile-relative and sparse-group shuffle source handling. The stored
+/// value remains each 16-lane tile's lane-0 broadcast.
 #[kernel]
 pub fn test_typed_warp16_shfl(mut out: DisjointSlice<u32>) {
     let gid = thread::index_1d();
     let tile = this_thread_block().tiled_partition::<16>();
     let lane = warp::lane_id();
+    tile.sync();
     let broadcast = tile.shfl(lane, 0);
+    let rank = tile.thread_rank();
+    let tile_ok = (tile.shfl_xor(lane, 1) == (lane ^ 1))
+        & (tile.shfl_xor(lane, 16) == lane)
+        & (tile.shfl_down(lane, 1) == if rank < 15 { lane + 1 } else { lane })
+        & (tile.shfl_up(lane, 1) == if rank > 0 { lane - 1 } else { lane })
+        & (tile.shfl_xor_f32(lane as f32, 16) == lane as f32)
+        & (tile.shfl_down_f32(lane as f32, 1)
+            == if rank < 15 {
+                (lane + 1) as f32
+            } else {
+                lane as f32
+            })
+        & (tile.shfl_up_f32(lane as f32, 1)
+            == if rank > 0 {
+                (lane - 1) as f32
+            } else {
+                lane as f32
+            });
+    let coalesced_ok = if lane & 1 == 0 {
+        let group = coalesced_threads();
+        (group.shfl(lane, group.size()) == lane)
+            & (group.shfl_xor(lane, 1) == lane)
+            & (group.shfl_down(lane, 1) == lane)
+            & (group.shfl_up(lane, 1) == lane)
+            & (group.shfl_down(lane, 2) == if lane < 30 { lane + 2 } else { lane })
+            & (group.shfl_up(lane, 2) == if lane >= 2 { lane - 2 } else { lane })
+            & (group.shfl_xor_f32(lane as f32, 1) == lane as f32)
+            & (group.shfl_down_f32(lane as f32, 1) == lane as f32)
+            & (group.shfl_up_f32(lane as f32, 1) == lane as f32)
+    } else {
+        true
+    };
     if let Some(slot) = out.get_mut(gid) {
-        *slot = broadcast;
+        *slot = if tile_ok & coalesced_ok {
+            broadcast
+        } else {
+            u32::MAX
+        };
     }
 }
 
@@ -597,17 +665,32 @@ fn main() {
     println!("=== Cooperative Groups Demo ===\n");
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
+
+    // Thread block clusters require sm_90 (Hopper) or later.
+    let (major, minor) = ctx.compute_capability().expect("compute capability");
+    if major < 9 {
+        println!("skipping: thread block clusters require sm_90+ (device is sm_{major}{minor})");
+        return;
+    }
+
     let stream = ctx.default_stream();
 
-    let module = ctx
-        .load_module_from_file("coop_groups_demo.ptx")
-        .expect("Failed to load PTX module");
-
-    // Typed handle for the `#[cuda_module]` grid-sync kernels. Their
+    // Typed handle for the `#[cuda_module]` grid-sync kernels, loaded from the
+    // artifact embedded in this binary rather than a loose `.ptx`, so there is
+    // nothing to find on disk and `--materialize-cubin` works. Their
     // `#[cooperative_launch]` attribute makes the generated launch methods
     // submit cooperative launches, so no per-call flag is needed.
-    let grid_sync_module = grid_sync_kernels::from_module(module.clone())
-        .expect("Failed to initialize typed grid-sync module");
+    //
+    // SAFETY: `load` selects this package's own embedded bundle, which is
+    // compiled from the module below and so carries exactly the entry points
+    // and ABI the generated launch methods expect.
+    let grid_sync_module =
+        unsafe { grid_sync_kernels::load(&ctx) }.expect("Failed to load embedded grid-sync module");
+
+    // The kernels outside the `#[cuda_module]` are launched through
+    // `cuda_launch!`, which takes the raw module. It is the same load, so both
+    // paths run the same image -- one `cuModuleLoad`, not two.
+    let module = grid_sync_module.as_cuda_module().clone();
 
     const N: usize = 256;
     let cfg = LaunchConfig {
@@ -710,6 +793,76 @@ fn main() {
     if !ok {
         println!("  observed sums: {:?}", host);
         std::process::exit(1);
+    }
+
+    // --- cluster + cooperative (Hopper+) ---
+    println!("\n--- cluster + cooperative grid::sync() (PreparedLaunch) ---");
+    const CLUSTER_COOP_BLOCKS: u32 = 4; // divisible by #[cluster_launch(2, 1, 1)]
+    const CLUSTER_COOP_THREADS: u32 = 128;
+    match ctx.supports_cluster_launch() {
+        Ok(false) => {
+            println!(
+                "  cluster+cooperative: not exercised (device lacks cluster launch / Hopper+)"
+            );
+        }
+        Err(error) => {
+            println!("  cluster support query failed: {error}");
+            std::process::exit(1);
+        }
+        Ok(true) => {
+            let cluster_config = LaunchConfig1D::new(CLUSTER_COOP_BLOCKS, CLUSTER_COOP_THREADS, 0);
+            let prepared =
+                match grid_sync_module.prepare_test_cluster_coop_grid_sync(cluster_config) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        println!("  prepare failed: {error}");
+                        std::process::exit(1);
+                    }
+                };
+            let mut markers =
+                DeviceBuffer::<u32>::zeroed(&stream, CLUSTER_COOP_BLOCKS as usize).unwrap();
+            let mut sums =
+                DeviceBuffer::<u32>::zeroed(&stream, CLUSTER_COOP_BLOCKS as usize).unwrap();
+            grid_sync_module
+                .test_cluster_coop_grid_sync(stream.as_ref(), &prepared, &mut markers, &mut sums)
+                .expect("test_cluster_coop_grid_sync launch failed");
+            let host = sums.to_host_vec(&stream).unwrap();
+            let expected: u32 = (1..=CLUSTER_COOP_BLOCKS).sum();
+            let ok = host.iter().all(|&s| s == expected);
+            println!(
+                "  every block saw the full barrier-flushed marker sum {} : {}",
+                expected,
+                if ok { "yes" } else { "NO" }
+            );
+            if !ok {
+                println!("  observed sums: {:?}", host);
+                std::process::exit(1);
+            }
+
+            // Oversized cooperative clustered grid must fail preparation with a
+            // clear residency error rather than hanging at launch.
+            let too_large = LaunchConfig1D::new(1_048_576, CLUSTER_COOP_THREADS, 0);
+            match grid_sync_module.prepare_test_cluster_coop_grid_sync(too_large) {
+                Err(error) => {
+                    let message = error.to_string();
+                    let ok = message.contains("cooperative grid")
+                        || message.contains("cluster")
+                        || message.contains("resident");
+                    println!(
+                        "  oversized prepare rejected cleanly: {}",
+                        if ok { "yes" } else { "NO" }
+                    );
+                    if !ok {
+                        println!("  unexpected prepare error: {message}");
+                        std::process::exit(1);
+                    }
+                }
+                Ok(_) => {
+                    println!("  oversized prepare unexpectedly succeeded");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     // =========================================================================

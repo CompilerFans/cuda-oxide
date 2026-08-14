@@ -70,6 +70,22 @@ mod kernels {
     /// an owned value.
     #[kernel]
     pub fn vecadd_with_helper(a: &[f32], b: &[f32], c: DisjointSlice<f32>) {
+        // A named generic helper nested inside a kernel carries the kernel's
+        // generated symbol in an earlier def-path segment. It must remain a
+        // normal device callee under its canonical mangled symbol, not become
+        // a second `_TID_` kernel entry.
+        #[inline(never)]
+        fn nested_identity<T: Copy>(value: T) -> T {
+            value
+        }
+
+        // Keep two concrete monomorphizations reachable without changing the
+        // example's result. `inline(never)` makes them visible to the device
+        // collector and this guard is always false at runtime.
+        if nested_identity::<f32>(0.0) != 0.0 || nested_identity::<u32>(0) != 0 {
+            return;
+        }
+
         // Call the device function by its original name
         vecadd_device(a, b, c);
     }
@@ -99,11 +115,7 @@ fn main() {
     let b_dev = DeviceBuffer::from_host(&stream, &b_host).unwrap();
     let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-    let module = ctx
-        .load_module_from_file("helper_fn.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     // Launch kernel
     // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
     unsafe {

@@ -73,7 +73,19 @@ Kernel parameters are mapped into host launch parameters:
 | `&[T]` | `&DeviceBuffer<T>` |
 | `&mut [T]` | `&mut DeviceBuffer<T>` |
 | `DisjointSlice<T>` | `&mut DeviceBuffer<T>` |
+| `Uniform<T>` | `T` |
 | `Copy` scalar, struct, closure, or raw pointer | unchanged |
+
+A `Uniform<T>` parameter takes the bare scalar on the host because the host is
+what makes the value uniform: one marshalled value reaches every thread of the
+launch. The device side receives the witness, which is what device APIs needing
+a launch-uniform scalar require in place of an `unsafe` assertion.
+
+A slice whose index space carries a runtime row width takes `RowWidth<T>`, which
+binds the width to that slice for the launch. The same reasoning applies and for
+the same reason, one step earlier: the row width reaches the device as one word the
+host wrote, so `DisjointSlice::tile_2d32_rt` needs neither a stride argument nor
+an `unsafe` assertion. The owned async launches take `RowWidthOwned<B>`.
 
 Because the launches are ordinary methods, rust-analyzer and rustc can complete
 kernel names, show argument names, and type-check arguments before the program
@@ -132,6 +144,18 @@ a 2-D configuration cannot be passed to a 1-D contract. The prepared value is
 also branded with the exact kernel specialization, so `reduce::<f32>` and
 `reduce::<f64>` are not interchangeable. Generic closures can use the generated
 `prepare_{kernel}_for(&closure, config)` helper to infer their anonymous type.
+If `#[launch_bounds]` uses a policy constant, each specialization has its own
+host-side maximum. For example, `prepare_transform::<SmallPolicy>` can enforce
+64 threads while `prepare_transform::<WidePolicy>` enforces 256. This is a
+maximum, not an exact size; declare `block = (x, y, z)` when the full shape must
+match.
+
+An exact `block` is additionally carried into the compiled artifact as
+`.reqntid x, y, z`, which the CUDA driver enforces per axis. Preparation and
+the driver check the shape on independent paths, so a mismatch is rejected even
+when preparation is bypassed. A thread maximum gives no such guarantee: under
+`.maxntid 256, 1, 1` the driver accepts `(16, 16, 1)` as readily as
+`(256, 1, 1)`.
 
 For contracted kernels, raw `LaunchConfig` is available only through generated
 unsafe methods such as `reduce_unchecked`. Uncontracted generated methods are
@@ -155,10 +179,11 @@ the marker emitted by `#[launch_contract]` is merged with alignment requests in
 the body and reachable local helpers, and the stronger value reaches PTX.
 Prelinked external helpers keep the alignment recorded when they were compiled.
 
-Cluster and cooperative contracts are validated separately. A contract that
-combines both currently fails preparation because the available occupancy query
-cannot prove the combined residency rule; the unsafe launch method remains the
-explicit expert escape hatch.
+Cluster and cooperative contracts may be declared together. Preparation proves
+cluster geometry first (`cuOccupancyMaxActiveClusters`), then checks that the
+full grid fits in that concurrent cluster capacity so a cooperative
+`grid::sync()` cannot hang waiting for non-resident blocks. Oversized grids
+fail with `LaunchContractError::CooperativeGridTooLarge`.
 
 This closes the unsafe gap from issue #115. A 1-D contract rejects a 2-D launch
 in safe code, while an uncontracted or deliberately mismatched launch requires
@@ -295,6 +320,20 @@ selection and the pre-Blackwell to Blackwell PTX bridge do not use this cache.
 The first compiler/linker handles are retained for the process lifetime;
 restart the process to select another toolkit or after replacing one in place.
 Remove the `.oxide-artifacts` directory to clear all cached entries.
+
+The driver-independent `cuda-artifact-finalizer` crate owns the shared
+libNVVM/nvJitLink policy. Runtime loading and build-time materialization
+therefore use the same target, FMA, debug, input-order, provenance, and cubin
+validation rules.
+
+Deferred NVVM IR and LTOIR keep those policies in `<module>.options`. Existing
+v1 sidecars record FMA contraction and imply no debug information; v2 sidecars
+also record line-table or full-debug preservation. Missing sidecars on legacy,
+unversioned artifacts retain the historical default of FMA enabled and no
+debug information. In-memory callers can use the
+`*_with_compile_options` helpers to carry the complete policy. The older
+`*_with_options(..., allow_fma_contraction)` helpers remain available and use
+no debug information.
 
 ## Tiling Utilities (tcgen05)
 

@@ -31,7 +31,9 @@
 //!
 //! The owned module's `mark_kernel_entry` method owns this internal marker spelling.
 
-use cuda_oxide_codegen::experimental::{CodegenModule, CompileOptions, Compiler, Target};
+use cuda_oxide_codegen::experimental::{
+    CodegenModule, CompileOptions, Compiler, Optimization, Target,
+};
 
 use dialect_mir::ops::{
     MirAddOp, MirFuncOp, MirLoadOp, MirMulOp, MirPtrOffsetOp, MirReturnOp, MirStoreOp,
@@ -235,10 +237,70 @@ fn build_add_kernel(module: &mut CodegenModule) {
     module.mark_kernel_entry("add_kernel").unwrap();
 }
 
+fn build_unused_helper(module: &mut CodegenModule) {
+    module.edit(|ctx, module| {
+        let module_region = module.get_operation().deref(ctx).get_region(0);
+        let module_block = module_region
+            .deref(ctx)
+            .iter(ctx)
+            .next()
+            .expect("kernel builder created the module block");
+        let func_type = FunctionType::get(ctx, vec![], vec![]);
+        let op = Operation::new(
+            ctx,
+            MirFuncOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        let helper = MirFuncOp::new(ctx, op, TypeAttr::new(func_type.into()));
+        helper.set_symbol_name(ctx, "unused_helper".try_into().unwrap());
+        let entry = BasicBlock::new(ctx, None, vec![]);
+        entry.insert_at_back(op.deref(ctx).get_region(0), ctx);
+        Operation::new(
+            ctx,
+            MirReturnOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        )
+        .insert_at_back(entry, ctx);
+        helper.get_operation().insert_at_back(module_block, ctx);
+    });
+}
+
+/// Locate `ptxas`. Discovery order, mirroring the toolkit contract that
+/// `crates/cuda-bindings/build.rs` and `cargo oxide doctor`'s
+/// `cuda_toolkit_root` already implement:
+///
+/// 1. `CUDA_TOOLKIT_PATH`, then `CUDA_HOME` — first non-empty one wins
+/// 2. `/usr/local/cuda`, the conventional default prefix
+/// 3. bare `ptxas`, leaving resolution to `PATH`
+///
+/// Step 3 is what CI relies on, since the toolkit action puts `ptxas` on `PATH`.
+/// Steps 1 and 2 are what a local checkout relies on: the build scripts fully
+/// support a toolkit installed at any prefix, so this test should not be the one
+/// place that ignores where it was told the toolkit lives.
+fn find_ptxas() -> std::path::PathBuf {
+    ["CUDA_TOOLKIT_PATH", "CUDA_HOME"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .filter(|root| !root.trim().is_empty())
+        .map(|root| std::path::PathBuf::from(root).join("bin/ptxas"))
+        .chain(std::iter::once(std::path::PathBuf::from(
+            "/usr/local/cuda/bin/ptxas",
+        )))
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("ptxas"))
+}
+
 #[test]
 fn spine_add_kernel_emits_entry_and_validates() {
     let mut module = CodegenModule::new("spine_module").unwrap();
     build_add_kernel(&mut module);
+    build_unused_helper(&mut module);
     let compiler = Compiler::discover().expect("LLVM 21+ llc/opt are installed");
     let options = CompileOptions::new(Target::parse("sm_120").unwrap());
     let ptx = compiler
@@ -254,6 +316,25 @@ fn spine_add_kernel_emits_entry_and_validates() {
     assert!(
         text.contains(".target sm_120"),
         "PTX targets sm_120:\n{text}"
+    );
+    assert!(text.contains("add_kernel"), "kernel root survives:\n{text}");
+    assert!(
+        !text.contains("unused_helper"),
+        "optimized PTX removes the non-root helper:\n{text}"
+    );
+
+    let no_opt = compiler
+        .compile(
+            &mut module,
+            &CompileOptions::new(Target::parse("sm_120").unwrap())
+                .with_optimization(Optimization::None),
+        )
+        .expect("compiles unoptimized PTX")
+        .into_ptx();
+    let no_opt = String::from_utf8(no_opt).expect("PTX is utf-8");
+    assert!(
+        no_opt.contains("unused_helper"),
+        "no-opt PTX demonstrates that helper removal comes from the optimizer:\n{no_opt}"
     );
 
     // ptxas must accept it for the real target.
@@ -271,14 +352,10 @@ fn spine_add_kernel_emits_entry_and_validates() {
     let cubin_path = dir.join("spine.cubin");
     std::fs::write(&ptx_path, &ptx).unwrap();
 
-    let ptxas = if std::path::Path::new("/usr/local/cuda/bin/ptxas").exists() {
-        "/usr/local/cuda/bin/ptxas"
-    } else {
-        "ptxas"
-    };
+    let ptxas = find_ptxas();
     // Capture the Result before cleanup so the scratch dir is always removed,
     // even when ptxas is absent and `.output()` would otherwise panic.
-    let ptxas_result = std::process::Command::new(ptxas)
+    let ptxas_result = std::process::Command::new(&ptxas)
         .arg("-arch=sm_120")
         .arg("--compile-only")
         .arg(&ptx_path)
@@ -289,7 +366,14 @@ fn spine_add_kernel_emits_entry_and_validates() {
     // Cleanup before any assert or expect so the dir is reclaimed on all paths.
     let _ = std::fs::remove_dir_all(&dir);
 
-    let out = ptxas_result.expect("ptxas runs");
+    let out = ptxas_result.unwrap_or_else(|error| {
+        panic!(
+            "could not run {}: {error}\nThis test needs `ptxas` from a CUDA \
+             toolkit (no GPU required). Point CUDA_TOOLKIT_PATH or CUDA_HOME at \
+             the install root, or put `ptxas` on PATH.",
+            ptxas.display()
+        )
+    });
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),

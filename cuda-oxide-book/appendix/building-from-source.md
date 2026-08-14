@@ -32,18 +32,20 @@ components. Rustup picks it up automatically:
 # rust-toolchain.toml (already in the repo root)
 [toolchain]
 channel = "nightly-2026-04-03"
-components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "llvm-tools"]
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "rustfmt", "llvm-tools"]
 ```
 
 If you need to install manually:
 
 ```bash
 rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev --toolchain nightly-2026-04-03
+rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-03
 ```
 
-`rust-src` provides the standard library source for cross-compilation and
-`rustc-dev` exposes compiler internals that the codegen backend links against.
+`rust-src` provides the standard library source for cross-compilation,
+`rustc-dev` exposes compiler internals that the codegen backend links against,
+and `llvm-tools` installs the toolchain-bundled `llc` used for PTX generation
+(also required by `cargo oxide doctor`).
 
 ## Install CUDA
 
@@ -175,8 +177,14 @@ and prints a success message.
 # Build and run an example
 cargo oxide run <example>
 
+# Print generated PTX only
+cargo oxide inspect <example>
+
 # Show the full compilation pipeline (MIR → LLVM IR → PTX)
 cargo oxide pipeline <example>
+
+# Remove local build outputs and generated artifacts
+cargo oxide clean
 
 # Run under NVIDIA Compute Sanitizer
 cargo oxide sanitize <example> --tool memcheck

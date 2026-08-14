@@ -17,6 +17,7 @@ roadmap, **N/A** = not applicable or no identified need.
 | HMM / Unified Memory Management | **Full** | GPU directly reads/writes host memory without `cudaMemcpy`. Reference captures in closures leverage HMM for host pointer access. Requires Turing+ GPU, Linux 6.1.24+, CUDA 12.2+. |
 | Unified Struct ABI (no `#[repr(C)]`) | **Full** | Device struct layout matches host exactly. The compiler queries rustc's actual layout and reproduces it with explicit padding in LLVM IR. Works with `#[repr(Rust)]` default. |
 | Dynamic Layout Matching | **Full** | Compiler queries rustc's `fields_by_offset_order()` and byte offsets, builds LLVM structs with correct field order and explicit padding bytes. Independent of LLVM's datalayout. |
+| Packed Layouts (`#[repr(packed)]`) | **Partial** | Field addresses formed through a pointer (`addr_of!((*p).field)`) use rustc's exact byte offsets, so `read_unaligned`/`write_unaligned` round-trips work, including `packed(N)`. Handling a packed struct *by value* (construction, whole-value load/store) and addressing elements of `[Packed; N]` are rejected with a diagnostic: LLVM's natural struct layout cannot express the tighter offsets, and a natural-layout value image would silently read the wrong bytes. Byte-faithful by-value support needs packed struct types upstream. |
 | Pointer Distance (`offset_from`) | **Full** | `ptr_offset_from` / `ptr_offset_from_unsigned` intrinsics (and the `offset_from`, `offset_from_unsigned`, `byte_offset_from`, `byte_offset_from_unsigned` methods) lower to an address difference divided by the rustc-reported pointee size, returning `isize` (signed) or `usize` (unsigned). Errors on a zero-sized pointee. |
 | Volatile Load/Store | **Full** | `core::ptr::read_volatile` / `write_volatile` carry an explicit volatile bit through MIR import, mem2reg (volatile accesses are never promoted), MIR-to-LLVM lowering, and textual export (`load volatile` / `store volatile`). Emits `ld.volatile` / `st.volatile` in PTX. |
 | Bulk Copy (`copy_nonoverlapping`) | **Full** | `core::ptr::copy_nonoverlapping` lowers to a `mir.memcpy` op and then `llvm.memcpy`, with the element count scaled to bytes for the pointee. The intrinsic overload suffix is derived from the operand address spaces and length width. |
@@ -32,10 +33,36 @@ roadmap, **N/A** = not applicable or no identified need.
 | `CuSimd<T, N>` SIMD Type | **Full** | Generic SIMD register type with named accessors (`x`/`y`/`z`/`w`), runtime and compile-time indexing, `to_array` conversion. |
 | ABI Scalarization | **Full** | Slices are scalarized at kernel boundaries (`&[T]` -> `(ptr, len)`, reconstructed inside the function). Structs and closures pass by value as one byval `.param`; field flattening still applies on internal device-to-device calls. |
 
-Array value constants are limited to primitive leaves (integers, `f16`,
-`f32`, `f64`) and nested arrays of those. Arrays whose elements are
-structs or other ADTs are not yet materialized as constants; they need
-layout-aware field decoding rather than the primitive byte-slicing rule.
+Array value constants support primitive leaves (integers, `f16`, `f32`,
+`f64`), nested arrays, and tuples recursively composed of supported scalar,
+enum, tuple, and zero-sized fields. Tuple element strides and field offsets
+come from rustc layout, including internal and trailing padding; direct tuple
+value constants use the same layout-aware decoder. Struct constants (direct
+and promoted-by-reference) also read every field at its rustc layout offset,
+so padded, reordered, `#[repr(C)]`, and nested shapes decode correctly, and a
+struct's stored size is its padded size, which fixes the element stride for
+arrays of padded structs inside constants. Pointer-free initialized union
+constants are materialized from rustc's evaluated storage image without
+guessing an active field: initialized bytes are preserved, uninitialized
+inactive bytes remain `undef`, and the byte image is transmuted into the
+layout-exact union type. This includes direct unions, unions nested in tuple or
+struct constants, runtime-indexed `[U; N]`, and `MaybeUninit<T>` constants.
+Bare arrays whose elements are structs are materialized element-wise
+through the same layout-aware struct decoders; promoting such tables to
+one immutable device global is a tracked follow-up.
+Thin pointer fields in array, tuple, and struct **const** values that relocate
+to device statics are materialized via `MirGlobalAllocOp` per field, including
+non-zero byte addends into a static (see `struct_constant_provenance`,
+`tuple_constant_provenance`, `tuple_array_provenance`). Pointer relocations
+inside union constants, fat pointers, enum constants with relocations,
+pointer-to-array union constants (`&[U; N]`), and device-global *initializer*
+relocations remain rejected.
+
+Enum constants with direct thin-reference payloads preserve relocations to
+device statics, including non-zero byte addends. This includes niche-encoded
+`Option<&T>` and direct-tagged enum layouts. Anonymous promoted allocations and
+pointer relocations nested inside array, tuple, struct, or enum payload fields
+remain unsupported.
 
 ## Compiler: Closures
 
@@ -56,6 +83,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | While Loops / If-Else | **Full** | Baseline control flow fully supported. |
 | Break and Continue | **Full** | `break` and `continue` in for/while loops, including early exit. |
 | Loop Unroll Annotations | **Partial** | `#[unroll]` and `#[unroll(N)]` request unrolling of explicit counted `while` loops. Nested loops and multiple `continue` paths work; full unrolling preserves `break` paths and multiple exit targets, while partial unrolling requires a positive-step `<`/`<=` loop with an invariant limit and only the normal header exit. Requests are capped at 1,024 copies, 8,192 cloned blocks, and 65,536 cloned operations. |
+| Monomorphization-Dead Branches | **Partial** | Branches that become dead after generic specialization (e.g. the const-false arm of `if M::ENABLED`) are ignored by symbol collection, panic checks, and pointer address-space inference, so panic-only hooks in dead arms compile. Only switches rustc itself folds are pruned: a constant discriminant operand or a direct single-assignment constant. Multi-step constant copy chains keep both arms, matching rustc's host monomorphization; this is deliberate, not a general constant-propagation pass. |
 
 ## Compiler: Arithmetic and Casting
 
@@ -96,6 +124,8 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | Float Math Intrinsics (libdevice) | **Full** | Rust `f32`/`f64` math methods (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...) lower to CUDA libdevice (`__nv_*`) on pre-Blackwell and Blackwell GPUs. cuda-oxide selects the matching NVVM IR syntax automatically. On Blackwell, the runtime can also JIT PTX produced from a standard pre-Blackwell target such as `sm_86`. |
 | MXMACA Math Intrinsics | **Partial** | Rust `f32`/`f64` math methods lower to MXMACA `mc_math_func_*` on MXMACA backend. f32: sin, cos, exp, pow, floor, abs, rint, min, max, sincos. f64: sin, cos, exp, pow, atan2, rint, min, max. sqrt inline-asm path not covered. |
 | Pipeline Inspection | **Full** | `cargo oxide pipeline <example>` shows imported and post-`mem2reg` MIR, LLVM dialect, exported LLVM IR, and PTX. |
+| PTX Inspect | **Full** | `cargo oxide inspect <example>` builds and prints generated PTX without the full pipeline dump. |
+| Local Clean | **Full** | `cargo oxide clean` removes project-local `target/` directories and generated device artifacts (`.ptx`, `.ll`, `.opt.ll`, `.ltoir`, `.cubin`, `.target`, `.options`, `.cubin.target`), never the shared `~/.cargo/cuda-oxide/` cache. |
 | Compute Sanitizer Wrapper | **Full** | `cargo oxide sanitize <example>` builds the example and runs the host binary under NVIDIA Compute Sanitizer (`memcheck`, `racecheck`, `initcheck`, or `synccheck`). |
 | cuda-gdb Source Debugging | **Full** | `cargo oxide debug` builds device debug information on the PTX path and launches `cuda-gdb`. Legacy NVVM IR does not yet support debug metadata. |
 | cuda-gdb Local / Argument Inspection | **Partial** | `CUDA_OXIDE_DEBUG=full` is a `-G`-style build (optimization off, locals kept in memory) so `info args`/`info locals` show real values for scalars, pointers/references, and structs/tuples/arrays with their fields. Enums, ABI-split bare slices, closures, and projections (`x.0`) are not yet described. |
@@ -128,7 +158,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| `ptx_asm!` Macro | **Partial** | CUDA inline PTX with `%0` operands, `in`, zero or one `out`, up to 16 inputs, CUDA register constraints `h`, `r`, `l`, `q`, `f`, and `d`, immediate integer constraint `n`, `clobber("memory")`, and `options(register_only)` for pure register snippets. By default, snippets are treated as side-effecting and stay inside their current control flow. Use `options(register_only, may_diverge)` only for pure snippets that are safe to move across divergent control flow; **never** use it for `.sync` instructions or collectives. Multiple outputs, read-write operands, and the `"C"` constraint are not implemented yet. |
+| `ptx_asm!` Macro | **Partial** | CUDA inline PTX with `%0` operands, `in`, `out`, and `inout`; up to 16 output operands across `out` with `=`-prefixed constraints and `inout` with `+`-prefixed constraints; up to 16 explicit inputs; CUDA register constraints `h`, `r`, `l`, `q`, `f`, and `d`; immediate integer constraint `n`; compile-time string constraint `C`; `clobber("memory")`; and `options(register_only)` for pure register snippets. With multiple output operands, the macro writes tuple results back in declaration order. By default, snippets are treated as side-effecting and stay inside their current control flow. Use `options(register_only, may_diverge)` only for pure snippets that are safe to move across divergent control flow; **never** use it for `.sync` instructions or collectives. More than 16 output operands are not implemented yet. |
 
 ---
 
@@ -138,6 +168,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 |:--------|:-------|:------------|
 | `DisjointSlice<T, IndexSpace>` | **Full** | Bounds-checked parallel write output slice. `IndexSpace` rejects mismatched layouts; uniqueness also requires matching prepared launch geometry (or a raw unsafe proof). |
 | `ThreadIndex<'kernel, IndexSpace>` | **Full** | Opaque, non-transferable witness. `index_1d` uniqueness requires inactive Y/Z dimensions, proven by a `domain = 1` prepared launch or by the caller of a raw unsafe launch. |
+| Proof-carrying static views | **Full** | A checked `u32` thread index proves one complete element or tile, then `at_const` accesses compile-time positions without another runtime bounds check. |
 | `PreparedLaunch<K>` | **Full** | Checked, reusable launch geometry branded for the exact kernel. Raw `LaunchConfig` generated methods are unsafe. |
 | `ManagedBarrier` Typestate | **Full** | Compile-time barrier lifecycle: `Uninit → Ready → Invalidated`. Invalid transitions are compile errors. |
 
@@ -162,7 +193,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. Index witnesses are layout-typed; their uniqueness also depends on matching launch dimensionality. `index_2d_runtime(s)` adds a caller-proved stride. See [The Safety Model](../gpu-safety/the-safety-model.md). |
+| Thread/Block/Grid Intrinsics | **Full** | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`. Index witnesses are layout-typed; their uniqueness also depends on matching launch dimensionality. `index_2d_runtime(&slice)` resolves against the slice's own row width, bound once by the host. See [The Safety Model](../gpu-safety/the-safety-model.md). |
 | Block Synchronization | **Full** | `sync_threads()` — thread block barrier. |
 | Async Barriers (mbarrier) | **Full** | Hardware async barriers for Hopper+: init, arrive, test_wait, try_wait, inval. |
 | Cluster Synchronization | **Full** | `cluster_sync()` for all blocks in a cluster. sm_90+. |
@@ -172,7 +203,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 
 | Feature | Status | Description |
 |:--------|:-------|:------------|
-| Warp Shuffle Operations | **Full** | `shuffle`, `shuffle_xor`, `shuffle_down`, `shuffle_up` for `i32` and `f32`. |
+| Warp Shuffle Operations | **Full** | `shuffle`, `shuffle_xor`, `shuffle_down`, `shuffle_up`. Unsuffixed forms take `u32`; `_f32`, `_u64`, `_f64` variants and a `_sync` form of each. |
 | Warp Vote Operations | **Full** | `all(pred)`, `any(pred)`, `ballot(pred)` → bitmask. |
 | Lane/Warp ID | **Full** | `lane_id()` (0–31), `warp_id()`. Direct register reads. |
 
@@ -183,7 +214,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | Typed Group Handles | **Full** | `Grid`, `Cluster`, `ThreadBlock`, `WarpTile<N>` (N ∈ {1,2,4,8,16,32}), `CoalescedThreads`. |
 | Group Universal API | **Full** | `size()`, `thread_rank()`, `sync()` on every group handle. |
 | Warp Tile Partitioning | **Full** | `ThreadBlock::tiled_partition::<N>()` carves a sub-warp `WarpTile<N>`. `coalesced_threads()` materialises the active-lane group. |
-| Warp Collectives | **Full** | `ballot`, `all`, `any`, `shfl`, `shfl_xor`, `shfl_down`, `shfl_up` (`i32` and `f32`); `match_any` / `match_all` (`i32` and `i64`); `active_mask`. |
+| Warp Collectives | **Full** | `ballot`, `all`, `any`, `shfl`, `shfl_xor`, `shfl_down`, `shfl_up` (`u32` and `f32`); `match_any` / `match_all` (`i32` and `i64`); `active_mask`. |
 | Warp Reductions / Scans | **Full** | `warp_reduce`, `warp_scan` (inclusive). `Sum`/`Min`/`Max` for `u32`/`i32`/`f32`; `BitAnd`/`BitOr`/`BitXor` for `u32`. |
 | Block Reductions / Scans | **Full** | `block_reduce`, `block_scan` (inclusive). Const-generic over `NUM_WARPS`; same op/type matrix as warp variants; uses `__shared__` scratch. |
 | Cooperative Kernel Launch | **Full** | `#[cooperative_launch]` on a `#[cuda_module]` kernel (or `unsafe { cuda_launch! { cooperative: true, ... } }`) enables `Grid::sync()` for grid-wide barriers. |
@@ -193,7 +224,7 @@ layout-aware field decoding rather than the primitive byte-slicing rule.
 | Feature | Status | Description |
 |:--------|:-------|:------------|
 | `gpu_printf!` Macro | **Full** | Formatted GPU output with full format specifier support. Lowers to `vprintf`. |
-| `gpu_assert!` Macro | **Full** | Runtime GPU assertion. Calls `trap()` if condition is false. |
+| `gpu_assert!` Macro | **Full** | The no-message form calls `trap()` on failure. The string-literal message form calls CUDA's device-side `__assertfail`, reports message and call-site metadata, and surfaces `CUDA_ERROR_ASSERT`. |
 | Debug Intrinsics | **Full** | `clock()`, `clock64()`, `trap()`, `breakpoint()`, `prof_trigger::<N>()`. |
 
 ## Runtime Library: Kernel Launch

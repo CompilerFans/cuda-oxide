@@ -27,6 +27,7 @@
 | Module               | Description                                                                  | GPU     |
 |----------------------|------------------------------------------------------------------------------|---------|
 | `thread`             | Thread/block IDs, `index_1d`/`index_2d::<S>`, `sync_threads`                 | All     |
+| `config`             | Metadata-only policy shapes, layouts, memory spaces, tiles, and atoms        | All     |
 | `disjoint`           | `DisjointSlice<T, IndexSpace>` -- safe parallel writes via `ThreadIndex`     | All     |
 | `shared`             | `SharedArray<T, N>`, `DynamicSharedArray<T>` -- block-scoped shared memory   | All     |
 | `warp`               | Shuffle (xor/up/down/idx for i32 and f32), lane_id, vote (all/any/ballot)    | All     |
@@ -54,7 +55,7 @@
 - `thread::index_1d()` -- unique only for a fully 1-D launch: grid and block
   Y/Z dimensions must all be `1`.
 - `thread::index_2d::<S>()` -- const-stride 2D index. The witness type carries `S`, so a `DisjointSlice<T, Index2D<S>>` rejects mismatched strides at compile time.
-- `unsafe thread::index_2d_runtime(s)` -- escape hatch for runtime strides; the `unsafe` is the contract that every thread used the same `s`.
+- `thread::index_2d_runtime(&slice)` -- runtime row strides, taken from the slice the index will address, where the host bound the row width once for the launch.
 
 The witness is `!Send + !Sync + !Copy + !Clone` and `'kernel`-scoped, so threads can't launder it through shared memory and it can't outlive the kernel body. `DisjointSlice<T, IndexSpace>` accepts only a `ThreadIndex` whose `IndexSpace` matches its own.
 
@@ -74,6 +75,24 @@ A `#[launch_contract(domain = 1, ...)]` moves the 1-D geometry proof into the
 safe prepared host launch; raw launch geometry is unsafe. For non-trivial
 patterns (reductions, histograms), `get_unchecked_mut(usize)` is the unsafe
 element-access escape hatch.
+
+### Compile-time kernel policies
+
+The `config` module provides names for shapes, layouts, memory spaces, tiles,
+and operations. These are zero-sized descriptions: they do not allocate or
+access memory. A kernel library can place them and tuning constants on a policy
+trait, then specialize one generic kernel for each policy type. The policy is
+not passed to the GPU at runtime.
+
+```rust
+#[kernel]
+#[launch_bounds(P::MAX_THREADS, P::MIN_BLOCKS)]
+#[launch_contract(domain = 1)]
+fn transform<P: TransformPolicy>(out: DisjointSlice<u32>) { /* ... */ }
+```
+
+`MAX_THREADS` is the largest accepted block, not an exact block size. A
+prepared launch checks the concrete value for `P` before calling CUDA.
 
 ### `SharedArray<T, N, ALIGN>` and `DynamicSharedArray<T, ALIGN>`
 
@@ -130,14 +149,27 @@ use cuda_device::{gpu_printf, gpu_assert};
 #[kernel]
 pub fn debug_kernel(data: &[f32]) {
     let idx = thread::index_1d();
-    gpu_printf!("thread %d: val = %f\n", idx.get() as i32, data[idx.get()] as f64);
-    gpu_assert!(data[idx.get()] >= 0.0);
+    let value = data[idx.get()];
+
+    gpu_printf!(
+        "thread %d: val = %f\n",
+        idx.get() as i32,
+        value as f64
+    );
+    gpu_assert!(value >= 0.0, "expected non-negative value");
 }
 ```
 
 `gpu_printf!` compiles to device-side `vprintf` with C vararg promotion.
-`gpu_assert!` traps on failure. The `debug` module also exposes GPU timing
-register reads such as `clock64()` and `globaltimer()`.
+
+`gpu_assert!(condition)` uses `trap()` when the condition is false. The
+string-literal message form, `gpu_assert!(condition, "message")`, calls CUDA's
+device-side `__assertfail` system call. The CUDA driver reports the assertion
+message and call-site metadata, and synchronization returns
+`CUDA_ERROR_ASSERT`.
+
+The `debug` module also exposes GPU timing register reads such as `clock64()`
+and `globaltimer()`.
 
 ## Proc-Macro Re-exports
 

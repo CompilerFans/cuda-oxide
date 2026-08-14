@@ -86,16 +86,7 @@ pub unsafe fn mma_m16n16k16_i32_i8(c: [i32; 4], a: u32, b: u32) -> [i32; 4] {
 ///
 /// # Safety
 ///
-/// - All 32 lanes must execute the same call together.
-/// - Calling from divergent control flow is undefined behavior.
-/// - Requires `sm_75+` and PTX ISA 7.8+. cuda-oxide selects both floors
-///   automatically, including when targeting Turing or Ampere.
-#[inline(never)]
-#[must_use]
-pub unsafe fn movmatrix_trans_b16(a: u32) -> u32 {
-    let _ = a;
-    unreachable!("movmatrix_trans_b16 called outside CUDA kernel context")
-}
+include!("generated/movmatrix.rs");
 
 // =============================================================================
 // Shared-memory matrix loads
@@ -483,3 +474,7 @@ pub unsafe fn mma_m16n8k32_s32_s8(c: [i32; 4], a: [u32; 4], b: [u32; 2]) -> [i32
     let _ = (c, a, b);
     unreachable!("mma_m16n8k32_s32_s8 called outside CUDA kernel context")
 }
+
+include!("generated/register_mma.rs");
+include!("generated/sparse_mma.rs");
+include!("generated/ldmatrix.rs");

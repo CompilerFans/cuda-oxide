@@ -1,7 +1,7 @@
 <p align="center">
   <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/ci.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=CI"></a>
   <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/examples-compile.yml"><img alt="examples" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/examples-compile.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=examples"></a>
-  <a href="https://discord.gg/Fua7DeKnm"><img alt="discord" src="https://img.shields.io/discord/1515530041767759993?style=flat-square&logo=discord&logoColor=white&label=discord&color=5865F2"></a>
+  <a href="https://discord.gg/ZUEr4AhH5C"><img alt="discord" src="https://img.shields.io/discord/1515530041767759993?style=flat-square&logo=discord&logoColor=white&label=discord&color=5865F2"></a>
   <br>
   <img src="assets/logo.png" alt="cuda-oxide logo" width="100%">
 </p>
@@ -14,6 +14,7 @@ The workspace combines:
 - single-source compilation -- host and device code live in the same file, built with one `cargo oxide build`
 - a rustc codegen backend that compiles `#[kernel]` functions to CUDA PTX
 - device-side abstractions (type-safe indexing, shared memory, scoped atomics, barriers, TMA, warp/cluster ops)
+- compile-time kernel policies for separate tuned specializations without runtime policy arguments
 - a host-side runtime for memory management, pinned host transfers, and kernel launching (`cuda-core`, `cuda-async`)
 - a rust-native compilation pipeline using [Pliron](https://github.com/vaivaswatha/pliron), an MLIR-like IR framework in Rust (Rust → Rust MIR → Pliron IR → LLVM IR → PTX)
 
@@ -113,15 +114,32 @@ See the `async_mlp` example and `crates/cuda-async/README.md` for the full async
 # Build and run an example
 cargo oxide run host_closure
 
+# Build and print the generated PTX
+cargo oxide inspect vecadd
+
 # Show full compilation pipeline (Rust MIR → dialect-mir → mem2reg → LLVM dialect → LLVM IR → PTX)
 cargo oxide pipeline vecadd
+
+# Remove project-local build outputs and generated artifacts
+cargo oxide clean
 
 # Run CUDA correctness checks
 cargo oxide sanitize vecadd --tool memcheck
 
 # Debug with cuda-gdb
 cargo oxide debug vecadd --tui
+
+# Run Cargo tests through the cuda-oxide backend
+cargo oxide test
+
+# Compile a crate's device code to a binary LTOIR artifact in one step
+cargo oxide emit-ltoir
+
+# Refresh the cached codegen backend
+cargo oxide update
 ```
+
+`cargo oxide --help` lists every subcommand.
 
 ## Setup
 
@@ -162,7 +180,7 @@ nix run github:NVlabs/cuda-oxide#new my-project   # bootstrap a project
 # Toolchain installed automatically via rust-toolchain.toml
 # Manual install if needed:
 rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev --toolchain nightly-2026-04-03
+rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-03
 ```
 
 #### CUDA
@@ -238,7 +256,7 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 
 ## Examples
 
-**60+ examples** in `crates/rustc-codegen-cuda/examples/`. Highlights:
+**190+ examples** in `crates/rustc-codegen-cuda/examples/`. Highlights:
 
 | Example              | Description                                                              |
 |----------------------|--------------------------------------------------------------------------|
@@ -271,6 +289,7 @@ cargo oxide run gemm_sol_final
 | Crate               | Description                                                               |
 |---------------------|---------------------------------------------------------------------------|
 | `cuda-device`       | Device intrinsics (`thread::*`, `warp::*`, barriers)                      |
+| `cuda-intrinsics`   | Generated low-level CUDA intrinsic declarations                           |
 | `cuda-host`         | Typed module loading, launch helpers, LTOIR loader                        |
 | `cuda-macros`       | Proc macros (`#[cuda_module]`, `#[kernel]`, `gpu_printf!`)                |
 | `cuda-bindings`     | Raw `bindgen` FFI bindings to `cuda.h`                                    |
@@ -287,14 +306,24 @@ cargo oxide run gemm_sol_final
 | `mir-importer`       | Rust MIR -> `dialect-mir` translation + pipeline      |
 | `mir-lower`          | `dialect-mir` -> LLVM dialect lowering                |
 | `dialect-mir`        | pliron dialect modelling Rust MIR                     |
+| `dialect-iket`       | pliron dialect modelling in-kernel event tracing      |
+| `iket-lower`         | `dialect-iket` profiles + instrumentation lowering    |
 | `llvm-export`        | pliron-llvm shim + textual `.ll` exporter             |
 | `dialect-nvvm`       | pliron dialect modelling NVVM intrinsics              |
+| `mir-transforms`     | Optimization passes over the MIR dialect (loop unroll, ...) |
+| `nvvm-transforms`    | Target-aware LLVM dialect legalization for NVVM      |
+| `cuda-oxide-codegen` | Experimental rustc-independent PTX backend           |
 
 ### Build Tooling
 
-| Crate          | Description                                          |
-|----------------|------------------------------------------------------|
-| `cargo-oxide`  | Cargo subcommand (`cargo oxide run`, etc.)           |
+| Crate                     | Description                                                    |
+|---------------------------|----------------------------------------------------------------|
+| `cargo-oxide`             | Cargo subcommand (`cargo oxide run`, etc.)                     |
+| `cuda-intrinsics-gen`     | Extractor and deterministic source generator for the intrinsics |
+| `cuda-artifact-finalizer` | Driver-independent NVVM IR and LTOIR finalization              |
+| `oxide-artifacts`         | Architecture-neutral embedded device artifact metadata         |
+| `reserved-oxide-symbols`  | Workspace-private `cuda_oxide_*` symbol-name contract          |
+| `fuzzer`                  | Differential codegen fuzzer support (rustlantis adapter)       |
 
 ### Documentation
 
