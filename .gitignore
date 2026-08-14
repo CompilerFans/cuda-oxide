@@ -19,6 +19,9 @@ AGENTS.md
 
 # Internal design notes are maintained out-of-band (see cuda-oxide-book/ for the published book).
 /docs/
+# The MetaX (MXMACA) migration handoff is an active work log shared with
+# the team; it stays in-tree.
+!/docs/maca-migration-handoff.md
 DESIGN.md
 test.mlir
 /debug/

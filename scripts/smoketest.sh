@@ -47,6 +47,13 @@ AUTO_NVVM_EXAMPLES=(libdevice_math)
 # Examples that inspect PTX text (vector load shapes, mangled symbol names)
 # or need CUDA-only host metadata interop. Meaningless on a non-PTX target.
 PTX_INSPECT_EXAMPLES=(vectorization const_generic cross_crate_kernel cutile_inter_kernel)
+# Examples exercising NVIDIA hardware features with no MXMACA equivalent:
+# mbarrier, cp.async, TMA, thread-block clusters, pmevent, mma.sync, and
+# packed bf16/f16x2 inline PTX. These fail closed by design on MACA.
+NV_FEATURE_EXAMPLES=(barrier clc cluster debug future_apis standalone_device_fn mcast_barrier_test tma_copy tma_multicast cp_async_small cp_async_zfill coop_groups_demo bf16x2_arith bf16x2_fma cvt_f16x2 cvt_packed packed_atomic_add dotprod inline_ptx)
+# Examples requiring HMM/ATS (device dereferences host pageable memory).
+# MetaX C500 does not support device-side access to host stack/heap memory.
+HMM_EXAMPLES=(abi_hmm host_closure)
 NVVM_VERIFY_EXAMPLES=(device_global libdevice_math legacy_nvvm_pointer_shapes primitive_stress)
 ERROR_EXAMPLES=(error error_wgmma_mma_unimplemented error_set_discriminant_niche error_set_discriminant_uninhabited error_static_initializer_provenance error_drop_glue error_heap_alloc error_missing_device_attr)
 
@@ -57,6 +64,8 @@ classify() {
     for cat in "${LTOIR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo ltoir;       return; }; done
     for cat in "${AUTO_NVVM_EXAMPLES[@]}";   do [[ "$ex" == "$cat" ]] && { echo auto-nvvm;   return; }; done
     for cat in "${PTX_INSPECT_EXAMPLES[@]}"; do [[ "$ex" == "$cat" ]] && { echo ptx-inspect; return; }; done
+    for cat in "${NV_FEATURE_EXAMPLES[@]}";  do [[ "$ex" == "$cat" ]] && { echo nv-feature;  return; }; done
+    for cat in "${HMM_EXAMPLES[@]}";         do [[ "$ex" == "$cat" ]] && { echo hmm;         return; }; done
     for cat in "${ERROR_EXAMPLES[@]}";       do [[ "$ex" == "$cat" ]] && { echo error;       return; }; done
     echo standard
 }
@@ -70,7 +79,7 @@ maca_remap_category() {
     local cat="$1"
     if [[ "${TARGET_BACKEND}" == "maca" ]]; then
         case "${cat}" in
-            tcgen05|wgmma|ltoir|auto-nvvm|ptx-inspect) echo "maca-skip" ;;
+            tcgen05|wgmma|ltoir|auto-nvvm|ptx-inspect|nv-feature|hmm) echo "maca-skip" ;;
             *) echo "${cat}" ;;
         esac
     else

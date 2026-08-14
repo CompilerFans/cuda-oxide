@@ -239,6 +239,41 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 3. **Type mismatch** (1个） — elect_leader 的 Wave64 类型问题
 4. **Other compile errors** (17个） — MXMACA 编译器错误（shared memory, atomics, warp ops 等）
 
+### 4.0.1 2026-07-20 会话进展
+
+**本日修复（按 commit 顺序）**：
+
+1. **elect.sync 正确实现** — `leader = cttz(mask)`（`llvm.cttz.i64`）+ `is_elected = lane_id == leader`，
+   替换此前硬编码 leader=0 的错误实现。修复 elect_leader 挂起。
+2. **alloca 地址空间（AS5）** — MetaX 后端无法在通用地址空间选择 `FrameIndex`（`Cannot select: i64 = FrameIndex<0>`）。
+   对齐 MetaX clang：`alloca ..., addrspace(5)` + `addrspacecast` 回通用指针
+   （`llvm-export` 新增 `ExportBackendConfig::alloca_address_space`）。修复 array_for_loop、array_constants、abi_hmm 等编译崩溃。
+3. **mxcc -O3 中端优化** — 设备二进制生成前先用 `mxcc -x ir -O3 -S -emit-llvm` 优化
+   （`-forward-unknown-to-compiler --target=mxc-metax-macahca` 防止 triple 被覆盖为 x86_64）。
+4. **alloca 提升至 entry 块** — MetaX 后端按 **4KB 粒度**分配私有内存（4KB/thread 硬件上限），
+   分支块中的 alloca 无法被 mem2reg/SROA 提升，每个都占满 4KB 导致 launch 失败
+   （`private memory size required ... 5 KB/thread`）。`mir-lower` 在 MACA lowering 后
+   把所有静态 alloca 提升到 entry 块。修复 enum_array_match、union_aggregate、place_read_fallbacks。
+5. **byte-array transmute 寄存器化** — `[u8; N]` ↔ 标量（`from_ne_bytes`/`to_ne_bytes`）在 MACA 下
+   不再走 `alloca+store+load` 内存往返（byte-pun alloca 无法提升），改为 extractvalue/shl/or 寄存器组装。
+   修复 ne_bytes_transmute。
+6. **WAVE_SIZE 目标条件化** — `cuda_oxide_target_maca` cfg（64=MetaX / 32=NVIDIA），
+   `cargo oxide run/build/passthrough` 三条路径均注入；WaveMask 统一 u64（CUDA lowering 截断）。
+   修复此前 WAVE_SIZE=64 无条件化导致的 CUDA 侧 warp_id 语义破坏。
+7. **Wave64 示例移植** — lanemask_scan（u64 mask + WAVE_SIZE）、shuffle_64（64-lane butterfly、half-warp 泛型）。
+8. **hashmap_v3 reclaim 死锁** — `try_reclaim_deleted` 的 `RESERVED` 自旋改为有界（4096 次后回退 EMPTY claim）。
+   无限自旋在 SIMT 硬件上可能死锁：持有 RESERVED 的 lane 在 wave-mates 自旋时永远得不到调度。
+   新增 `bin/repro_reclaim.rs` 最小回归测试（90% 负载 delete+reinsert）。
+9. **smoketest 分类** — PTX 文本检查类示例（vectorization、const_generic、cross_crate_kernel、cutile_inter_kernel）
+   在 MACA 下归入 `maca-skip`。
+
+**关键经验**：
+- MetaX 私有内存分配粒度 4KB；任何无法提升为寄存器的 alloca 都是 4KB。CUDA 路径靠 `opt -O2` 消除，MACA 路径需自己保证。
+- `cargo oxide run` 与 `cargo oxide build` 走不同的 rustflags 注入路径（`codegen_run` vs `run_cargo_passthrough`），
+  新增设备 cfg 必须三条路径都覆盖。
+- 调试注意：示例构建失败时 smoketest 会跑**陈旧二进制**（输出与源码不符时先 `cargo build` 验证编译错误）。
+- Wave64 SIMT 上的波内原子自旋（spin on atomic）是死锁高发区：自旋必须有界。
+
 ### 4.1 高优先级
 
 | 任务 | 说明 | 阻塞因素 |
