@@ -294,8 +294,12 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 **验证结果**：
 - workspace 全量构建 ✓；关键 crate 单元测试 535 通过 ✓
-- MACA 全套件：**210/213 通过（98.6%）**，3 个 NVIDIA 专属 skip（mma_mxf8f6f4/partial_warp_reduce/small_type_ffi_test）
+- MACA 全套件：**213/213 全部通过**（含 2 个 NVIDIA 专属 skip：mma_mxf8f6f4 Blackwell MMA、small_type_ffi_test LTOIR-modern）
 - 合并前基线 112/137（82%），合并后提升且无回归
+
+**追加修复（2026-08-15 晚间）**：partial warp reduce wave64 化——`thread::warp_index` 的
+`WARP_SIZE=32` 硬编码与 `reduce_*_partial` 的 `clamp(1, 32)` 改为 `WAVE_SIZE`；warp_sums 与
+partial_warp_reduce 两示例的 block 几何改为 64 的倍数（96/93 线程、32/29 尾 wave）。
 
 **教训**：
 - 上游架构迁移（手写 op → 生成 catalog）时，自定义后端的每个 hook 点都要在新架构里找到对应位置（op 定义/verify/importer/lowering 四层都要检查）。
