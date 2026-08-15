@@ -1201,7 +1201,7 @@ pub fn live_lanes_1d() -> u32 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_sum_f32_partial(val: f32, live_lanes: u32) -> f32 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {
@@ -1240,7 +1240,7 @@ pub fn reduce_sum_f32_partial(val: f32, live_lanes: u32) -> f32 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_max_f32_partial(val: f32, live_lanes: u32) -> f32 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {
@@ -1279,7 +1279,7 @@ pub fn reduce_max_f32_partial(val: f32, live_lanes: u32) -> f32 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_min_f32_partial(val: f32, live_lanes: u32) -> f32 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {
@@ -1314,7 +1314,7 @@ pub fn reduce_min_f32_partial(val: f32, live_lanes: u32) -> f32 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_sum_f64_partial(val: f64, live_lanes: u32) -> f64 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {
@@ -1350,7 +1350,7 @@ pub fn reduce_sum_f64_partial(val: f64, live_lanes: u32) -> f64 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_max_f64_partial(val: f64, live_lanes: u32) -> f64 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {
@@ -1386,7 +1386,7 @@ pub fn reduce_max_f64_partial(val: f64, live_lanes: u32) -> f64 {
 #[must_use]
 #[inline(always)]
 pub fn reduce_min_f64_partial(val: f64, live_lanes: u32) -> f64 {
-    let live = live_lanes.clamp(1, 32);
+    let live = live_lanes.clamp(1, crate::WAVE_SIZE);
     let mask = live_lane_mask(live);
 
     if live.is_power_of_two() {

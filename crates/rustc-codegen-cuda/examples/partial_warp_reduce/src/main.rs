@@ -34,17 +34,18 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
-    DisjointSlice, cuda_module, kernel, launch_bounds, launch_contract, thread, warp,
+    DisjointSlice, WAVE_SIZE, cuda_module, kernel, launch_bounds, launch_contract, thread,
+    warp,
 };
 
-/// A power-of-two tail: two warps per block, the second with 16 live lanes.
-const BLOCK_POW2: u32 = 48;
-/// A tail that is not a power of two: 13 live lanes in the second warp.
-const BLOCK_ODD: u32 = 45;
+/// A power-of-two tail: two waves per block, the second with 32 live lanes.
+const BLOCK_POW2: u32 = 96;
+/// A tail that is not a power of two: 29 live lanes in the second wave.
+const BLOCK_ODD: u32 = 93;
 const BLOCKS: u32 = 7;
 
-const WARPS_PER_BLOCK_POW2: u32 = BLOCK_POW2.div_ceil(32);
-const WARPS_PER_BLOCK_ODD: u32 = BLOCK_ODD.div_ceil(32);
+const WARPS_PER_BLOCK_POW2: u32 = BLOCK_POW2.div_ceil(cuda_device::WAVE_SIZE);
+const WARPS_PER_BLOCK_ODD: u32 = BLOCK_ODD.div_ceil(cuda_device::WAVE_SIZE);
 const WARPS_POW2: u32 = WARPS_PER_BLOCK_POW2 * BLOCKS;
 const WARPS_ODD: u32 = WARPS_PER_BLOCK_ODD * BLOCKS;
 
@@ -54,8 +55,8 @@ mod kernels {
 
     /// One sum per warp, from blocks of 48.
     #[kernel(launch_context = launch_context)]
-    #[launch_bounds(48)]
-    #[launch_contract(domain = 1, coordinates = u32, block = (48, 1, 1))]
+    #[launch_bounds(96)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (96, 1, 1))]
     pub fn sums_pow2_tail(input: &[f32], mut sums: DisjointSlice<f32, thread::WarpIndex>) {
         let gid = thread::index_1d().get();
         let contribution = if gid < input.len() { input[gid] } else { 0.0 };
@@ -70,8 +71,8 @@ mod kernels {
 
     /// One sum per warp, from blocks of 45, whose tail warp has 13 live lanes.
     #[kernel(launch_context = launch_context)]
-    #[launch_bounds(45)]
-    #[launch_contract(domain = 1, coordinates = u32, block = (45, 1, 1))]
+    #[launch_bounds(93)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (93, 1, 1))]
     pub fn sums_odd_tail(input: &[f32], mut sums: DisjointSlice<f32, thread::WarpIndex>) {
         let gid = thread::index_1d().get();
         let contribution = if gid < input.len() { input[gid] } else { 0.0 };
@@ -90,8 +91,8 @@ mod kernels {
     /// shows up plainly: an uninitialised or foreign lane carrying a larger
     /// value replaces the answer rather than perturbing it.
     #[kernel(launch_context = launch_context)]
-    #[launch_bounds(45)]
-    #[launch_contract(domain = 1, coordinates = u32, block = (45, 1, 1))]
+    #[launch_bounds(93)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (93, 1, 1))]
     pub fn maxima_odd_tail(input: &[f32], mut maxima: DisjointSlice<f32, thread::WarpIndex>) {
         let gid = thread::index_1d().get();
         let contribution = if gid < input.len() {
@@ -122,7 +123,7 @@ fn reference(
     for b in 0..blocks {
         for lane in 0..block {
             let gid = b * block + lane;
-            let warp = b * warps_per_block + lane / 32;
+            let warp = b * warps_per_block + lane / cuda_device::WAVE_SIZE;
             expected[warp as usize] = combine(expected[warp as usize], host[gid as usize]);
         }
     }

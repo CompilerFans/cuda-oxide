@@ -16,7 +16,7 @@
 //! `get_mut` with no `unsafe`.
 //!
 //! The block width below is deliberately not a multiple of the warp size, which
-//! is the case where deriving the warp index as `index_1d() / 32` would give
+//! is the case where deriving the warp index as `index_1d() / WAVE_SIZE` would give
 //! two different warps the same index. The same partial tail warp also rules
 //! out `warp::reduce_sum_f32`, whose contract needs all 32 lanes launched and
 //! converged, so both kernels call `warp::reduce_sum_f32_partial` with the
@@ -25,16 +25,19 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
-    DisjointSlice, cuda_module, kernel, launch_bounds, launch_contract, thread, warp,
+    DisjointSlice, WAVE_SIZE, cuda_module, kernel, launch_bounds, launch_contract, thread,
+    warp,
 };
 use std::time::Instant;
 
 /// Not a multiple of 32, so each block's last warp is partial.
-const BLOCK: u32 = 48;
+// The partial warp is deliberate: BLOCK is not a multiple of WAVE_SIZE,
+// so every block has one full wave plus a partial tail wave.
+const BLOCK: u32 = 96;
 const BLOCKS: u32 = 7;
 const THREADS: u32 = BLOCK * BLOCKS;
 /// Two warps per block, the second one partial.
-const WARPS_PER_BLOCK: u32 = BLOCK.div_ceil(32);
+const WARPS_PER_BLOCK: u32 = BLOCK.div_ceil(cuda_device::WAVE_SIZE);
 const WARPS: u32 = WARPS_PER_BLOCK * BLOCKS;
 
 #[cuda_module]
@@ -43,8 +46,8 @@ mod kernels {
 
     /// Sum each warp's contributions and store one value per warp.
     #[kernel(launch_context = launch_context)]
-    #[launch_bounds(48)]
-    #[launch_contract(domain = 1, coordinates = u32, block = (48, 1, 1))]
+    #[launch_bounds(96)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (96, 1, 1))]
     pub fn warp_sums(input: &[f32], mut sums: DisjointSlice<f32, thread::WarpIndex>) {
         let gid = thread::index_1d().get();
         let contribution = if gid < input.len() { input[gid] } else { 0.0 };
@@ -70,16 +73,16 @@ mod kernels {
     /// Only lane 0 of each warp writes, the warp index is unique across the
     /// launch, and `sums` holds one element per warp of this launch geometry.
     #[kernel(launch_context = launch_context)]
-    #[launch_bounds(48)]
-    #[launch_contract(domain = 1, coordinates = u32, block = (48, 1, 1))]
+    #[launch_bounds(96)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (96, 1, 1))]
     pub unsafe fn warp_sums_raw(input: &[f32], mut sums: DisjointSlice<f32>) {
         let gid = thread::index_1d().get();
         let contribution = if gid < input.len() { input[gid] } else { 0.0 };
         let total = warp::reduce_sum_f32_partial(contribution, warp::live_lanes_1d());
 
         if warp::lane_id() == 0 {
-            let warps_per_block = thread::blockDim_x().div_ceil(32);
-            let warp = thread::blockIdx_x() * warps_per_block + thread::threadIdx_x() / 32;
+            let warps_per_block = thread::blockDim_x().div_ceil(crate::WAVE_SIZE);
+            let warp = thread::blockIdx_x() * warps_per_block + thread::threadIdx_x() / crate::WAVE_SIZE;
             // SAFETY: as documented on the kernel.
             unsafe {
                 *sums.get_unchecked_mut(warp as usize) = total;
@@ -109,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for block in 0..BLOCKS {
         for lane in 0..BLOCK {
             let gid = block * BLOCK + lane;
-            let warp = block * WARPS_PER_BLOCK + lane / 32;
+            let warp = block * WARPS_PER_BLOCK + lane / cuda_device::WAVE_SIZE;
             expected[warp as usize] += host[gid as usize];
         }
     }

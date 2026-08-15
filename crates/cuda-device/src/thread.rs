@@ -509,7 +509,7 @@ pub mod __internal {
     };
 
     /// Threads per warp on every currently supported target.
-    const WARP_SIZE: u32 = 32;
+    const WARP_SIZE: u32 = crate::WAVE_SIZE;
 
     mod sealed {
         pub trait Sealed {}

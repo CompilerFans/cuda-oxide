@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python3 - << 'EOF'\\np = 'crates/dialect-nvvm/src/ops/generated/sreg.rs'\\nsrc = open(p).read()\\nfor op in ['LanemaskLt','LanemaskLe','LanemaskEq','LanemaskGe','LanemaskGt']:\\n    old = f'''...",
-  "error": "Exit code 1\nlanemask verify widened to 64\n0",
-  "timestamp": "2026-08-14T17:41:25.933Z",
+  "tool_input_preview": "{\"command\":\"rtk grep -E \\\"^Pass:|^Fail:\\\" /tmp/smoketest-final2.log; rtk grep -E \\\"^  [a-z_0-9]+ +FAIL\\\" /tmp/smoketest-final2.log\",\"description\":\"Final results\"}",
+  "error": "Exit code 1\nPass:    213 / 213\nFail:    0 / 213",
+  "timestamp": "2026-08-15T05:15:23.054Z",
   "retry_count": 1
 }
