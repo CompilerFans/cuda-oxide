@@ -1,8 +1,0 @@
-[package]
-name = "maca-core"
-version = "0.1.0"
-edition = "2021"
-description = "Safe RAII wrappers for MetaX MXMACA Runtime API"
-
-[dependencies]
-maca-bindings = { path = "../maca-bindings" }

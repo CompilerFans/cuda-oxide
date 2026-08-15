@@ -788,7 +788,6 @@ mod tests {
         };
         let state = ModuleExportState::new(
             &ctx,
-            true,
             super::super::config::KernelCallingConvention::PtxKernel,
             super::super::config::DebugKind::LineTables,
             None,

@@ -162,7 +162,7 @@ mod tests {
     use pliron::context::Context;
 
     fn test_state<'a>(ctx: &'a Context) -> ModuleExportState<'a> {
-        ModuleExportState::new(ctx, true, KernelCallingConvention::C, DebugKind::Off, None, 0)
+        ModuleExportState::new(ctx, KernelCallingConvention::C, DebugKind::Off, None, 0)
     }
 
     #[test]

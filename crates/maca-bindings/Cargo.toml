@@ -1,8 +1,0 @@
-[package]
-name = "maca-bindings"
-version = "0.1.0"
-edition = "2021"
-description = "Rust bindings to MetaX MXMACA Runtime API"
-
-[build-dependencies]
-bindgen = "0.71"

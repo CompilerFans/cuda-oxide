@@ -467,7 +467,6 @@ pub(super) fn export_module_with_externs_impl(
     let kernel_calling_convention = config.kernel_calling_convention();
     let mut state = ModuleExportState::new(
         ctx,
-        emit_all_annotations,
         kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),
@@ -663,7 +662,6 @@ pub(super) fn export_module_to_string_with_config(
     let kernel_calling_convention = config.kernel_calling_convention();
     let mut state = ModuleExportState::new(
         ctx,
-        emit_all_annotations,
         kernel_calling_convention,
         config.debug_kind(),
         config.nvvm_ir_dialect(),

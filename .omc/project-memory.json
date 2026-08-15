@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && cd crates/rustc-codegen-cuda && rtk cargo build 2>&1 | grep -cE \"^error\"",
-    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p mir-lower -p llvm-export -p cuda-oxide-codegen -p cargo-oxide -p cuda-device --lib > /tmp/key_tests.log 2>&1; echo \"RC: $?\"; rtk read /tmp/key_tests.log --tail-lines 3",
+    "buildCommand": "python3 - << 'EOF'\np = 'Cargo.toml'\nsrc = open(p).read()\nsrc = src.replace('''    \"crates/cuda-async\",\n    \"crates/libnvvm-sys\",\n    \"crates/nvjitlink-sys\",\n    # MXMACA bindings\n    \"crates/maca-bindings\",\n    \"crates/maca-core\",\n    \"crates/maca-host\",\n    # Examples\n''', '''    \"crates/cuda-async\",\n    \"crates/libnvvm-sys\",\n    \"crates/nvjitlink-sys\",\n    # Examples\n''')\nopen(p,'w').write(src)\nprint(\"members cleaned\")\nEOF\ngrep -c maca Cargo.toml; export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && cargo build --workspace 2>&1 | grep -E \"^error\" -A4 | head -10; echo \"WS: ${PIPESTATUS[0]}\"",
+    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p llvm-export -p mir-lower -p cuda-bindings -p cuda-oxide-codegen --lib 2>&1 | tail -2",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}

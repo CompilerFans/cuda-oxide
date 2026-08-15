@@ -84,8 +84,6 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) launch_bounds_kernels: Vec<KernelLaunchBounds>,
     /// Track ALL kernels (for backends that require annotations for every kernel)
     pub(super) all_kernels: Vec<KernelInfo>,
-    /// Whether to track all kernels (set by backend config)
-    pub(super) track_all_kernels: bool,
     /// Calling convention printed on kernel declarations and definitions.
     pub(super) kernel_calling_convention: KernelCallingConvention,
     /// Track device function names for @llvm.used (standalone device fn compilation)
@@ -175,7 +173,6 @@ pub(super) struct ResolvedDebugScope {
 impl<'a> ModuleExportState<'a> {
     pub(super) fn new(
         ctx: &'a pliron::context::Context,
-        track_all_kernels: bool,
         kernel_calling_convention: KernelCallingConvention,
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
@@ -187,7 +184,6 @@ impl<'a> ModuleExportState<'a> {
             cluster_kernels: Vec::new(),
             launch_bounds_kernels: Vec::new(),
             all_kernels: Vec::new(),
-            track_all_kernels,
             kernel_calling_convention,
             device_functions: Vec::new(),
             public_globals: Vec::new(),

@@ -1,8 +1,0 @@
-[package]
-name = "maca-vecadd"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-maca-core = { path = "../../crates/maca-core" }
-libloading = "0.8"

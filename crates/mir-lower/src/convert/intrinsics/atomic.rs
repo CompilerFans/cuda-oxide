@@ -489,7 +489,7 @@ pub(crate) fn convert_atomic_rmw(
     if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca
         && matches!(
             rmw_kind,
-            LlvmAtomicRmwKind::FAdd | LlvmAtomicRmwKind::FSub | LlvmAtomicRmwKind::Xchg
+            LlvmAtomicRmwKind::FAdd | LlvmAtomicRmwKind::Xchg
         )
         && val.get_type(ctx).deref(ctx).is::<llvm_export::types::HalfType>()
     {
@@ -574,7 +574,6 @@ fn ensure_maca_f16_rmw_helper(
 )> {
     let kind_suffix = match rmw_kind {
         LlvmAtomicRmwKind::FAdd => "fadd",
-        LlvmAtomicRmwKind::FSub => "fsub",
         LlvmAtomicRmwKind::Xchg => "xchg",
         other => {
             return pliron::input_err_noloc!("MACA f16 RMW helper: unsupported kind {other:?}")
@@ -717,11 +716,8 @@ fn ensure_maca_f16_rmw_helper(
         let old_fv = old_f.get_operation().deref(ctx).get_result(0);
 
         let flags = llvm_export::attributes::FastmathFlagsAttr::default();
-        let new_f_op = if rmw_kind == LlvmAtomicRmwKind::FAdd {
-            llvm::FAddOp::new_with_fast_math_flags(ctx, old_fv, v, flags).get_operation()
-        } else {
-            llvm::FSubOp::new_with_fast_math_flags(ctx, old_fv, v, flags).get_operation()
-        };
+        let new_f_op =
+            llvm::FAddOp::new_with_fast_math_flags(ctx, old_fv, v, flags).get_operation();
         new_f_op.insert_at_back(loop_bb, ctx);
         let new_fv = new_f_op.deref(ctx).get_result(0);
 

@@ -176,14 +176,16 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 ### 3.3 运行时绑定（✅ 完成）
 
-#### maca-bindings
-- **文件**: `crates/maca-bindings/`
+#### maca-bindings（已移除）
+- **文件**: `crates/maca-bindings/`（2026-08-15 清理时删除）
+- **说明**: 早期直连 MXMACA Runtime API 的 bindgen 绑定探针；生产路径统一走
+  `cuda-bindings` + cu-bridge `wcu*` 兼容层后无消费者，随 maca-core/maca-host 一并移除。
 - **功能**: MXMACA Runtime API FFI 绑定（bindgen 生成）
 - **依赖**: `libmcruntime.so`
 - **关键类型**: `mcError_t`, `mcDevice_t`, `mcStream_t`, `mcEvent_t`, `mcModule_t`, `mcFunction_t`
 
-#### maca-core
-- **文件**: `crates/maca-core/`
+#### maca-core（已移除）
+- **文件**: `crates/maca-core/`（2026-08-15 清理时删除）
 - **功能**: 安全 RAII 包装层（`DeviceBuffer`, `MacaContext`, `LaunchConfig`）
 - **依赖**: maca-bindings
 
@@ -204,8 +206,8 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/o
 
 ### 3.5 早期独立 Kernel Launch 探针（✅ 完成）
 
-#### C Launcher 方式
-- **文件**: `examples/maca-vecadd/`
+#### C Launcher 方式（已移除）
+- **文件**: `examples/maca-vecadd/`（2026-08-15 清理时删除，早期 SDK/设备探针）
 - **方法**: 编译 C launcher 为 .so，通过 libloading 加载
 - **优势**: mxcc 自动处理设备上下文初始化
 - **验证**: vecadd: SUCCESS: All 1024 elements correct!
