@@ -81,23 +81,18 @@ impl<'a> ModuleExportState<'a> {
         } else if ty_ref.is::<FP64Type>() {
             write!(output, "double").unwrap();
         } else if let Some(struct_ty) = ty_ref.downcast_ref::<StructType>() {
-            // Fail closed on packed structs: `<{ ... }>` printing is not
-            // implemented yet, and silently emitting the unpacked spelling
-            // would change the in-memory layout LLVM computes.
-            if struct_ty.layout() == StructLayout::Packed {
-                return Err(format!(
-                    "cannot export packed struct type `{}`: packed struct printing is not implemented",
-                    ty_ref.disp(self.ctx)
-                ));
-            }
-            write!(output, "{{ ").unwrap();
+            let (open, close) = match struct_ty.layout() {
+                StructLayout::Packed => ("<{ ", " }>"),
+                StructLayout::Unpacked => ("{ ", " }"),
+            };
+            write!(output, "{open}").unwrap();
             for (i, elem_ty) in struct_ty.fields().enumerate() {
                 if i > 0 {
                     write!(output, ", ").unwrap();
                 }
                 self.export_type(elem_ty, output)?;
             }
-            write!(output, " }}").unwrap();
+            write!(output, "{close}").unwrap();
         } else if let Some(array_ty) = ty_ref.downcast_ref::<crate::types::ArrayType>() {
             write!(output, "[{} x ", array_ty.size()).unwrap();
             self.export_type(array_ty.elem_type(), output)?;
@@ -213,48 +208,20 @@ impl<'a> ModuleExportState<'a> {
             }
             a
         } else if let Some(struct_ty) = ty_ref.downcast_ref::<StructType>() {
-            // Max field alignment (1 if empty). May under-state a repr(align)
-            // raise; the true alignment is carried on the op, not the type.
-            struct_ty
-                .fields()
-                .map(|f| self.natural_alignment(f))
-                .max()
-                .unwrap_or(1)
+            if struct_ty.layout() == StructLayout::Packed {
+                1
+            } else {
+                // Max field alignment (1 if empty). May under-state a repr(align)
+                // raise; the true alignment is carried on the op, not the type.
+                struct_ty
+                    .fields()
+                    .map(|f| self.natural_alignment(f))
+                    .max()
+                    .unwrap_or(1)
+            }
         } else {
             // Conservative fallback for pointers and unknown types.
             8
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use pliron::{
-        builtin::types::{IntegerType, Signedness},
-        context::Context,
-        r#type::TypeHandle,
-    };
-
-    use crate::export::{config::DebugKind, state::ModuleExportState};
-    use crate::types::{StructLayout, StructType};
-
-    #[test]
-    fn packed_struct_export_fails_closed() {
-        // Packed struct printing (`<{ ... }>`) is not implemented; exporting
-        // one must be a loud error, never the unpacked `{ ... }` spelling.
-        let ctx = Context::new();
-        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
-        let packed: TypeHandle =
-            StructType::get_unnamed(&ctx, (vec![i32_ty], StructLayout::Packed)).into();
-        let state = ModuleExportState::new(&ctx, false, DebugKind::Off, None);
-
-        let mut output = String::new();
-        let err = state
-            .export_type(packed, &mut output)
-            .expect_err("packed struct export must fail");
-        assert!(
-            err.contains("packed struct printing is not implemented"),
-            "unexpected error message: {err}"
-        );
     }
 }
