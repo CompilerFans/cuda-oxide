@@ -14953,6 +14953,7 @@ fn render_lowering(catalog: &CatalogFile, hash: &str) -> String {
     inline_asm_convergent(
         ctx,
         rewriter,
+        op,
         void_ty.into(),
         operands,
         template,
@@ -14988,6 +14989,7 @@ fn convert_generated_tcgen05_load(
         let inline_asm = inline_asm_convergent(
             ctx,
             rewriter,
+            op,
             scalar_ty,
             operands,
             template,
@@ -15007,6 +15009,7 @@ fn convert_generated_tcgen05_load(
     let inline_asm = inline_asm_convergent(
         ctx,
         rewriter,
+        op,
         result_ty.into(),
         operands,
         template,
@@ -15090,6 +15093,7 @@ fn convert_generated_tcgen05_load(
             inline_asm_convergent(
                 ctx,
                 rewriter,
+                op,
                 void_ty.into(),
                 operands,
                 &template,
@@ -15169,7 +15173,7 @@ fn convert_generated_tcgen05_load(
         )
         .unwrap();
         output.push_str(
-            "    fn convert(\n        &self,\n        ctx: &mut Context,\n        rewriter: &mut DialectConversionRewriter,\n        operands_info: &OperandsInfo,\n    ) -> Result<()> {\n        let op = self.get_operation();\n        match context::lowering_options(ctx).intrinsic_backend {\n            IntrinsicBackend::LlvmNvptx => {\n                convert_active_mask(ctx, rewriter, op, operands_info)\n            }\n            IntrinsicBackend::LibNvvm => {\n                let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n                let inline_asm = inline_asm_convergent(\n                    ctx,\n                    rewriter,\n                    i32_ty.into(),\n                    vec![],\n                    \"activemask.b32 $0;\",\n                    \"=r,~{memory}\",\n                );\n                rewriter.replace_operation(ctx, op, inline_asm);\n                Ok(())\n            }\n        }\n    }\n}\n\n",
+            "    fn convert(\n        &self,\n        ctx: &mut Context,\n        rewriter: &mut DialectConversionRewriter,\n        operands_info: &OperandsInfo,\n    ) -> Result<()> {\n        let op = self.get_operation();\n        match context::lowering_options(ctx).intrinsic_backend {\n            IntrinsicBackend::LlvmNvptx => {\n                convert_active_mask(ctx, rewriter, op, operands_info)\n            }\n            IntrinsicBackend::LibNvvm => {\n                let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n                let inline_asm = inline_asm_convergent(\n                    ctx,\n                    rewriter,\n                    op,\n                    i32_ty.into(),\n                    vec![],\n                    \"activemask.b32 $0;\",\n                    \"=r,~{memory}\",\n                );\n                rewriter.replace_operation(ctx, op, inline_asm);\n                Ok(())\n            }\n        }\n    }\n}\n\n",
         );
     }
     if ldmatrix(catalog).next().is_some() {
@@ -15231,7 +15235,7 @@ fn convert_generated_tcgen05_load(
     if let Some(record) = movmatrix(catalog).next() {
         writeln!(
             output,
-            "#[op_interface_impl]\nimpl MirToLlvmConversion for {} {{\n    fn convert(\n        &self,\n        ctx: &mut Context,\n        rewriter: &mut DialectConversionRewriter,\n        _operands_info: &OperandsInfo,\n    ) -> Result<()> {{\n        let op = self.get_operation();\n        let operands: Vec<_> = op.deref(ctx).operands().collect();\n        if operands.len() != 1 {{\n            return pliron::input_err_noloc!(\n                \"movmatrix_trans_b16 requires 1 operand, got {{}}\",\n                operands.len()\n            );\n        }}\n        let result_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, result_ty.into(), operands, {:?}, \"=r,r\",\n        );\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())\n    }}\n}}\n",
+            "#[op_interface_impl]\nimpl MirToLlvmConversion for {} {{\n    fn convert(\n        &self,\n        ctx: &mut Context,\n        rewriter: &mut DialectConversionRewriter,\n        _operands_info: &OperandsInfo,\n    ) -> Result<()> {{\n        let op = self.get_operation();\n        let operands: Vec<_> = op.deref(ctx).operands().collect();\n        if operands.len() != 1 {{\n            return pliron::input_err_noloc!(\n                \"movmatrix_trans_b16 requires 1 operand, got {{}}\",\n                operands.len()\n            );\n        }}\n        let result_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, op, result_ty.into(), operands, {:?}, \"=r,r\",\n        );\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())\n    }}\n}}\n",
             record.dialect.op_type,
             movmatrix_template(record),
         )
@@ -15472,7 +15476,7 @@ fn convert_generated_tcgen05_load(
             .unwrap();
         }
         output.push_str(
-            "            _ => return pliron::input_err!(\n                self.get_operation().deref(ctx).loc(),\n                \"nvvm.cluster_barrier mode has no generated lowering recipe\",\n            ),\n        };\n        let op = self.get_operation();\n        let void_ty = llvm_types::VoidType::get(ctx);\n        match context::lowering_options(ctx).intrinsic_backend {\n            IntrinsicBackend::LlvmNvptx => {\n                let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);\n                call_intrinsic(ctx, rewriter, op, recipe.0, function_ty, vec![])?;\n            }\n            IntrinsicBackend::LibNvvm => {\n                inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], recipe.1, \"~{memory}\");\n            }\n        }\n        rewriter.erase_operation(ctx, op);\n        Ok(())\n    }\n}\n\n",
+            "            _ => return pliron::input_err!(\n                self.get_operation().deref(ctx).loc(),\n                \"nvvm.cluster_barrier mode has no generated lowering recipe\",\n            ),\n        };\n        let op = self.get_operation();\n        let void_ty = llvm_types::VoidType::get(ctx);\n        match context::lowering_options(ctx).intrinsic_backend {\n            IntrinsicBackend::LlvmNvptx => {\n                let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);\n                call_intrinsic(ctx, rewriter, op, recipe.0, function_ty, vec![])?;\n            }\n            IntrinsicBackend::LibNvvm => {\n                inline_asm_convergent(ctx, rewriter, op, void_ty.into(), vec![], recipe.1, \"~{memory}\");\n            }\n        }\n        rewriter.erase_operation(ctx, op);\n        Ok(())\n    }\n}\n\n",
         );
 
         let arrive = cluster_barriers(catalog)
@@ -15509,7 +15513,7 @@ fn convert_generated_tcgen05_load(
         output.push_str("            }\n            IntrinsicBackend::LibNvvm => {\n");
         writeln!(
             output,
-            "                inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], {:?}, \"~{{memory}}\");",
+            "                inline_asm_convergent(ctx, rewriter, op, void_ty.into(), vec![], {:?}, \"~{{memory}}\");",
             format!(
                 "{} {}",
                 cluster_barrier_template(arrive),
@@ -15560,7 +15564,7 @@ fn convert_generated_tcgen05_load(
                              \"~{memory}\"\n\
                          };\n\
                          inline_asm_convergent(\n\
-                             ctx, rewriter, void_ty.into(), operands, ptx, constraints,\n\
+                             ctx, rewriter, op, void_ty.into(), operands, ptx, constraints,\n\
                          );\n\
                      }\n\
                  }\n\
@@ -15974,14 +15978,14 @@ fn convert_generated_tcgen05_load(
             ClusterMemoryOperation::MapSharedRank => {
                 writeln!(
                     output,
-                    "        let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, i64_ty.into(), vec![shared_pointer, rank], {template:?}, {constraints:?},\n        );\n        let mapped = asm.deref(ctx).get_result(0);\n        let shared_pointer_ty = llvm_types::PointerType::get(ctx, 3);\n        let int_to_ptr = llvm_ops::IntToPtrOp::new(ctx, mapped, shared_pointer_ty.into());\n        rewriter.insert_operation(ctx, int_to_ptr.get_operation());\n        rewriter.replace_operation(ctx, op, int_to_ptr.get_operation());\n        Ok(())"
+                    "        let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, op, i64_ty.into(), vec![shared_pointer, rank], {template:?}, {constraints:?},\n        );\n        let mapped = asm.deref(ctx).get_result(0);\n        let shared_pointer_ty = llvm_types::PointerType::get(ctx, 3);\n        let int_to_ptr = llvm_ops::IntToPtrOp::new(ctx, mapped, shared_pointer_ty.into());\n        rewriter.insert_operation(ctx, int_to_ptr.get_operation());\n        rewriter.replace_operation(ctx, op, int_to_ptr.get_operation());\n        Ok(())"
                 )
                 .unwrap();
             }
             ClusterMemoryOperation::ReadU32 => {
                 writeln!(
                     output,
-                    "        let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, i32_ty.into(), vec![shared_pointer, rank], {template:?}, {constraints:?},\n        );\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())"
+                    "        let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(\n            ctx, rewriter, op, i32_ty.into(), vec![shared_pointer, rank], {template:?}, {constraints:?},\n        );\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())"
                 )
                 .unwrap();
             }
@@ -16046,7 +16050,7 @@ fn convert_generated_tcgen05_load(
             MbarrierExtendedAdapter::PointerTxCountBytesToTokenDroppingTxCount => {
                 writeln!(
                     output,
-                    "        let result_ty = IntegerType::get(ctx, 64, Signedness::Signless);\n        let asm = inline_asm_convergent(ctx, rewriter, result_ty.into(), operands, {template:?}, {constraints:?});\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())"
+                    "        let result_ty = IntegerType::get(ctx, 64, Signedness::Signless);\n        let asm = inline_asm_convergent(ctx, rewriter, op, result_ty.into(), operands, {template:?}, {constraints:?});\n        rewriter.replace_operation(ctx, op, asm);\n        Ok(())"
                 )
                 .unwrap();
             }
@@ -16054,7 +16058,7 @@ fn convert_generated_tcgen05_load(
             | MbarrierExtendedAdapter::PointerParityToPredicate => {
                 writeln!(
                     output,
-                    "        let result_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(ctx, rewriter, result_ty.into(), operands, {template:?}, {constraints:?});\n        let asm_result = asm.deref(ctx).get_result(0);\n        let result = trunc_to_i1(ctx, rewriter, asm_result);\n        let DefiningEntity::Op(result_op) = result.defining_entity() else {{ unreachable!() }};\n        rewriter.replace_operation(ctx, op, result_op);\n        Ok(())"
+                    "        let result_ty = IntegerType::get(ctx, 32, Signedness::Signless);\n        let asm = inline_asm_convergent(ctx, rewriter, op, result_ty.into(), operands, {template:?}, {constraints:?});\n        let asm_result = asm.deref(ctx).get_result(0);\n        let result = trunc_to_i1(ctx, rewriter, asm_result);\n        let DefiningEntity::Op(result_op) = result.defining_entity() else {{ unreachable!() }};\n        rewriter.replace_operation(ctx, op, result_op);\n        Ok(())"
                 )
                 .unwrap();
             }
@@ -16063,7 +16067,7 @@ fn convert_generated_tcgen05_load(
             | MbarrierExtendedAdapter::NanosecondsToVoid => {
                 writeln!(
                     output,
-                    "        let void_ty = llvm_types::VoidType::get(ctx);\n        inline_asm_convergent(ctx, rewriter, void_ty.into(), operands, {template:?}, {constraints:?});\n        rewriter.erase_operation(ctx, op);\n        Ok(())"
+                    "        let void_ty = llvm_types::VoidType::get(ctx);\n        inline_asm_convergent(ctx, rewriter, op, void_ty.into(), operands, {template:?}, {constraints:?});\n        rewriter.erase_operation(ctx, op);\n        Ok(())"
                 )
                 .unwrap();
             }
@@ -16572,10 +16576,10 @@ impl MirToLlvmConversion for Tcgen05MmaOp {
         );
         match record.debug_control.as_ref().unwrap().operation {
             DebugControlOperation::Trap => output.push_str(
-                "        inline_asm_sideeffect(ctx, rewriter, void_ty.into(), vec![], \"trap;\", \"\");\n",
+                "        inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], \"trap;\", \"\");\n",
             ),
             DebugControlOperation::Breakpoint => output.push_str(
-                "        inline_asm_sideeffect(ctx, rewriter, void_ty.into(), vec![], \"brkpt;\", \"\");\n",
+                "        inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], \"brkpt;\", \"\");\n",
             ),
             DebugControlOperation::Pmevent => output.push_str(
                 "        let Some(event_id) = self.event_id(ctx) else {\n\
@@ -16585,7 +16589,7 @@ impl MirToLlvmConversion for Tcgen05MmaOp {
                      );\n\
                  };\n\
                  let template = format!(\"pmevent {event_id};\");\n\
-                 inline_asm_sideeffect(ctx, rewriter, void_ty.into(), vec![], &template, \"\");\n",
+                 inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], &template, \"\");\n",
             ),
         }
         output.push_str("        rewriter.erase_operation(ctx, op);\n        Ok(())\n    }\n}\n\n");
@@ -16608,7 +16612,7 @@ impl MirToLlvmConversion for Tcgen05MmaOp {
             )
             .unwrap();
             output.push_str(
-                "            }\n            IntrinsicBackend::LibNvvm => {\n                inline_asm_convergent(ctx, rewriter, void_ty.into(), vec![], \"bar.sync 0;\", \"~{memory}\");\n            }\n        }\n        rewriter.erase_operation(ctx, op);\n        Ok(())\n    }\n}\n\n",
+                "            }\n            IntrinsicBackend::LibNvvm => {\n                inline_asm_convergent(ctx, rewriter, op, void_ty.into(), vec![], \"bar.sync 0;\", \"~{memory}\");\n            }\n        }\n        rewriter.erase_operation(ctx, op);\n        Ok(())\n    }\n}\n\n",
             );
         } else {
             debug_assert!(threadfence_ptx_level(record).is_some());
@@ -24258,10 +24262,10 @@ mod tests {
             assert!(lowering.contains(&format!("impl MirToLlvmConversion for {op}")));
         }
         assert!(lowering.contains(
-            "inline_asm_sideeffect(ctx, rewriter, void_ty.into(), vec![], \"trap;\", \"\")"
+            "inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], \"trap;\", \"\")"
         ));
         assert!(lowering.contains(
-            "inline_asm_sideeffect(ctx, rewriter, void_ty.into(), vec![], \"brkpt;\", \"\")"
+            "inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], \"brkpt;\", \"\")"
         ));
         assert!(lowering.contains("let template = format!(\"pmevent {event_id};\")"));
 
