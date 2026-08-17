@@ -56,6 +56,17 @@ of projected unsized slice tails, including padded layouts:
 | 25 | `test_nested_slice_tail_runtime_index`   | `Field(inner) -> Field(tail) -> Index`                 |
 | 26 | `test_nested_slice_tail_padded_offset`   | Nested padded DST tail with constant + runtime indexes |
 
+plus **6 DST slice-tail address regression kernels** for issue #881:
+
+| #  | Variant                                  | Shape pinned                                        |
+|:---|:-----------------------------------------|:----------------------------------------------------|
+| 27 | `test_slice_tail_write_constant_index`   | `Field(tail) -> ConstantIndex` mutable store        |
+| 28 | `test_slice_tail_write_runtime_index`    | `Field(tail) -> Index` mutable store                |
+| 29 | `test_slice_tail_borrow_constant_index`  | `&value.tail[1]` element borrow                     |
+| 30 | `test_slice_tail_borrow_runtime_index`   | `&value.tail[k]` element borrow                     |
+| 31 | `test_slice_tail_write_padded`           | Padded `[u16]` tail, constant + runtime writes      |
+| 32 | `test_slice_tail_borrow_padded`          | Padded `[u16]` tail, constant + runtime borrows     |
+
 Each kernel writes a difference (`r1 - r0`, or original-local readback for
 the write-through variants) for inputs chosen so a correct implementation
 must produce `+5.0` for every element. The harness prints `PASS` per kernel,
@@ -83,6 +94,15 @@ pointer's length metadata must remain paired with the projected address across
 field. `test_nested_slice_tail_padded_offset` nests `PaddedTail<T>` as the final
 field of another struct so the walk must preserve metadata while also honoring
 both aggregate field offsets.
+
+The issue #881 regressions exercise the corresponding address-producing path.
+Whole-tail borrows such as `&value.tail` already rebuild the DST tail as a
+`(data_ptr, len)` slice value. Element writes and borrows continue one
+projection farther: after rebuilding that fat tail, the address walker
+normalizes it back to its data pointer and reuses the existing
+`Index`/`ConstantIndex` element-offset lowering. The padded variants verify
+that this address arithmetic still starts at the real tail byte offset rather
+than at a naive aggregate prefix.
 
 ## Trigger conditions
 
@@ -132,7 +152,7 @@ the fix, the same MIR lowers to
 %v9 = load float, ptr %v8                                              ; correct
 ```
 
-and all 26 kernels report `PASS` (the harness prints a final `SUCCESS` marker
+and all 32 kernels report `PASS` (the harness prints a final `SUCCESS` marker
 and exits non-zero if any kernel reports a wrong diff).
 
 Issue #880 exposes a separate value-walker gap after the direct DST-tail
