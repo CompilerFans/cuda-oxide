@@ -1,8 +1,8 @@
 # device_global
 
 Tests ordinary Rust `static mut` values in CUDA global memory, non-zero
-immutable Rust static tables, and thin pointers stored inside device-global
-initializers.
+immutable Rust static tables, and pointer relocations stored inside
+device-global initializers, including slice fat pointers.
 
 Run with:
 
@@ -51,6 +51,31 @@ each slot with `getelementptr`, `addrspacecast`, and `ptrtoint` constant
 expressions, so the device linker sees an actual relocation rather than a null
 placeholder.
 
+Slice fat-pointer initializers use the same relocation carrier for their data
+word while keeping the length metadata as literal initializer data:
+
+```rust
+#[repr(C)]
+struct SliceTarget {
+    prefix: [u32; 2],
+    view: [u32; 3],
+    suffix: [u32; 3],
+}
+
+static SLICE_TARGET: SliceTarget = SliceTarget {
+    prefix: [11, 17],
+    view: [23, 31, 41],
+    suffix: [47, 59, 61],
+};
+static SLICE_VIEW: &'static [u32] = &SLICE_TARGET.view;
+```
+
+The two-element `prefix` fixes `view` at byte offset 8 without relying on
+range indexing in a static initializer, which is not const-stable on the
+repository's current Rust toolchain. The data word therefore relocates to
+`SLICE_TARGET + 8`, while the metadata word stores length `3`. The runtime
+regression verifies both the non-zero data-pointer addend and the slice length.
+
 A top-level union initializer is also supported when its complete storage is
 exactly one naturally aligned pointer word and every non-ZST union alternative
 is a representation-compatible thin pointer. The example initializes the union
@@ -75,6 +100,8 @@ The relocation coverage includes:
 - two fields sharing one target;
 - a second independently materialized target;
 - an interior pointer with a non-zero byte addend;
+- a slice fat-pointer initializer with a relocated data word and literal length metadata;
+- a non-zero slice data-pointer addend into the target static;
 - a top-level thin-pointer union occupying one pointer word;
 - packed/unaligned relocation slots, including literal prefix/suffix bytes;
 - targets reachable only through another static initializer;
@@ -117,13 +144,15 @@ still checked for pointer width, bounds, overlap, target identity, target addres
 space, and addend bounds. Unsupported layouts fail at compile time instead of
 producing a wrong value.
 
-The supported relocation scope is intentionally narrow: thin pointers from one
-device static to another device static in global or constant memory, including
-zero and non-zero byte addends. A top-level union is admitted only when the
-complete union is one naturally aligned pointer word and every non-ZST
-alternative is a representation-compatible thin pointer. Anonymous promoted
-allocations, functions, vtables, trait-object metadata, slices and other fat
-pointers, unsized pointees, nested unions, pointer/integer unions, and relocation
-targets outside device static storage remain fail-closed. Packed or otherwise
-unaligned thin-pointer slots are supported when the containing top-level struct
-has an explicit, non-overlapping rustc layout.
+The supported relocation scope is intentionally narrow: thin pointers and slice
+fat pointers whose data word targets another device static in global or constant
+memory, including zero and non-zero byte addends. For slices, the data word
+carries provenance while the length metadata remains literal initializer data.
+A top-level union is admitted only when the complete union is one naturally
+aligned pointer word and every non-ZST alternative is a
+representation-compatible thin pointer. Anonymous promoted allocations,
+functions, vtables, trait-object metadata, other fat-pointer forms, unsized
+pointees, nested unions, pointer/integer unions, and relocation targets outside
+device static storage remain fail-closed. Packed or otherwise unaligned
+thin-pointer slots are supported when the containing top-level struct has an
+explicit, non-overlapping rustc layout.
