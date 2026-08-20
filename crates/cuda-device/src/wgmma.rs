@@ -20,12 +20,14 @@
 //!
 //! The `m64n64k16.f32.f16.f16` variant supports canonical linear full-drain
 //! regions and the canonical counted K-loop. The `m64n64k8.f32.tf32.tf32`
-//! variant uses the canonical linear full-drain carrier only. Every accepted
+//! variant uses the canonical linear full-drain carrier only. The
+//! `m64n128k16.f32.bf16.bf16` variant supports canonical linear full-drain
+//! regions with a 64-value `[[f32; 8]; 8]` accumulator. Every accepted
 //! asynchronous lifetime is fused into one convergent inline-PTX scope and ends
 //! in `wait_group<0>` before accumulator values become visible to LLVM again.
-//! Unsupported BF16 full-drain pointer shapes retain the deferred pointer-form
-//! fallback. F16 and TF32 have no pointer-form fallback; the legacy K=16 TF32
-//! entry point remains unsupported.
+//! Unsupported m64n64 BF16 full-drain pointer shapes retain the deferred
+//! pointer-form fallback. m64n128, F16, and TF32 have no pointer-form fallback;
+//! the legacy K=16 TF32 entry point remains unsupported.
 //!
 //! # Architecture
 //!
@@ -75,13 +77,18 @@
 //!
 //! - **BF16 linear full drain:** one canonical `[[f32; 8]; 4]` accumulator,
 //!   one commit, and a final `wgmma_wait_group::<0>()`.
-//! - **F16 linear full drain:** the same canonical accumulator and full-drain
+//! - **BF16 m64n128 linear full drain:** one canonical `[[f32; 8]; 8]`
+//!   accumulator carries 64 `f32` values through one or more homogeneous
+//!   m64n128 MMAs, one commit, and a final `wgmma_wait_group::<0>()`. There is
+//!   no pointer fallback, counted-loop lowering, or partial-wait pipeline for
+//!   this shape.
+//! - **F16 linear full drain:** the m64n64 canonical accumulator and full-drain
 //!   lifetime are supported, but there is no pointer fallback or partial-wait
 //!   pipeline for F16.
 //! - **TF32 linear full drain:** `m64n64k8.f32.tf32.tf32` uses the same
 //!   canonical accumulator and full-drain lifetime. TF32 has no pointer
 //!   fallback, counted-loop lowering, or partial-wait pipeline.
-//! - **Canonical counted K-loop:** one BF16 or F16 MMA per iteration,
+//! - **Canonical counted K-loop:** one BF16 or F16 m64n64 MMA per iteration,
 //!   compile-time trip count, and `u64` descriptor recurrences of the form `desc + const`. The
 //!   fence-to-final-wait lifetime is fused so the accumulator is loaded and
 //!   stored once for the whole loop rather than once per iteration.
@@ -246,6 +253,33 @@ pub unsafe fn wgmma_mma_m64n64k16_f32_bf16(acc: &mut [[f32; 8]; 4], desc_a: u64,
     unreachable!("wgmma_mma_m64n64k16_f32_bf16 called outside CUDA kernel context")
 }
 
+/// Warpgroup matrix multiply-accumulate: 64x128x16 BF16 with f32 accumulation.
+///
+/// The 64x128 output tile is distributed as 64 `f32` accumulator values per
+/// thread, represented by `[[f32; 8]; 8]`. This variant currently supports
+/// canonical linear full-drain regions only.
+///
+/// # PTX
+///
+/// ```ptx
+/// wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16
+///     {%f0, %f1, ..., %f63}, %rd_desc_a, %rd_desc_b,
+///     1, 1, 1, 0, 0;
+/// ```
+///
+/// # Safety
+///
+/// - Descriptors must be valid SMEM descriptors
+/// - Must be called by all threads in a warpgroup
+/// - Must be called from within a CUDA kernel context on sm_90a
+/// - `acc` must not be read or written until the region's final
+///   `wgmma_wait_group::<0>()` returns
+#[inline(never)]
+pub unsafe fn wgmma_mma_m64n128k16_f32_bf16(acc: &mut [[f32; 8]; 8], desc_a: u64, desc_b: u64) {
+    let _ = (acc, desc_a, desc_b);
+    unreachable!("wgmma_mma_m64n128k16_f32_bf16 called outside CUDA kernel context")
+}
+
 /// WGMMA with f32 accumulator and f16 inputs.
 ///
 /// This variant supports canonical linear full-drain regions and canonical
@@ -323,8 +357,11 @@ pub unsafe fn wgmma_mma_m64n64k16_f32_tf32(acc: &mut [[f32; 8]; 4], desc_a: u64,
 // Accumulator Utilities
 // =============================================================================
 
-/// Type alias for the WGMMA accumulator (m64n64 tile, 32 floats per thread).
+/// Type alias for the m64n64 WGMMA accumulator (32 floats per thread).
 pub type Acc64x64 = [[f32; 8]; 4];
+
+/// Type alias for the m64n128 WGMMA accumulator (64 floats per thread).
+pub type Acc64x128 = [[f32; 8]; 8];
 
 /// Initialize an accumulator to zero.
 ///
