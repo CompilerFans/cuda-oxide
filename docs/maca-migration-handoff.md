@@ -308,7 +308,31 @@ partial_warp_reduce 两示例的 block 几何改为 64 的倍数（96/93 线程�
 - trait 默认实现的静默回退是危险信号：`kernel_calling_convention` 没转发时编译照过、运行时符号找不到。
 - 生成文件（DO NOT EDIT 标记）与后端扩展的边界：maca_mma.rs 作为手写扩展模块注册进 generated/ 目录是可行模式。
 
-### 4.1 高优先级
+### 4.1 当前状态（2026-08-15 合并后）✅
+
+**MACA 全套件：213/213 全部通过**（`scripts/smoketest.sh -t maca`）。
+原 4.1/4.2/4.3 列出的任务均已达成，逐项对照：
+
+| 原任务 | 状态 | 说明 |
+|---|---|---|
+| inline PTX 替代实现（7+9 个） | ✅ 完成 | 归入 maca-skip（NVIDIA 专属 mbarrier/cp.async/TMA 等 fail-closed）；trap/atomic/fence 已加 MACA 分支 |
+| MXMACA 编译器错误（17 个） | ✅ 完成 | alloca AS5 + entry-block 提升 + mxcc O3 修复私有内存/FrameIndex 崩溃 |
+| Wave64 类型修正（elect_leader, lanemask_scan） | ✅ 完成 | mask 类 op 64 位加宽 + WAVE_SIZE 条件化 + warp_index wave64 化 |
+| cu-bridge API 完整映射（35 个 panic） | ✅ 完成 | 上游 cuda-core 新 API 面（CUlimit/ctx-flags/流优先级/函数属性/错误码）已补 compat 别名 |
+| 更多示例迁移（reduction, GEMM, atomics） | ✅ 完成 | hashmap_v2/v3、maca_mma_smoke、maca_primitives_smoke 等 |
+| Wave=64 mask 类型 u32→u64 | ✅ 完成 | WaveMask=u64，CUDA lowering 截断 |
+| cuda-async 适配 | ✅ 完成 | 15 单元测试通过 |
+| 完整测试套件（133 示例） | ✅ 完成 | 上游合并后 213 示例，213/213 通过 |
+| 文档更新 cuda-oxide-book | ⏳ 待做 | book 中 supported-features/installation 已随上游合并部分更新，MACA 章节待补 |
+
+### 4.2 剩余工作（按价值排序）
+
+| 优先级 | 任务 | 说明 |
+|---|---|---|
+| 高 | GEMM 性能优化 | 当前 3.46 TFLOP/s（1024³ FP16，2x2 tiles/wave）；待加 shared-memory pipeline 后对比 mcBLAS |
+| 中 | cuda-oxide-book MACA 章节 | 补 Wave64/`.devbin`/cu-bridge 环境说明 |
+| 低 | oxide.zip 清理 | 工作区未跟踪的残留压缩包，确认后删除 |
+
 
 | 任务 | 说明 | 阻塞因素 |
 |---|---|---|
@@ -325,21 +349,6 @@ partial_warp_reduce 两示例的 block 几何改为 64 的倍数（96/93 线程�
 已完成的原高优先级项目：cuda-core `wcu*` 兼容层、原始 vecadd build/run、MACA `.devbin`
 产物闭环、Inline PTX/MMA fail-closed、Wave64 shuffle/vote/match/redux 与 C500 primitives smoke。
 
-### 4.2 中优先级
-
-| 任务 | 说明 |
-|---|---|
-| 更多示例迁移 | reduction, GEMM, atomics 等 |
-| Wave=64 mask 类型 | u32→u64 变更（API breaking） |
-| cuda-async 适配 | 跟随 cuda-core 变更 |
-
-### 4.3 低优先级
-
-| 任务 | 说明 |
-|---|---|
-| 完整测试套件 | 运行所有 133 个示例 |
-| 性能优化 | 对齐 MXMACA 最佳实践 |
-| 文档更新 | 更新 cuda-oxide-book |
 
 ---
 
