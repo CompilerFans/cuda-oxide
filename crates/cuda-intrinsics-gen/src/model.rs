@@ -827,7 +827,10 @@ pub struct RegisterMmaF8F6F4Admission {
     pub llvm_evidence_profile: String,
     pub libnvvm_evidence_profile: String,
     pub runtime_validation: RuntimeValidation,
-    pub first_abi_id: String,
+    /// Legacy shard metadata retained only so older overlays continue to parse.
+    /// ABI identity is bound from the append-only ledger by catalog ID.
+    #[serde(default, rename = "first_abi_id")]
+    pub _legacy_first_abi_id: Option<String>,
     pub a_elements: Vec<RegisterMmaElement>,
     pub b_elements: Vec<RegisterMmaElement>,
     pub product_count: usize,
@@ -841,7 +844,10 @@ pub struct RegisterMmaFp8Admission {
     pub llvm_evidence_profile: String,
     pub libnvvm_evidence_profile: String,
     pub runtime_validation: RuntimeValidation,
-    pub first_abi_id: String,
+    /// Legacy shard metadata retained only so older overlays continue to parse.
+    /// ABI identity is bound from the append-only ledger by catalog ID.
+    #[serde(default, rename = "first_abi_id")]
+    pub _legacy_first_abi_id: Option<String>,
     pub shapes: Vec<RegisterMmaShape>,
     pub accumulators: Vec<RegisterMmaAccumulator>,
     pub a_elements: Vec<RegisterMmaElement>,
@@ -856,7 +862,10 @@ pub struct RegisterMmaAmpereFloatAdmission {
     pub llvm_evidence_profile: String,
     pub libnvvm_evidence_profile: String,
     pub runtime_validation: RuntimeValidation,
-    pub first_abi_id: String,
+    /// Legacy shard metadata retained only so older overlays continue to parse.
+    /// ABI identity is bound from the append-only ledger by catalog ID.
+    #[serde(default, rename = "first_abi_id")]
+    pub _legacy_first_abi_id: Option<String>,
     pub product_count: usize,
     #[serde(rename = "variant")]
     pub variants: Vec<RegisterMmaAmpereFloatVariant>,
@@ -912,7 +921,10 @@ pub struct SparseMmaF8F6F4F16Admission {
     pub llvm_evidence_profile: String,
     pub libnvvm_evidence_profile: String,
     pub runtime_validation: RuntimeValidation,
-    pub first_abi_id: String,
+    /// Legacy shard metadata retained only so older overlays continue to parse.
+    /// ABI identity is bound from the append-only ledger by catalog ID.
+    #[serde(default, rename = "first_abi_id")]
+    pub _legacy_first_abi_id: Option<String>,
     pub a_elements: Vec<SparseMmaElement>,
     pub b_elements: Vec<SparseMmaElement>,
     pub product_count: usize,
