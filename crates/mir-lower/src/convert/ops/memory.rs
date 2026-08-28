@@ -48,11 +48,15 @@
 //! .extern .shared .align 16 .b8 __dynamic_smem_other_kernel[];
 //! ```
 
-use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
+use crate::context::{
+    DeviceGlobalDeclaration, DeviceGlobalRecord, DeviceGlobalsMap, DynamicSmemAlignmentMap,
+    SharedGlobalDeclaration, SharedGlobalKind, SharedGlobalRecord, SharedGlobalsMap,
+};
 use crate::convert::types::{
-    StructLayoutInfo, build_struct_slot_map, convert_type, get_type_size,
-    llvm_packed_struct_contains_pointer_in_address_space, mir_type_abi_align,
-    validate_initialized_global_layout, validate_relocated_initialized_global_layout,
+    StructLayoutInfo, build_struct_slot_map, convert_type,
+    llvm_packed_struct_contains_pointer_in_address_space, llvm_type_size_align, mir_element_stride,
+    mir_type_abi_align, validate_initialized_global_layout,
+    validate_relocated_initialized_global_layout,
 };
 use crate::helpers;
 use dialect_mir::types::{MirPtrType, MirStructType};
@@ -311,11 +315,17 @@ pub(crate) fn convert_memmove(
 /// Shared lowering for `mir.memcpy` / `mir.memmove`. `intrinsic_base` selects
 /// the LLVM intrinsic family ("memcpy" or "memmove"); both share the same
 /// `(dst, src, len_bytes, isvolatile)` signature and element->byte count scaling.
+///
+/// The element type comes from the op's own `elem_type` attribute, stamped
+/// at build time from dst's pointer type. Operand type history is not
+/// usable here: a kind-only `mir.cast` lowers to a plain value forwarding,
+/// history does not follow that edge, and a stale hit would scale the byte
+/// count by the wrong element size.
 fn convert_mem_transfer(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    operands_info: &OperandsInfo,
+    _operands_info: &OperandsInfo,
     intrinsic_base: &str,
 ) -> Result<()> {
     let operands: Vec<_> = op.deref(ctx).operands().collect();
@@ -329,21 +339,47 @@ fn convert_mem_transfer(
     };
 
     let pointee = {
-        let dst_ptr_ty = operands_info
-            .lookup_most_recent_of_type::<MirPtrType>(ctx, dst)
+        let op_ref = op.deref(ctx);
+        op_ref
+            .attributes
+            .get::<pliron::builtin::attributes::TypeAttr>(
+                &format!("{intrinsic_base}_elem_type").try_into().unwrap(),
+            )
+            .map(|attr| attr.get_type(ctx))
             .ok_or_else(|| {
                 pliron::create_error!(
-                    op.deref(ctx).loc(),
+                    op_ref.loc(),
                     pliron::result::ErrorKind::VerificationFailed,
                     pliron::result::StringError(format!(
-                        "{intrinsic_base} destination must be a MIR pointer before lowering"
+                        "mir.{intrinsic_base} missing its elem_type attribute; \
+                         byte count has no fact to derive from"
                     ))
                 )
-            })?;
-        dst_ptr_ty.pointee
+            })?
     };
-    let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
-    let elem_size = get_type_size(ctx, elem_ty);
+    // Byte-count policy: exact or error, never guessed. rustc's stride of the
+    // stamped MIR elem type is the primary fact; the converted LLVM type's
+    // natural layout is the fallback.
+    let elem_size = match mir_element_stride(ctx, pointee) {
+        Some(stride) => stride,
+        None => {
+            let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
+            match llvm_type_size_align(ctx, elem_ty) {
+                Some((size, _)) => size,
+                None => {
+                    let type_display = pointee.deref(ctx).disp(ctx).to_string();
+                    return Err(pliron::create_error!(
+                        op.deref(ctx).loc(),
+                        pliron::result::ErrorKind::VerificationFailed,
+                        pliron::result::StringError(format!(
+                            "mir.{intrinsic_base} element type `{type_display}` has no exact \
+                             byte size; refusing to guess the copy length"
+                        ))
+                    ));
+                }
+            }
+        }
+    };
 
     let bytes = if elem_size == 1 {
         count
@@ -662,30 +698,38 @@ pub(crate) fn convert_ref(
 /// Convert `mir.ptr_offset` to `llvm.getelementptr`.
 ///
 /// Operands: `[ptr, offset]` where offset is an integer index.
-/// Uses the pointee type from the MIR pointer type for element sizing.
-/// Falls back to i8 element type if pointee type cannot be determined.
+/// Element sizing comes from the op's own result type, which is still the
+/// MIR pointer type when this converter runs. The operand's recorded type
+/// history is not usable here: a kind-only `mir.cast` lowers to a plain
+/// value forwarding, and the history does not follow that replacement
+/// edge, so a history miss would silently misscale the offset.
 pub(crate) fn convert_ptr_offset(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    operands_info: &OperandsInfo,
+    _operands_info: &OperandsInfo,
 ) -> Result<()> {
+    let loc = op.deref(ctx).loc();
     let operands: Vec<_> = op.deref(ctx).operands().collect();
 
     let (ptr, offset) = match operands.as_slice() {
         [ptr, offset] => (*ptr, *offset),
-        _ => return pliron::input_err_noloc!("PtrOffset requires exactly 2 operands"),
+        _ => return pliron::input_err!(loc, "PtrOffset requires exactly 2 operands"),
     };
 
-    let pointee_ty_opt = operands_info
-        .lookup_most_recent_of_type::<MirPtrType>(ctx, ptr)
-        .map(|mir_ptr| mir_ptr.pointee);
-
-    let elem_ty = if let Some(pointee) = pointee_ty_opt {
-        convert_type(ctx, pointee).map_err(anyhow_to_pliron)?
-    } else {
-        IntegerType::get(ctx, 8, Signedness::Signless).into()
-    };
+    let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let pointee = result_ty
+        .deref(ctx)
+        .downcast_ref::<MirPtrType>()
+        .map(|mir_ptr| mir_ptr.pointee)
+        .ok_or_else(|| {
+            pliron::input_error!(
+                loc.clone(),
+                "mir.ptr_offset result must be a MIR pointer type; \
+                 element sizing has no fact to derive from"
+            )
+        })?;
+    let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
 
     let llvm_gep = llvm::GetElementPtrOp::new(
         ctx,
@@ -758,14 +802,27 @@ pub fn convert_shared_alloc_dc(
         (alloc_key, source_name, mir_elem_type, size, alignment)
     };
 
-    // Cache hit only when the op carries a key AND that key is already in
-    // `shared_globals`. `as_ref()` borrows for the if-let scope so the else
-    // branch can still move `alloc_key` into `create_shared_global` (which
-    // takes ownership and inserts it into the cache).
+    let declaration = SharedGlobalDeclaration {
+        kind: SharedGlobalKind::Static,
+        mir_elem_type,
+        size,
+        alignment,
+    };
+
+    // A key names one physical allocation, not merely a preferred symbol.
+    // Reuse it only when the complete storage declaration agrees; otherwise
+    // the later address would silently inherit the first allocation's type,
+    // extent, or alignment.
     let global_name = if let Some(key) = alloc_key.as_ref()
-        && let Some(existing_name) = shared_globals.get(key)
+        && let Some(existing) = shared_globals.get(key)
     {
-        existing_name.clone()
+        if existing.declaration != declaration {
+            return Err(anyhow_to_pliron(anyhow::anyhow!(
+                "duplicate shared alloc_key {:?} has an incompatible declaration",
+                key
+            )));
+        }
+        existing.symbol.clone()
     } else {
         create_shared_global(
             ctx,
@@ -810,8 +867,8 @@ struct SharedAllocSpec<'a> {
 ///
 /// The global is inserted at the front of the module block. When
 /// `spec.alloc_key` is `Some`, the key is moved into `shared_globals` so that
-/// later allocations with the same key reuse this global (caller is
-/// expected to have already checked the cache for a hit).
+/// later allocations with the same key reuse this global only after the caller
+/// has checked that their complete declarations agree.
 ///
 /// `spec.source_name`, when present, is the Rust path of the `static` this
 /// allocation came from. The generated symbol stays anonymous; the name is
@@ -866,7 +923,18 @@ fn create_shared_global(
     global_op.get_operation().insert_at_front(module_block, ctx);
 
     if let Some(key) = spec.alloc_key {
-        shared_globals.insert(key, name.clone());
+        shared_globals.insert(
+            key,
+            SharedGlobalRecord {
+                symbol: name.clone(),
+                declaration: SharedGlobalDeclaration {
+                    kind: SharedGlobalKind::Static,
+                    mir_elem_type: spec.mir_elem_type,
+                    size: spec.size,
+                    alignment: spec.alignment,
+                },
+            },
+        );
     }
 
     Ok(name)
@@ -960,8 +1028,23 @@ pub fn convert_global_alloc_dc(
         )
     };
 
-    let global_name = if let Some(existing_name) = device_globals.get(&global_key) {
-        existing_name.clone()
+    let declaration = DeviceGlobalDeclaration {
+        mir_type: mir_global_type,
+        alignment,
+        addr_space,
+        initializer_hex: initializer_hex.clone(),
+        initializer_relocations: initializer_relocations.clone(),
+        immutable,
+    };
+
+    let global_name = if let Some(existing) = device_globals.get(&global_key) {
+        if existing.declaration != declaration {
+            return Err(anyhow_to_pliron(anyhow::anyhow!(
+                "duplicate global_key {:?} has an incompatible declaration",
+                global_key
+            )));
+        }
+        existing.symbol.clone()
     } else {
         create_device_global(
             ctx,
@@ -1096,7 +1179,20 @@ fn create_device_global(
         .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("Module is empty")))?;
 
     global_op.get_operation().insert_at_front(module_block, ctx);
-    device_globals.insert(spec.key.to_string(), name.clone());
+    device_globals.insert(
+        spec.key.to_string(),
+        DeviceGlobalRecord {
+            symbol: name.clone(),
+            declaration: DeviceGlobalDeclaration {
+                mir_type: spec.mir_type,
+                alignment: spec.alignment,
+                addr_space: spec.addr_space,
+                initializer_hex: spec.initializer_hex.map(str::to_owned),
+                initializer_relocations: spec.initializer_relocations.map(str::to_owned),
+                immutable: spec.immutable,
+            },
+        },
+    );
 
     Ok(name)
 }
@@ -1175,7 +1271,15 @@ fn relocated_initializer_storage_type(
         StructLayout::Unpacked
     };
     let storage: TypeHandle = StructType::get_unnamed(ctx, (fields, layout)).into();
-    let lowered_size = get_type_size(ctx, storage);
+    // Exact or error, never guessed: the storage type is built from i8 arrays
+    // and integer slots, so its natural size is always computable, and it must
+    // land exactly on rustc's byte count or the relocation offsets are wrong.
+    let Some((lowered_size, _)) = llvm_type_size_align(ctx, storage) else {
+        anyhow::bail!(
+            "relocated device global storage `{}` has no exact size",
+            storage.deref(ctx).disp(ctx)
+        );
+    };
     if lowered_size != byte_count {
         anyhow::bail!(
             "relocated device global storage lowers to {} bytes, but rustc evaluated {} bytes",
@@ -1321,12 +1425,24 @@ fn get_or_create_extern_shared_global(
         },
     )?;
 
+    let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+    let declaration = SharedGlobalDeclaration {
+        kind: SharedGlobalKind::DynamicExtern,
+        mir_elem_type: i8_ty.into(),
+        size: 0,
+        alignment: max_alignment,
+    };
     let global_created_key = format!("__dynamic_smem_global_created_{}", func_name);
-    if shared_globals.contains_key(&global_created_key) {
-        return Ok(symbol_name);
+    if let Some(existing) = shared_globals.get(&global_created_key) {
+        if existing.declaration != declaration || existing.symbol != symbol_name {
+            return Err(anyhow_to_pliron(anyhow::anyhow!(
+                "dynamic shared-memory key {:?} has an incompatible declaration",
+                global_created_key
+            )));
+        }
+        return Ok(existing.symbol.clone());
     }
 
-    let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
     let array_type = ArrayType::get(ctx, i8_ty.into(), 0);
 
     let global_op = llvm::GlobalOp::new_with_alignment(
@@ -1356,12 +1472,20 @@ fn get_or_create_extern_shared_global(
 
     global_op.get_operation().insert_at_front(module_block, ctx);
 
-    shared_globals.insert(global_created_key, symbol_name.clone());
+    shared_globals.insert(
+        global_created_key,
+        SharedGlobalRecord {
+            symbol: symbol_name.clone(),
+            declaration,
+        },
+    );
 
     Ok(symbol_name)
 }
 
 #[cfg(test)]
+// Tests build kinded fixture types directly; production minting lives in mir-importer's facts.rs.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     //! End-to-end lowering tests for `dialect-mir` memory ops.
     //!
@@ -1374,8 +1498,11 @@ mod tests {
 
     use super::*;
     use crate::convert::ops::test_util::*;
+    use dialect_mir::attributes::MirPointerKindAuthorityAttr;
     use dialect_mir::ops as mir;
-    use dialect_mir::types::{MirArrayType, MirPtrType, MirStructType, MirTupleType, MirUnionType};
+    use dialect_mir::types::{
+        MirArrayType, MirPointerKind, MirPtrType, MirStructType, MirTupleType, MirUnionType,
+    };
     use llvm_export::op_interfaces::PointerTypeResult;
     use llvm_export::ops as llvm;
     use llvm_export::types::{PointerType, StructType, address_space as llvm_addr};
@@ -1645,8 +1772,6 @@ mod tests {
         abi_align: u64,
         field_index: u32,
     ) -> Option<u32> {
-        use dialect_mir::attributes::FieldIndexAttr;
-
         let mut ctx = make_ctx();
         let field_types: Vec<TypeHandle> = field_bit_widths
             .iter()
@@ -1671,16 +1796,9 @@ mod tests {
         let (module_ptr, block) = build_kernel(&mut ctx, vec![struct_ptr_ty.into()], vec![]);
         let struct_ptr_val = block.deref(&ctx).get_argument(0);
 
-        let field_addr_op = Operation::new(
-            &mut ctx,
-            mir::MirFieldAddrOp::get_concrete_op_info(),
-            vec![field_ptr_ty.into()],
-            vec![struct_ptr_val],
-            vec![],
-            0,
-        );
-        mir::MirFieldAddrOp::new(field_addr_op)
-            .set_attr_field_index(&ctx, FieldIndexAttr(field_index));
+        let field_addr_op =
+            mir::MirFieldAddrOp::build(&mut ctx, struct_ptr_val, field_ptr_ty.into(), field_index)
+                .expect("field_addr build");
         field_addr_op.insert_at_back(block, &ctx);
         let field_ptr_val = field_addr_op.deref(&ctx).get_result(0);
 
@@ -1891,8 +2009,6 @@ mod tests {
     /// access than the bytes allow.
     #[test]
     fn convert_load_claims_address_alignment_over_abi_at_packed_offsets() {
-        use dialect_mir::attributes::FieldIndexAttr;
-
         let mut ctx = make_ctx();
         let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
         let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
@@ -1924,15 +2040,8 @@ mod tests {
         let (module_ptr, block) = build_kernel(&mut ctx, vec![outer_ptr_ty], vec![]);
         let base = block.deref(&ctx).get_argument(0);
 
-        let field_addr_op = Operation::new(
-            &mut ctx,
-            mir::MirFieldAddrOp::get_concrete_op_info(),
-            vec![inner_ptr_ty],
-            vec![base],
-            vec![],
-            0,
-        );
-        mir::MirFieldAddrOp::new(field_addr_op).set_attr_field_index(&ctx, FieldIndexAttr(1));
+        let field_addr_op =
+            mir::MirFieldAddrOp::build(&mut ctx, base, inner_ptr_ty, 1).expect("field_addr build");
         field_addr_op.insert_at_back(block, &ctx);
         let field_ptr_val = field_addr_op.deref(&ctx).get_result(0);
 
@@ -1992,8 +2101,6 @@ mod tests {
         abi_align: u64,
         field_index: u32,
     ) -> Option<u32> {
-        use dialect_mir::attributes::FieldIndexAttr;
-
         let mut ctx = make_ctx();
         let field_types: Vec<TypeHandle> = field_bit_widths
             .iter()
@@ -2023,16 +2130,9 @@ mod tests {
         let struct_ptr_val = block.deref(&ctx).get_argument(0);
         let val = block.deref(&ctx).get_argument(1);
 
-        let field_addr_op = Operation::new(
-            &mut ctx,
-            mir::MirFieldAddrOp::get_concrete_op_info(),
-            vec![field_ptr_ty.into()],
-            vec![struct_ptr_val],
-            vec![],
-            0,
-        );
-        mir::MirFieldAddrOp::new(field_addr_op)
-            .set_attr_field_index(&ctx, FieldIndexAttr(field_index));
+        let field_addr_op =
+            mir::MirFieldAddrOp::build(&mut ctx, struct_ptr_val, field_ptr_ty.into(), field_index)
+                .expect("field_addr build");
         field_addr_op.insert_at_back(block, &ctx);
         let field_ptr_val = field_addr_op.deref(&ctx).get_result(0);
 
@@ -2111,7 +2211,6 @@ mod tests {
         struct_abi_align: u64,
         index: Option<u64>,
     ) -> Option<u32> {
-        use dialect_mir::attributes::FieldIndexAttr;
         use pliron::builtin::attributes::IntegerAttr;
         use std::num::NonZeroUsize;
 
@@ -2142,15 +2241,9 @@ mod tests {
         let struct_ptr_val = block.deref(&ctx).get_argument(0);
 
         // &s.lanes -- carries the struct's alignment onto the array address.
-        let field_addr_op = Operation::new(
-            &mut ctx,
-            mir::MirFieldAddrOp::get_concrete_op_info(),
-            vec![array_ptr_ty.into()],
-            vec![struct_ptr_val],
-            vec![],
-            0,
-        );
-        mir::MirFieldAddrOp::new(field_addr_op).set_attr_field_index(&ctx, FieldIndexAttr(0));
+        let field_addr_op =
+            mir::MirFieldAddrOp::build(&mut ctx, struct_ptr_val, array_ptr_ty.into(), 0)
+                .expect("field_addr build");
         field_addr_op.insert_at_back(block, &ctx);
         let array_ptr_val = field_addr_op.deref(&ctx).get_result(0);
 
@@ -2255,7 +2348,6 @@ mod tests {
         index: Option<u64>,
         load_first_scalar: bool,
     ) -> (Option<u32>, Option<u32>) {
-        use dialect_mir::attributes::FieldIndexAttr;
         use pliron::builtin::attributes::IntegerAttr;
         use std::num::NonZeroUsize;
 
@@ -2290,15 +2382,9 @@ mod tests {
         let struct_ptr_val = block.deref(&ctx).get_argument(0);
 
         // &s.lanes -- carries the struct's alignment onto the array address.
-        let field_addr_op = Operation::new(
-            &mut ctx,
-            mir::MirFieldAddrOp::get_concrete_op_info(),
-            vec![array_ptr_ty.into()],
-            vec![struct_ptr_val],
-            vec![],
-            0,
-        );
-        mir::MirFieldAddrOp::new(field_addr_op).set_attr_field_index(&ctx, FieldIndexAttr(0));
+        let field_addr_op =
+            mir::MirFieldAddrOp::build(&mut ctx, struct_ptr_val, array_ptr_ty.into(), 0)
+                .expect("field_addr build");
         field_addr_op.insert_at_back(block, &ctx);
         let array_ptr_val = field_addr_op.deref(&ctx).get_result(0);
 
@@ -2887,7 +2973,8 @@ mod tests {
     fn convert_ref_lowers_to_alloca_then_store() {
         let mut ctx = make_ctx();
         let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
-        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
+        let mir_ptr_ty =
+            MirPtrType::get_generic_with_kind(&mut ctx, i32_ty, false, MirPointerKind::SharedRef);
 
         // Take a u32 by value, build `&x`.
         let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![]);
@@ -2901,7 +2988,9 @@ mod tests {
             vec![],
             0,
         );
-        mir::MirRefOp::new(ref_op_ptr).set_mutable(&mut ctx, false);
+        let ref_op = mir::MirRefOp::new(ref_op_ptr);
+        ref_op.set_mutable(&mut ctx, false);
+        ref_op.set_pointer_kind_authority(&mut ctx, MirPointerKindAuthorityAttr::Reborrow);
         ref_op_ptr.insert_at_back(block, &ctx);
         append_mir_return(&mut ctx, block, vec![]);
 
@@ -2925,7 +3014,8 @@ mod tests {
     fn convert_ref_preserves_tuple_alignment_on_alloca_and_store() {
         let mut ctx = make_ctx();
         let tuple_ty = over_aligned_tuple_ty(&mut ctx);
-        let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, tuple_ty, false);
+        let mir_ptr_ty =
+            MirPtrType::get_generic_with_kind(&mut ctx, tuple_ty, false, MirPointerKind::SharedRef);
         let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
 
         let undef = mir::MirUndefOp::new(&mut ctx, tuple_ty);
@@ -2939,7 +3029,9 @@ mod tests {
             vec![],
             0,
         );
-        mir::MirRefOp::new(ref_op).set_mutable(&mut ctx, false);
+        let mir_ref = mir::MirRefOp::new(ref_op);
+        mir_ref.set_mutable(&mut ctx, false);
+        mir_ref.set_pointer_kind_authority(&mut ctx, MirPointerKindAuthorityAttr::Reborrow);
         ref_op.insert_at_back(block, &ctx);
         append_mir_return(&mut ctx, block, vec![]);
 
@@ -2973,7 +3065,12 @@ mod tests {
             )
             .into();
             let array_ty: TypeHandle = MirArrayType::get(&mut ctx, union_ty, 3).into();
-            let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, array_ty, false);
+            let mir_ptr_ty = MirPtrType::get_generic_with_kind(
+                &mut ctx,
+                array_ty,
+                false,
+                MirPointerKind::SharedRef,
+            );
             let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
 
             let undef = mir::MirUndefOp::new(&mut ctx, array_ty);
@@ -2987,7 +3084,9 @@ mod tests {
                 vec![],
                 0,
             );
-            mir::MirRefOp::new(ref_op).set_mutable(&mut ctx, false);
+            let mir_ref = mir::MirRefOp::new(ref_op);
+            mir_ref.set_mutable(&mut ctx, false);
+            mir_ref.set_pointer_kind_authority(&mut ctx, MirPointerKindAuthorityAttr::Reborrow);
             ref_op.insert_at_back(block, &ctx);
             append_mir_return(&mut ctx, block, vec![]);
 
@@ -3411,8 +3510,13 @@ mod tests {
 
     /// Build a `mir.shared_alloc` returning `MirPtrType<i32, addrspace=3>` of
     /// length `size`, with the given alloc_key, and append it to `block`.
-    fn append_shared_alloc(ctx: &mut Context, block: Ptr<BasicBlock>, alloc_key: &str, size: u64) {
-        append_shared_alloc_named(ctx, block, alloc_key, size, None);
+    fn append_shared_alloc(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        alloc_key: &str,
+        size: u64,
+    ) -> Ptr<Operation> {
+        append_shared_alloc_named(ctx, block, alloc_key, size, None)
     }
 
     /// As [`append_shared_alloc`], additionally carrying the Rust path of the
@@ -3423,7 +3527,7 @@ mod tests {
         alloc_key: &str,
         size: u64,
         source_name: Option<&str>,
-    ) {
+    ) -> Ptr<Operation> {
         use pliron::builtin::attributes::IntegerAttr;
         use pliron::utils::apint::APInt;
 
@@ -3449,6 +3553,7 @@ mod tests {
             alloc.set_attr_source_name(ctx, StringAttr::new(source_name.to_string()));
         }
         op.insert_at_back(block, ctx);
+        op
     }
 
     #[test]
@@ -3526,6 +3631,83 @@ mod tests {
         // Each of the three mir.shared_alloc ops becomes one addressof.
         let body = kernel_blocks(&ctx, module_ptr);
         assert_eq!(count_ops::<llvm::AddressOfOp>(&ctx, &body), 3);
+    }
+
+    #[test]
+    fn convert_shared_alloc_rejects_conflicting_key_declarations() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        append_shared_alloc(&mut ctx, block, "conflicting-key", 1);
+        let differently_aligned = append_shared_alloc(&mut ctx, block, "conflicting-key", 1);
+        mir::MirSharedAllocOp::new(differently_aligned).set_alignment_value(&mut ctx, 16);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let error = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("one shared alloc_key must not name differently aligned storage");
+        assert!(
+            error.to_string().contains("incompatible declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dynamic_extern_then_static_shared_rejects_reserved_key_collision() {
+        use pliron::builtin::attributes::IntegerAttr;
+        use pliron::utils::apint::APInt;
+
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        let i8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Signless).into();
+        let shared_i8 = MirPtrType::get_shared(&mut ctx, i8_ty, true);
+
+        // Lower the dynamic declaration first. Its internal cache key is
+        // deliberately then reused by a static allocation with the same
+        // physical type, size, and alignment. Those declarations must still
+        // be rejected because one is extern storage and one is fixed storage.
+        let dynamic = Operation::new(
+            &mut ctx,
+            mir::MirExternSharedOp::get_concrete_op_info(),
+            vec![shared_i8.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        mir::MirExternSharedOp::new(dynamic).set_alignment_value(&mut ctx, 128);
+        dynamic.insert_at_back(block, &ctx);
+
+        let fixed = Operation::new(
+            &mut ctx,
+            mir::MirSharedAllocOp::get_concrete_op_info(),
+            vec![shared_i8.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let fixed_alloc = mir::MirSharedAllocOp::new(fixed);
+        fixed_alloc.set_attr_elem_type(&ctx, TypeAttr::new(i8_ty));
+        fixed_alloc.set_attr_size(
+            &ctx,
+            IntegerAttr::new(
+                IntegerType::get(&ctx, 64, Signedness::Unsigned),
+                APInt::from_u64(0, std::num::NonZeroUsize::new(64).unwrap()),
+            ),
+        );
+        fixed_alloc.set_attr_alloc_key(
+            &ctx,
+            StringAttr::new("__dynamic_smem_global_created_kernel_func".to_string()),
+        );
+        fixed_alloc.set_alignment_value(&mut ctx, 128);
+        fixed.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let error = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("a static allocation must not reuse a dynamic extern declaration");
+        let message = error.to_string();
+        assert!(message.contains("incompatible declaration"), "{message}");
+        assert!(
+            message.contains("duplicate shared alloc_key"),
+            "the dynamic declaration must be observed first, got: {message}"
+        );
     }
 
     /// Collect `(symbol, source_name)` for every shared global in the module.
@@ -3686,10 +3868,21 @@ mod tests {
         constant: bool,
     ) -> Ptr<Operation> {
         let i32_ty: TypeHandle = IntegerType::get(ctx, 32, Signedness::Signless).into();
+        append_global_alloc_typed(ctx, block, global_key, constant, !constant, i32_ty)
+    }
+
+    fn append_global_alloc_typed(
+        ctx: &mut Context,
+        block: Ptr<BasicBlock>,
+        global_key: &str,
+        constant: bool,
+        is_mutable: bool,
+        global_ty: TypeHandle,
+    ) -> Ptr<Operation> {
         let result_ty = if constant {
-            MirPtrType::get_constant(ctx, i32_ty, false)
+            MirPtrType::get_constant(ctx, global_ty, is_mutable)
         } else {
-            MirPtrType::get_global(ctx, i32_ty, true)
+            MirPtrType::get_global(ctx, global_ty, is_mutable)
         };
         let op = Operation::new(
             ctx,
@@ -3700,10 +3893,105 @@ mod tests {
             0,
         );
         let alloc = mir::MirGlobalAllocOp::new(op);
-        alloc.set_attr_global_type(ctx, TypeAttr::new(i32_ty));
+        alloc.set_attr_global_type(ctx, TypeAttr::new(global_ty));
         alloc.set_attr_global_key(ctx, StringAttr::new(global_key.to_string()));
         op.insert_at_back(block, ctx);
         op
+    }
+
+    #[test]
+    fn convert_global_alloc_deduplicates_matching_storage_across_pointer_mutability() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        append_global_alloc_typed(&mut ctx, block, "same-global", false, false, i32_ty);
+        append_global_alloc_typed(&mut ctx, block, "same-global", false, true, i32_ty);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect("pointer-carrier mutability does not change physical global storage");
+
+        let top = module_top_block(&ctx, module_ptr);
+        let globals = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .filter_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .filter(|global| global.source_global_key(&ctx).as_deref() == Some("same-global"))
+            .count();
+        assert_eq!(globals, 1);
+        assert_eq!(
+            count_ops::<llvm::AddressOfOp>(&ctx, &kernel_blocks(&ctx, module_ptr)),
+            2
+        );
+    }
+
+    #[test]
+    fn convert_global_alloc_rejects_conflicting_key_declarations() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        let byte_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Signless).into();
+        let word_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let empty_words: TypeHandle = MirArrayType::get(&mut ctx, word_ty, 0).into();
+
+        let byte =
+            append_global_alloc_typed(&mut ctx, block, "conflicting-global", false, false, byte_ty);
+        let byte = mir::MirGlobalAllocOp::new(byte);
+        byte.set_alignment_value(&mut ctx, 1);
+        byte.mark_immutable(&mut ctx);
+
+        let words = append_global_alloc_typed(
+            &mut ctx,
+            block,
+            "conflicting-global",
+            false,
+            false,
+            empty_words,
+        );
+        let words = mir::MirGlobalAllocOp::new(words);
+        words.set_alignment_value(&mut ctx, 4);
+        words.mark_immutable(&mut ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let error = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
+            .expect_err("one global_key must not name incompatible type/alignment storage");
+        assert!(
+            error.to_string().contains("incompatible declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn device_global_declaration_identity_covers_every_storage_property() {
+        let ctx = make_ctx();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
+        let base = DeviceGlobalDeclaration {
+            mir_type: i32_ty,
+            alignment: 4,
+            addr_space: llvm_addr::GLOBAL,
+            initializer_hex: Some("00000000".to_string()),
+            initializer_relocations: Some("reloc-a".to_string()),
+            immutable: true,
+        };
+
+        let mut changed = base.clone();
+        changed.mir_type = i64_ty;
+        assert!(base != changed);
+        changed = base.clone();
+        changed.alignment = 8;
+        assert!(base != changed);
+        changed = base.clone();
+        changed.addr_space = llvm_addr::CONSTANT;
+        assert!(base != changed);
+        changed = base.clone();
+        changed.initializer_hex = Some("01000000".to_string());
+        assert!(base != changed);
+        changed = base.clone();
+        changed.initializer_relocations = Some("reloc-b".to_string());
+        assert!(base != changed);
+        changed = base.clone();
+        changed.immutable = false;
+        assert!(base != changed);
     }
 
     #[test]
@@ -3907,7 +4195,10 @@ mod tests {
             .expect("relocated initializer must use struct storage");
         assert_eq!(struct_ty.layout(), StructLayout::Packed);
         assert_eq!(struct_ty.num_fields(), 2);
-        assert_eq!(get_type_size(&ctx, storage), 9);
+        assert_eq!(
+            crate::convert::types::llvm_type_size_align(&ctx, storage),
+            Some((9, 1))
+        );
 
         let fields: Vec<_> = struct_ty.fields().collect();
         let literal_ref = fields[0].deref(&ctx);
@@ -3941,7 +4232,10 @@ mod tests {
             .downcast_ref::<StructType>()
             .expect("relocated initializer must use struct storage");
         assert_eq!(struct_ty.layout(), StructLayout::Packed);
-        assert_eq!(get_type_size(&ctx, storage), 8);
+        assert_eq!(
+            crate::convert::types::llvm_type_size_align(&ctx, storage),
+            Some((8, 1))
+        );
     }
 
     #[test]

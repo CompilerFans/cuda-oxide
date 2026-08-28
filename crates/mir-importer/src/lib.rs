@@ -21,7 +21,7 @@
 //! ┌─────────────────────── mir-importer ──────────────────────────────────┐
 //! │                                                                       │
 //! │  ┌──────────────┐   ┌─────────────────────────────────────────────┐   │
-//! │  │  translator  │──▶│          cuda-oxide-codegen               │   │
+//! │  │  translator  │──▶│          cuda-oxide-codegen                 │   │
 //! │  │              │   │                                             │   │
 //! │  │     MIR      │   │  dialect-mir (alloca)                       │   │
 //! │  │      ──▶     │   │    ──▶ mem2reg                              │   │
@@ -61,6 +61,7 @@
 //!         output_name: "kernel".to_string(),
 //!         ..PipelineConfig::default()
 //!     },
+//!     known_defs, // lang-item DefIds resolved by the driver (KnownDefs)
 //! )?;
 //! ```
 //!
@@ -106,5 +107,6 @@ pub use pipeline::{
     DeviceExternDecl, DeviceExternType, KernelLaunchBounds, PipelineConfig, PipelineError,
     run_pipeline,
 };
+pub use translator::facts::KnownDefs;
 pub use translator::terminator::drop_glue::{drop_glue_is_noop, drop_instance_is_noop};
 pub use translator::terminator::is_panic_entry_path;
