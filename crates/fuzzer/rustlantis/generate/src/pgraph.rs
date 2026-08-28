@@ -759,12 +759,19 @@ impl PlaceGraph {
     pub fn mark_place_uninit(&mut self, p: impl ToPlaceIndex) {
         let pidx = p.to_place_index(self).unwrap();
 
-        // If this is a pointer, we have to remove the Deref edge, but not for other projections
-        // FIXME: this should be transitive
-        if self.places[pidx].ty.is_any_ptr(&self.tcx)
-            && let Some(old) = self.ref_edge(pidx)
-        {
-            self.remove_edge(old);
+        // Remove Deref edges owned by the value being invalidated, including pointers nested in
+        // aggregates. Incoming Deref edges from external pointers are intentionally preserved.
+        let mut ref_edges = vec![];
+        self.visit_transitive_subfields(pidx, |place| {
+            if self.places[place].ty.is_any_ptr(&self.tcx)
+                && let Some(edge) = self.ref_edge(place)
+            {
+                ref_edges.push(edge);
+            }
+            VisitAction::Continue
+        });
+        for edge in ref_edges {
+            self.remove_edge(edge);
         }
 
         self.update_transitive_subfields(pidx, |this, place| {
@@ -1496,12 +1503,13 @@ mod tests {
     use std::rc::Rc;
 
     use config::TyConfig;
+    use index_vec::IndexVec;
     use mir::{
         syntax::{
-            BinOp, FieldIdx, Literal, Local, Mutability, Operand, Place, ProjectionElem, Rvalue,
-            TyId, TyKind, UintTy,
+            Adt, BinOp, FieldIdx, Literal, Local, Mutability, Operand, Place, ProjectionElem,
+            Rvalue, TyId, TyKind, UintTy, VariantDef, VariantIdx,
         },
-        tyctxt::TyCtxt,
+        tyctxt::{AdtMeta, TyCtxt},
     };
 
     use crate::{
@@ -1679,6 +1687,195 @@ mod tests {
         pt.mark_place_uninit(local);
         assert!(!pt.is_place_init(&a));
         assert!(!pt.is_place_init(&c));
+    }
+
+    #[test]
+    fn uninit_removes_nested_deref_edges_but_preserves_incoming_refs() {
+        let mut tcx = TyCtxt::from_primitives(TyConfig::default());
+        let t_ref_i32 = tcx.push(TyKind::Ref(TyCtxt::I32, Mutability::Not));
+        let t_ptr_i32 = tcx.push(TyKind::RawPtr(TyCtxt::I32, Mutability::Not));
+        let t_inner = tcx.push(TyKind::Tuple(vec![t_ref_i32, t_ptr_i32]));
+        let t_root = tcx.push(TyKind::Tuple(vec![TyCtxt::U32, t_inner]));
+        let t_root_ref = tcx.push(TyKind::Ref(t_root, Mutability::Not));
+
+        let mut pt = PlaceGraph::new(Rc::new(tcx));
+
+        let root = Local::new(1);
+        let root_pidx = pt.allocate_local(root, t_root);
+        pt.mark_place_init(root);
+
+        let target_ref = Local::new(2);
+        let target_ref_pidx = pt.allocate_local(target_ref, TyCtxt::I32);
+        pt.mark_place_init(target_ref);
+
+        let target_ptr = Local::new(3);
+        let target_ptr_pidx = pt.allocate_local(target_ptr, TyCtxt::I32);
+        pt.mark_place_init(target_ptr);
+
+        let nested_ref = Place::from_projected(
+            root,
+            &[
+                ProjectionElem::TupleField(FieldIdx::new(1)),
+                ProjectionElem::TupleField(FieldIdx::new(0)),
+            ],
+        );
+        let nested_ref_pidx = nested_ref.to_place_index(&pt).unwrap();
+        pt.set_ref(nested_ref_pidx, target_ref_pidx, None);
+
+        let nested_ptr = Place::from_projected(
+            root,
+            &[
+                ProjectionElem::TupleField(FieldIdx::new(1)),
+                ProjectionElem::TupleField(FieldIdx::new(1)),
+            ],
+        );
+        let nested_ptr_pidx = nested_ptr.to_place_index(&pt).unwrap();
+        pt.set_ref(nested_ptr_pidx, target_ptr_pidx, None);
+
+        let external_ref = Local::new(4);
+        let external_ref_pidx = pt.allocate_local(external_ref, t_root_ref);
+        pt.set_ref(external_ref_pidx, root_pidx, None);
+
+        assert_eq!(pt.pointee(nested_ref_pidx), Some(target_ref_pidx));
+        assert_eq!(pt.pointee(nested_ptr_pidx), Some(target_ptr_pidx));
+        assert_eq!(pt.pointee(external_ref_pidx), Some(root_pidx));
+
+        pt.mark_place_uninit(root_pidx);
+
+        assert!(!pt.is_place_init(root_pidx));
+        assert_eq!(pt.pointee(nested_ref_pidx), None);
+        assert_eq!(pt.pointee(nested_ptr_pidx), None);
+        assert_eq!(pt.pointee(external_ref_pidx), Some(root_pidx));
+    }
+
+    #[test]
+    fn uninit_array_of_pointers_removes_element_deref_edges() {
+        let mut tcx = TyCtxt::from_primitives(TyConfig::default());
+        let t_ptr_i32 = tcx.push(TyKind::RawPtr(TyCtxt::I32, Mutability::Not));
+        let t_arr = tcx.push(TyKind::Array(t_ptr_i32, 2));
+        let t_arr_ref = tcx.push(TyKind::Ref(t_arr, Mutability::Not));
+
+        let mut pt = PlaceGraph::new(Rc::new(tcx));
+
+        let arr = Local::new(1);
+        let arr_pidx = pt.allocate_local(arr, t_arr);
+        pt.mark_place_init(arr);
+
+        let target_a = Local::new(2);
+        let target_a_pidx = pt.allocate_local(target_a, TyCtxt::I32);
+        pt.mark_place_init(target_a);
+
+        let target_b = Local::new(3);
+        let target_b_pidx = pt.allocate_local(target_b, TyCtxt::I32);
+        pt.mark_place_init(target_b);
+
+        let elem_0 = Place::from_projected(arr, &[ProjectionElem::ConstantIndex { offset: 0 }]);
+        let elem_0_pidx = elem_0.to_place_index(&pt).unwrap();
+        pt.set_ref(elem_0_pidx, target_a_pidx, None);
+
+        let elem_1 = Place::from_projected(arr, &[ProjectionElem::ConstantIndex { offset: 1 }]);
+        let elem_1_pidx = elem_1.to_place_index(&pt).unwrap();
+        pt.set_ref(elem_1_pidx, target_b_pidx, None);
+
+        let external_ref = Local::new(4);
+        let external_ref_pidx = pt.allocate_local(external_ref, t_arr_ref);
+        pt.set_ref(external_ref_pidx, arr_pidx, None);
+
+        assert_eq!(pt.pointee(elem_0_pidx), Some(target_a_pidx));
+        assert_eq!(pt.pointee(elem_1_pidx), Some(target_b_pidx));
+        assert_eq!(pt.pointee(external_ref_pidx), Some(arr_pidx));
+
+        pt.mark_place_uninit(arr_pidx);
+
+        assert!(!pt.is_place_init(arr_pidx));
+        // The array node owns the RunPointer, so the memory-bounded walk in
+        // mark_place_uninit stops at the array itself; only the structural
+        // subfield walk reaches the pointer elements. Their outgoing Deref
+        // edges must still be removed.
+        assert_eq!(pt.pointee(elem_0_pidx), None);
+        assert_eq!(pt.pointee(elem_1_pidx), None);
+        // Incoming Deref edges from external pointers are preserved.
+        assert_eq!(pt.pointee(external_ref_pidx), Some(arr_pidx));
+    }
+
+    #[test]
+    fn uninit_enum_removes_variant_field_deref_edge() {
+        let mut tcx = TyCtxt::from_primitives(TyConfig::default());
+        let t_ptr_i32 = tcx.push(TyKind::RawPtr(TyCtxt::I32, Mutability::Not));
+        let t_enum = tcx.push_adt(
+            Adt {
+                variants: IndexVec::from_iter([
+                    VariantDef {
+                        fields: IndexVec::from_iter([t_ptr_i32]),
+                    },
+                    VariantDef {
+                        fields: IndexVec::from_iter([TyCtxt::U32]),
+                    },
+                ]),
+            },
+            AdtMeta { copy: true },
+        );
+
+        let mut pt = PlaceGraph::new(Rc::new(tcx));
+
+        let root = Local::new(1);
+        let root_pidx = pt.allocate_local(root, t_enum);
+        pt.assign_discriminant(root_pidx, Some(VariantIdx::new(0)));
+
+        let target = Local::new(2);
+        let target_pidx = pt.allocate_local(target, TyCtxt::I32);
+        pt.mark_place_init(target);
+
+        let variant_ptr = Place::from_projected(
+            root,
+            &[ProjectionElem::DowncastField(
+                VariantIdx::new(0),
+                FieldIdx::new(0),
+                t_ptr_i32,
+            )],
+        );
+        let variant_ptr_pidx = variant_ptr.to_place_index(&pt).unwrap();
+        pt.mark_place_init(variant_ptr_pidx);
+        pt.set_ref(variant_ptr_pidx, target_pidx, None);
+
+        assert!(pt.is_place_init(root_pidx));
+        assert_eq!(pt.pointee(variant_ptr_pidx), Some(target_pidx));
+
+        pt.mark_place_uninit(root_pidx);
+
+        assert!(!pt.is_place_init(root_pidx));
+        assert_eq!(pt.pointee(variant_ptr_pidx), None);
+    }
+
+    #[test]
+    fn moved_place_invalidates_nested_deref_edge() {
+        let mut tcx = TyCtxt::from_primitives(TyConfig::default());
+        let t_ptr_i32 = tcx.push(TyKind::RawPtr(TyCtxt::I32, Mutability::Not));
+        let t_root = tcx.push(TyKind::Tuple(vec![TyCtxt::U32, t_ptr_i32]));
+
+        let mut pt = PlaceGraph::new(Rc::new(tcx));
+
+        let root = Local::new(1);
+        let root_pidx = pt.allocate_local(root, t_root);
+        pt.mark_place_init(root);
+
+        let target = Local::new(2);
+        let target_pidx = pt.allocate_local(target, TyCtxt::I32);
+        pt.mark_place_init(target);
+
+        let nested_ptr =
+            Place::from_projected(root, &[ProjectionElem::TupleField(FieldIdx::new(1))]);
+        let nested_ptr_pidx = nested_ptr.to_place_index(&pt).unwrap();
+        pt.set_ref(nested_ptr_pidx, target_pidx, None);
+
+        assert_eq!(pt.pointee(nested_ptr_pidx), Some(target_pidx));
+
+        // mark_place_moved routes through mark_place_uninit; moving out of a
+        // place containing a pointer must invalidate the nested Deref edge.
+        pt.mark_place_moved(root_pidx);
+
+        assert!(!pt.is_place_init(root_pidx));
+        assert_eq!(pt.pointee(nested_ptr_pidx), None);
     }
 
     #[test]
