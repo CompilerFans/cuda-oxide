@@ -391,6 +391,15 @@ pub fn translate_rvalue(
                     MirCastKindAttr::PointerWithExposedProvenance
                 }
                 mir::CastKind::Transmute => MirCastKindAttr::Transmute,
+                // Elaborated `box` derefs turn the inner pointer into a raw
+                // pointer with this cast. Upstream documents it as "almost
+                // equivalent to a regular transmute except that if the input
+                // would not be valid as `Box<T>`, the cast is UB. Backends
+                // that do not care about UB detection can treat this like a
+                // regular transmute", and rustc_codegen_ssa lowers it in the
+                // same match arm as `Transmute` (mir/rvalue.rs). We follow
+                // codegen_ssa: a plain same-size bit reinterpretation.
+                mir::CastKind::BoxDerefTransmute => MirCastKindAttr::Transmute,
                 mir::CastKind::PointerCoercion(coercion) => match coercion {
                     mir::PointerCoercion::Unsize => MirCastKindAttr::PointerCoercionUnsize,
                     mir::PointerCoercion::MutToConstPointer => {
@@ -475,7 +484,7 @@ pub fn translate_rvalue(
             let result = op.deref(ctx).get_result(0);
             Ok((Some(op), result, prev_op_after_right))
         }
-        mir::Rvalue::Use(operand) => {
+        mir::Rvalue::Use(operand, _) => {
             // Use just copies/moves a value - no operation needed, just pass through
             // The operand translation may insert field extraction operations
             let (val, last_inserted) =
@@ -1009,6 +1018,69 @@ pub fn translate_rvalue(
                 translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc)?;
 
             Ok((None, value, last_inserted))
+        }
+        mir::Rvalue::Reborrow(target_ty, _mutability, place) => {
+            // `Rvalue::Reborrow` (rust-lang/rust#159103, `feature(reborrow)`,
+            // nightly-2026-08-28+): reborrowing a user ADT that implements
+            // the `Reborrow` marker trait. Semantically this is a bitwise
+            // copy of `place`:
+            //
+            // - `Mutability::Mut` (Reborrow): the target type IS the source
+            //   type, so this is exactly a place read, like `Rvalue::Use` of
+            //   `Operand::Copy(place)`.
+            // - `Mutability::Not` (CoerceShared): the target is the
+            //   `CoerceShared` target ADT, which the trait's coherence rules
+            //   force to have the identical memory layout to the source
+            //   (rustc_middle mir/syntax.rs doc on `Rvalue::Reborrow`).
+            //
+            // rustc_codegen_ssa lowers both cases as
+            // `codegen_operand(bx, &Operand::Copy(place))` (mir/rvalue.rs:
+            // "Exclusive reborrowing is always equal to a memcpy ... the
+            // coherence check places such restrictions on the CoerceShared
+            // trait as to guarantee that it is [too]"); the const
+            // interpreter uses `copy_op` / `copy_op_allow_transmute`
+            // (interpret/step.rs). We mirror that: read the place, and when
+            // the translated dialect types diverge (a CoerceShared reborrow
+            // into a distinct same-layout ADT), reuse the same
+            // `MirCastKindAttr::Transmute` path a `CastKind::Transmute`
+            // would take.
+            //
+            // The optimizer (GVN/copy-prop) usually folds these into plain
+            // copies at `-C opt-level>0`, but they reach the importer intact
+            // through the `-Zmir-opt-level=0` debug device path (verified on
+            // the pinned nightly).
+            let (value, last_inserted) =
+                translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?;
+
+            let target_type = types::translate_type(ctx, target_ty)?;
+            if value.get_type(ctx) == target_type {
+                return Ok((None, value, last_inserted));
+            }
+
+            let op = Operation::new(
+                ctx,
+                MirCastOp::get_concrete_op_info(),
+                vec![target_type],
+                vec![value],
+                vec![],
+                0,
+            );
+            op.deref_mut(ctx).set_loc(loc);
+
+            let cast_op = MirCastOp::new(op);
+            cast_op.set_attr_cast_kind(ctx, MirCastKindAttr::Transmute);
+            // Same authority rule as the `Rvalue::Cast` transmute path: this
+            // reinterpretation comes directly from rustc MIR, so any concrete
+            // pointer category it carries is an explicit Rust semantic
+            // boundary.
+            if dialect_mir::types::type_contains_concrete_pointer_kind(ctx, target_type)
+                || !dialect_mir::types::pointer_kinds_in_type(ctx, target_type).is_empty()
+            {
+                cast_op.set_pointer_kind_authority(ctx, MirPointerKindAuthorityAttr::RustCast);
+            }
+
+            let result = op.deref(ctx).get_result(0);
+            Ok((Some(op), result, last_inserted))
         }
         mir::Rvalue::Len(place) => input_err!(
             loc,
