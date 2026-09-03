@@ -32,6 +32,17 @@ impl MirToLlvmConversion for ShflSyncDownF32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_f32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_down_f32",
+            31,
+            );
+        }
+
         convert_shuffle_f32(
             ctx,
             rewriter,
@@ -51,6 +62,17 @@ impl MirToLlvmConversion for ShflSyncDownI32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_down_i32",
+            31,
+            );
+        }
+
         convert_shuffle_i32(
             ctx,
             rewriter,
@@ -70,6 +92,17 @@ impl MirToLlvmConversion for ShflSyncDownI64Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i64(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "down",
+            31,
+            );
+        }
+
         convert_shuffle_i64(
             ctx,
             rewriter,
@@ -89,6 +122,17 @@ impl MirToLlvmConversion for ShflSyncIdxF32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_f32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_idx_f32",
+            31,
+            );
+        }
+
         convert_shuffle_f32(
             ctx,
             rewriter,
@@ -108,6 +152,17 @@ impl MirToLlvmConversion for ShflSyncIdxI32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_idx_i32",
+            31,
+            );
+        }
+
         convert_shuffle_i32(
             ctx,
             rewriter,
@@ -127,6 +182,17 @@ impl MirToLlvmConversion for ShflSyncIdxI64Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i64(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "idx",
+            31,
+            );
+        }
+
         convert_shuffle_i64(
             ctx,
             rewriter,
@@ -146,6 +212,17 @@ impl MirToLlvmConversion for ShflSyncUpF32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_f32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_up_f32",
+            0,
+            );
+        }
+
         convert_shuffle_f32(
             ctx,
             rewriter,
@@ -165,6 +242,17 @@ impl MirToLlvmConversion for ShflSyncUpI32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_up_i32",
+            0,
+            );
+        }
+
         convert_shuffle_i32(
             ctx,
             rewriter,
@@ -184,6 +272,16 @@ impl MirToLlvmConversion for ShflSyncUpI64Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i64(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "up", 0
+            );
+        }
+
         convert_shuffle_i64(ctx, rewriter, self.get_operation(), operands_info, "up", 0)
     }
 }
@@ -196,6 +294,17 @@ impl MirToLlvmConversion for ShflSyncBflyF32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_f32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_bfly_f32",
+            31,
+            );
+        }
+
         convert_shuffle_f32(
             ctx,
             rewriter,
@@ -215,6 +324,17 @@ impl MirToLlvmConversion for ShflSyncBflyI32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "llvm_nvvm_shfl_sync_bfly_i32",
+            31,
+            );
+        }
+
         convert_shuffle_i32(
             ctx,
             rewriter,
@@ -234,6 +354,17 @@ impl MirToLlvmConversion for ShflSyncBflyI64Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return             crate::convert::intrinsics::warp::convert_shuffle_i64(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            "bfly",
+            31,
+            );
+        }
+
         convert_shuffle_i64(
             ctx,
             rewriter,

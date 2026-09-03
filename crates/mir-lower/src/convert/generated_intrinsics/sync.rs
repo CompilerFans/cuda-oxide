@@ -30,8 +30,17 @@ impl MirToLlvmConversion for Barrier0Op {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_barrier0(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         match context::lowering_options(ctx).intrinsic_backend {
@@ -72,8 +81,17 @@ impl MirToLlvmConversion for ThreadfenceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_threadfence(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
@@ -96,8 +114,17 @@ impl MirToLlvmConversion for ThreadfenceBlockOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_threadfence_block(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
@@ -120,8 +147,17 @@ impl MirToLlvmConversion for ThreadfenceSystemOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_threadfence_system(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
         let function_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);

@@ -551,7 +551,7 @@ pub(super) fn try_dispatch(
         "cuda_intrinsics::__cuda_oxide_intrinsic_abi_v1::i0037"
         | "cuda_device::warp::lanemask_eq" => {
             require_arity(name, args.len(), 0, &loc)?;
-            Ok(Some(helpers::emit_generated_nvvm_intrinsic(
+            Ok(Some(helpers::emit_generated_nvvm_intrinsic_u64(
                 ctx,
                 ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
                 "v1:i0037",
@@ -567,7 +567,7 @@ pub(super) fn try_dispatch(
         "cuda_intrinsics::__cuda_oxide_intrinsic_abi_v1::i0038"
         | "cuda_device::warp::lanemask_ge" => {
             require_arity(name, args.len(), 0, &loc)?;
-            Ok(Some(helpers::emit_generated_nvvm_intrinsic(
+            Ok(Some(helpers::emit_generated_nvvm_intrinsic_u64(
                 ctx,
                 ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
                 "v1:i0038",
@@ -583,7 +583,7 @@ pub(super) fn try_dispatch(
         "cuda_intrinsics::__cuda_oxide_intrinsic_abi_v1::i0039"
         | "cuda_device::warp::lanemask_gt" => {
             require_arity(name, args.len(), 0, &loc)?;
-            Ok(Some(helpers::emit_generated_nvvm_intrinsic(
+            Ok(Some(helpers::emit_generated_nvvm_intrinsic_u64(
                 ctx,
                 ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
                 "v1:i0039",
@@ -599,7 +599,7 @@ pub(super) fn try_dispatch(
         "cuda_intrinsics::__cuda_oxide_intrinsic_abi_v1::i0036"
         | "cuda_device::warp::lanemask_le" => {
             require_arity(name, args.len(), 0, &loc)?;
-            Ok(Some(helpers::emit_generated_nvvm_intrinsic(
+            Ok(Some(helpers::emit_generated_nvvm_intrinsic_u64(
                 ctx,
                 ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
                 "v1:i0036",
@@ -615,7 +615,7 @@ pub(super) fn try_dispatch(
         "cuda_intrinsics::__cuda_oxide_intrinsic_abi_v1::i0035"
         | "cuda_device::warp::lanemask_lt" => {
             require_arity(name, args.len(), 0, &loc)?;
-            Ok(Some(helpers::emit_generated_nvvm_intrinsic(
+            Ok(Some(helpers::emit_generated_nvvm_intrinsic_u64(
                 ctx,
                 ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
                 "v1:i0035",

@@ -35,7 +35,8 @@ use crate::BackendTarget;
 use crate::context::lowering_options;
 use crate::convert::intrinsics::common::*;
 use llvm_export::attributes::{
-    ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering, SyncScopeAttr,
+    FCmpPredicateAttr, ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering,
+    SyncScopeAttr,
 };
 use llvm_export::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
@@ -598,14 +599,35 @@ pub(crate) fn convert_redux(
     let (mask, value) = (operands[0], operands[1]);
 
     if lowering_options(ctx).backend == BackendTarget::Maca {
+        let value_ty_ref = value.get_type(ctx);
+        let is_f32 = value_ty_ref
+            .deref(ctx)
+            .is::<FP32Type>();
+        if is_f32 {
+            let result =
+                emit_maca_redux_f32(ctx, rewriter, op, mask, value, intrinsic_name)?;
+            rewriter.replace_operation_with_values(ctx, op, vec![result]);
+            return Ok(());
+        }
         let result = emit_maca_redux(ctx, rewriter, op, mask, value, intrinsic_name)?;
         rewriter.replace_operation_with_values(ctx, op, vec![result]);
         return Ok(());
     }
 
-    let mask_i32 = llvm::TruncOp::new(ctx, mask, i32_ty.into());
-    rewriter.insert_operation(ctx, mask_i32.get_operation());
-    let mask_i32 = mask_i32.get_operation().deref(ctx).get_result(0);
+    // Mask may already be i32 (the f32 redux device fns historically take
+    // `u32`); only widen-from-i64 needs a trunc.
+    let mask_is_i64 = mask
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|i| i.width() == 64);
+    let mask_i32 = if mask_is_i64 {
+        let truncated = llvm::TruncOp::new(ctx, mask, i32_ty.into());
+        rewriter.insert_operation(ctx, truncated.get_operation());
+        truncated.get_operation().deref(ctx).get_result(0)
+    } else {
+        mask
+    };
 
     let value_ty = value.get_type(ctx);
     let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
@@ -807,6 +829,180 @@ fn emit_maca_redux(
     let final_value = llvm::SelectOp::new(ctx, lane_member, result, original);
     rewriter.insert_operation(ctx, final_value.get_operation());
     Ok(final_value.get_operation().deref(ctx).get_result(0))
+}
+
+/// Wave-wide f32 redux for MXMACA: the i32 bpermute loop operates on the
+/// bit pattern, with float comparisons (or fadd) after each round.
+fn emit_maca_redux_f32(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    current_op: Ptr<Operation>,
+    mask: pliron::value::Value,
+    value: pliron::value::Value,
+    intrinsic_name: &str,
+) -> Result<pliron::value::Value> {
+    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let f32_ty = FP32Type::get(ctx);
+    let lane = crate::convert::intrinsics::basic::emit_maca_lane_id(ctx, rewriter, current_op)?;
+    let overflow_flags = IntegerOverflowFlagsAttr::default();
+
+    // Work on the i32 bit pattern of the f32 value.
+    let bits = llvm::BitcastOp::new(ctx, value, i32_ty.into());
+    rewriter.insert_operation(ctx, bits.get_operation());
+    let mut result = bits.get_operation().deref(ctx).get_result(0);
+    let original_bits = result;
+
+    // Normalize the mask to i64: the f32 redux device fns historically take
+    // `u32` masks, but the MACA member checks run in i64.
+    let mask = {
+        let mask_ty = mask.get_type(ctx);
+        let is_i32 = mask_ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|i| i.width() == 32);
+        if is_i32 {
+            let widened = llvm::ZExtOp::new_with_nneg(ctx, mask, i64_ty.into(), false);
+            rewriter.insert_operation(ctx, widened.get_operation());
+            widened.get_operation().deref(ctx).get_result(0)
+        } else {
+            mask
+        }
+    };
+
+    let is_add = intrinsic_name.contains("add");
+    // fmin/fmax comparisons happen on f32; NaN variants ignore NaN inputs
+    // (LLVM fcmp ogt/olt already do), abs variants compare |x|.
+    let strip_abs = intrinsic_name.contains("_abs");
+    let want_max = intrinsic_name.contains("fmax");
+
+    for stride in [1i32, 2, 4, 8, 16, 32] {
+        let stride_value = create_i32_const(ctx, rewriter, stride);
+        let candidate = llvm::XorOp::new(ctx, lane, stride_value);
+        rewriter.insert_operation(ctx, candidate.get_operation());
+        let candidate = candidate.get_operation().deref(ctx).get_result(0);
+        let candidate_i64 = llvm::ZExtOp::new_with_nneg(ctx, candidate, i64_ty.into(), false);
+        rewriter.insert_operation(ctx, candidate_i64.get_operation());
+        let candidate_i64 = candidate_i64.get_operation().deref(ctx).get_result(0);
+        let one = create_i64_const(ctx, rewriter, 1);
+        let member_bit = llvm::ShlOp::new_with_overflow_flag(
+            ctx,
+            one,
+            candidate_i64,
+            overflow_flags.clone(),
+        );
+        rewriter.insert_operation(ctx, member_bit.get_operation());
+        let member_bit = member_bit.get_operation().deref(ctx).get_result(0);
+        let member = llvm::AndOp::new(ctx, mask, member_bit);
+        rewriter.insert_operation(ctx, member.get_operation());
+        let member = member.get_operation().deref(ctx).get_result(0);
+        let zero_i64 = create_i64_const(ctx, rewriter, 0);
+        let member = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::NE, member, zero_i64);
+        rewriter.insert_operation(ctx, member.get_operation());
+        let member = member.get_operation().deref(ctx).get_result(0);
+
+        // Broadcast the candidate lane's bits via the i32 bpermute:
+        // offset = lane * 4 bytes.
+        let two = create_i32_const(ctx, rewriter, 2);
+        let byte_offset =
+            llvm::ShlOp::new_with_overflow_flag(ctx, candidate, two, overflow_flags.clone());
+        rewriter.insert_operation(ctx, byte_offset.get_operation());
+        let byte_offset = byte_offset.get_operation().deref(ctx).get_result(0);
+        let bpermute_ty =
+            llvm_types::FuncType::get(ctx, i32_ty.into(), vec![i32_ty.into(), i32_ty.into()], false);
+        let bpermute = crate::convert::intrinsics::common::call_intrinsic(
+            ctx,
+            rewriter,
+            current_op,
+            "llvm_mxc_bsm_bpermute",
+            bpermute_ty,
+            vec![byte_offset, result],
+        )?;
+        let shuffled = bpermute.deref(ctx).get_result(0);
+
+        if is_add {
+            let zero_bits = create_i32_const(ctx, rewriter, 0);
+            let rhs = llvm::SelectOp::new(ctx, member, shuffled, zero_bits);
+            rewriter.insert_operation(ctx, rhs.get_operation());
+            let rhs = rhs.get_operation().deref(ctx).get_result(0);
+            let lhs_f = llvm::BitcastOp::new(ctx, result, f32_ty.into());
+            rewriter.insert_operation(ctx, lhs_f.get_operation());
+            let lhs_f = lhs_f.get_operation().deref(ctx).get_result(0);
+            let rhs_f = llvm::BitcastOp::new(ctx, rhs, f32_ty.into());
+            rewriter.insert_operation(ctx, rhs_f.get_operation());
+            let rhs_f = rhs_f.get_operation().deref(ctx).get_result(0);
+            let sum = llvm::FAddOp::new(ctx, lhs_f, rhs_f);
+            rewriter.insert_operation(ctx, sum.get_operation());
+            let sum = sum.get_operation().deref(ctx).get_result(0);
+            let bits = llvm::BitcastOp::new(ctx, sum, i32_ty.into());
+            rewriter.insert_operation(ctx, bits.get_operation());
+            result = bits.get_operation().deref(ctx).get_result(0);
+        } else {
+            let lhs_f = llvm::BitcastOp::new(ctx, result, f32_ty.into());
+            rewriter.insert_operation(ctx, lhs_f.get_operation());
+            let lhs_f = lhs_f.get_operation().deref(ctx).get_result(0);
+            let rhs_f0 = llvm::BitcastOp::new(ctx, shuffled, f32_ty.into());
+            rewriter.insert_operation(ctx, rhs_f0.get_operation());
+            let rhs_f0 = rhs_f0.get_operation().deref(ctx).get_result(0);
+            let rhs_f = if strip_abs {
+                // fabs via sign-mask clear on the incoming lane value
+                let rhs_bits = llvm::BitcastOp::new(ctx, rhs_f0, i32_ty.into());
+                rewriter.insert_operation(ctx, rhs_bits.get_operation());
+                let rhs_bits = rhs_bits.get_operation().deref(ctx).get_result(0);
+                let sign_mask = create_i32_const(ctx, rewriter, 0x7fff_ffff);
+                let abs_bits = llvm::AndOp::new(ctx, rhs_bits, sign_mask);
+                rewriter.insert_operation(ctx, abs_bits.get_operation());
+                let abs_bits = abs_bits.get_operation().deref(ctx).get_result(0);
+                let abs_f = llvm::BitcastOp::new(ctx, abs_bits, f32_ty.into());
+                rewriter.insert_operation(ctx, abs_f.get_operation());
+                abs_f.get_operation().deref(ctx).get_result(0)
+            } else {
+                rhs_f0
+            };
+            let pred = if want_max {
+                FCmpPredicateAttr::OGT
+            } else {
+                FCmpPredicateAttr::OLT
+            };
+            let cmp = llvm::FCmpOp::new(ctx, pred, rhs_f, lhs_f);
+            rewriter.insert_operation(ctx, cmp.get_operation());
+            let cmp_v = cmp.get_operation().deref(ctx).get_result(0);
+            let lhs_bits = llvm::BitcastOp::new(ctx, lhs_f, i32_ty.into());
+            rewriter.insert_operation(ctx, lhs_bits.get_operation());
+            let lhs_bits = lhs_bits.get_operation().deref(ctx).get_result(0);
+            let rhs_bits = llvm::BitcastOp::new(ctx, rhs_f, i32_ty.into());
+            rewriter.insert_operation(ctx, rhs_bits.get_operation());
+            let rhs_bits = rhs_bits.get_operation().deref(ctx).get_result(0);
+            let chosen = llvm::SelectOp::new(ctx, cmp_v, rhs_bits, lhs_bits);
+            rewriter.insert_operation(ctx, chosen.get_operation());
+            let chosen = chosen.get_operation().deref(ctx).get_result(0);
+            let chosen = llvm::SelectOp::new(ctx, member, chosen, result);
+            rewriter.insert_operation(ctx, chosen.get_operation());
+            result = chosen.get_operation().deref(ctx).get_result(0);
+        }
+    }
+
+    // Keep the calling lane's own value when it is not a mask member.
+    let lane_i64 = llvm::ZExtOp::new_with_nneg(ctx, lane, i64_ty.into(), false);
+    rewriter.insert_operation(ctx, lane_i64.get_operation());
+    let lane_i64 = lane_i64.get_operation().deref(ctx).get_result(0);
+    let one = create_i64_const(ctx, rewriter, 1);
+    let lane_bit = llvm::ShlOp::new_with_overflow_flag(ctx, one, lane_i64, overflow_flags);
+    rewriter.insert_operation(ctx, lane_bit.get_operation());
+    let lane_bit = lane_bit.get_operation().deref(ctx).get_result(0);
+    let lane_member = llvm::AndOp::new(ctx, mask, lane_bit);
+    rewriter.insert_operation(ctx, lane_member.get_operation());
+    let lane_member = lane_member.get_operation().deref(ctx).get_result(0);
+    let zero_i64 = create_i64_const(ctx, rewriter, 0);
+    let lane_member = llvm::ICmpOp::new(ctx, ICmpPredicateAttr::NE, lane_member, zero_i64);
+    rewriter.insert_operation(ctx, lane_member.get_operation());
+    let lane_member = lane_member.get_operation().deref(ctx).get_result(0);
+    let final_bits = llvm::SelectOp::new(ctx, lane_member, result, original_bits);
+    rewriter.insert_operation(ctx, final_bits.get_operation());
+    let final_bits = final_bits.get_operation().deref(ctx).get_result(0);
+    let final_f = llvm::BitcastOp::new(ctx, final_bits, f32_ty.into());
+    rewriter.insert_operation(ctx, final_f.get_operation());
+    Ok(final_f.get_operation().deref(ctx).get_result(0))
 }
 
 /// Convert an `activemask` op to its LLVM intrinsic call.

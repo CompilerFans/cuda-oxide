@@ -6,10 +6,17 @@
       "started_at": "2026-09-03T08:11:24.174Z",
       "parent_mode": "none",
       "status": "running"
+    },
+    {
+      "agent_id": "a16f7124ff3541224",
+      "agent_type": "oh-my-claudecode:executor",
+      "started_at": "2026-09-03T14:57:01.287Z",
+      "parent_mode": "none",
+      "status": "running"
     }
   ],
-  "total_spawned": 1,
+  "total_spawned": 2,
   "total_completed": 0,
   "total_failed": 0,
-  "last_updated": "2026-09-03T09:06:28.736Z"
+  "last_updated": "2026-09-03T14:57:01.389Z"
 }

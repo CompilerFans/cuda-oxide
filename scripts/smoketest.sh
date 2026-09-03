@@ -74,11 +74,11 @@ LTOIR_MODERN_EXAMPLES=(small_type_ffi_test)
 AUTO_NVVM_EXAMPLES=(libdevice_math)
 # Examples that inspect PTX text (vector load shapes, mangled symbol names)
 # or need CUDA-only host metadata interop. Meaningless on a non-PTX target.
-PTX_INSPECT_EXAMPLES=(vectorization const_generic cross_crate_kernel cutile_inter_kernel array_constants aligned_field_loads aligned_field_stores const_bool_dead_branch copy_aggregate_borrow disjoint_slice_len generated_intrinsics_blackwell repr_transparent_abi unchecked_indexing)
+PTX_INSPECT_EXAMPLES=(vectorization const_generic cross_crate_kernel cutile_inter_kernel array_constants aligned_field_loads aligned_field_stores const_bool_dead_branch copy_aggregate_borrow disjoint_slice_len generated_intrinsics_blackwell repr_transparent_abi unchecked_indexing dpx_minmax_chains packed_aggregate_abi f32x2_arith)
 # Examples exercising NVIDIA hardware features with no MXMACA equivalent:
 # mbarrier, cp.async, TMA, thread-block clusters, pmevent, mma.sync, and
 # packed bf16/f16x2 inline PTX. These fail closed by design on MACA.
-NV_FEATURE_EXAMPLES=(barrier clc cluster debug future_apis standalone_device_fn mcast_barrier_test tma_copy tma_multicast cp_async_small cp_async_zfill coop_groups_demo bf16x2_arith bf16x2_fma cvt_f16x2 cvt_packed packed_atomic_add dotprod inline_ptx counted_barrier dynamic_smem f16x2_arith generated_intrinsics generated_ldmatrix iket_trace interop_cubin_identity mma_mxf8f6f4 nvls_all_reduce policy_config printf scoped_atomic_load_store small_type_ffi_test toolchain_pairing_smoke wgmma_mma_bf16 float_rounding)
+NV_FEATURE_EXAMPLES=(barrier clc cluster debug future_apis standalone_device_fn mcast_barrier_test tma_copy tma_multicast cp_async_small cp_async_zfill coop_groups_demo bf16x2_arith bf16x2_fma cvt_f16x2 cvt_packed packed_atomic_add dotprod inline_ptx counted_barrier dynamic_smem f16x2_arith generated_intrinsics generated_ldmatrix iket_trace interop_cubin_identity mma_mxf8f6f4 nvls_all_reduce policy_config printf scoped_atomic_load_store small_type_ffi_test toolchain_pairing_smoke wgmma_mma_bf16 float_rounding ex2_approx_f16 sparse_mma_ordered_float)
 # Examples requiring HMM/ATS (device dereferences host pageable memory).
 # MetaX C500 does not support device-side access to host stack/heap memory.
 HMM_EXAMPLES=(abi_hmm host_closure)

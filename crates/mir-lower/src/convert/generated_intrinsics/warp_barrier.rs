@@ -26,6 +26,15 @@ impl MirToLlvmConversion for BarWarpSyncOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_bar_warp_sync(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_bar_warp_sync(ctx, rewriter, self.get_operation(), operands_info)
     }
 }

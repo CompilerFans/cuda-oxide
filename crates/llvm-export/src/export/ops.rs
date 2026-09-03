@@ -831,18 +831,18 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(array_size.get_type(self.ctx), output)?;
             write!(output, " {array_size_name}").unwrap();
         }
-        if alloca_as != 0 {
-            // MXMACA-style targets: the frame lives in a private address
-            // space; the alloca itself must carry the address-space suffix.
-            write!(output, ", addrspace({alloca_as})").unwrap();
-        }
         if let Some(align) = crate::ops::op_alignment(self.ctx, op.get_operation())
             .or_else(|| self.natural_alignment(elem_llvm_ty))
         {
-            writeln!(output, ", align {align}").unwrap();
-        } else {
-            writeln!(output).unwrap();
+            write!(output, ", align {align}").unwrap();
         }
+        if alloca_as != 0 {
+            // MXMACA-style targets: the frame lives in a private address
+            // space; the alloca carries `align N, addrspace(5)` — mxcc's
+            // parser rejects `addrspace` before `align`.
+            write!(output, ", addrspace({alloca_as})").unwrap();
+        }
+        writeln!(output).unwrap();
 
         if alloca_as != 0 {
             write!(output, "  {res_name} = addrspacecast ").unwrap();

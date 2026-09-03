@@ -26,6 +26,16 @@ impl MirToLlvmConversion for VoteSyncAllOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_vote(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_vote_all_sync",
+            );
+        }
+
         convert_vote(
             ctx,
             rewriter,
@@ -44,6 +54,16 @@ impl MirToLlvmConversion for VoteSyncAnyOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_vote(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_vote_any_sync",
+            );
+        }
+
         convert_vote(
             ctx,
             rewriter,

@@ -27,6 +27,15 @@ impl MirToLlvmConversion for ElectSyncOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_elect_sync_inline(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_elect_sync_typed(
                 ctx,

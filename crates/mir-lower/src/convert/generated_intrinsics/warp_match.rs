@@ -29,6 +29,18 @@ impl MirToLlvmConversion for MatchAllSyncI64Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            let value_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+            return crate::convert::intrinsics::warp::convert_match_all(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_match_all_sync_i64p",
+                value_ty.into(),
+            );
+        }
+
         let value_ty = IntegerType::get(ctx, 64, Signedness::Signless);
         convert_match_all(
             ctx,
@@ -89,6 +101,18 @@ impl MirToLlvmConversion for MatchAnySyncI32Op {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            let value_ty = IntegerType::get(ctx, 32, Signedness::Signless);
+            return crate::convert::intrinsics::warp::convert_match_any(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_match_any_sync_i32",
+                value_ty.into(),
+            );
+        }
+
         let value_ty = IntegerType::get(ctx, 32, Signedness::Signless);
         convert_match_any(
             ctx,

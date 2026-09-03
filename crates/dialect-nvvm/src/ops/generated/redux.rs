@@ -183,7 +183,7 @@ impl Verify for ReduxSyncFmaxAbsOp {
                 "nvvm.redux_sync_fmax_abs requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -234,7 +234,7 @@ impl Verify for ReduxSyncFmaxAbsNanOp {
                 "nvvm.redux_sync_fmax_abs_nan requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -285,7 +285,7 @@ impl Verify for ReduxSyncFmaxOp {
                 "nvvm.redux_sync_fmax requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -387,7 +387,7 @@ impl Verify for ReduxSyncFmaxNanOp {
                 "nvvm.redux_sync_fmax_nan requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -489,7 +489,7 @@ impl Verify for ReduxSyncFminAbsOp {
                 "nvvm.redux_sync_fmin_abs requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -540,7 +540,7 @@ impl Verify for ReduxSyncFminAbsNanOp {
                 "nvvm.redux_sync_fmin_abs_nan requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -591,7 +591,7 @@ impl Verify for ReduxSyncFminOp {
                 "nvvm.redux_sync_fmin requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {
@@ -693,7 +693,7 @@ impl Verify for ReduxSyncFminNanOp {
                 "nvvm.redux_sync_fmin_nan requires exactly two operands [member_mask, value] and one result"
             );
         }
-        if !is_i32(ctx, op.get_operand(0).get_type(ctx))
+        if !(is_i32(ctx, op.get_operand(0).get_type(ctx)) || is_i64(ctx, op.get_operand(0).get_type(ctx)))
             || !is_f32(ctx, op.get_operand(1).get_type(ctx))
             || !is_f32(ctx, op.get_result(0).get_type(ctx))
         {

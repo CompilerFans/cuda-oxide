@@ -48,7 +48,8 @@ impl Verify for ElectSyncOp {
                 "nvvm.elect_sync requires one i32 operand and results [i32, i1]"
             );
         }
-        if !is_integer_width(ctx, op.get_operand(0).get_type(ctx), 32)
+        if !(is_integer_width(ctx, op.get_operand(0).get_type(ctx), 32)
+            || is_integer_width(ctx, op.get_operand(0).get_type(ctx), 64))
             || !is_integer_width(ctx, op.get_result(0).get_type(ctx), 32)
             || !is_integer_width(ctx, op.get_result(1).get_type(ctx), 1)
         {

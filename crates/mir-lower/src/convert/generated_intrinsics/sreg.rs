@@ -41,8 +41,17 @@ impl MirToLlvmConversion for ReadPtxSregNtidXOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_blockdim_x(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -59,8 +68,17 @@ impl MirToLlvmConversion for ReadPtxSregNtidYOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_blockdim_y(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -77,8 +95,17 @@ impl MirToLlvmConversion for ReadPtxSregNtidZOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_blockdim_z(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -95,8 +122,18 @@ impl MirToLlvmConversion for ReadPtxSregCtaidXOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_ctaid_x",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -113,8 +150,18 @@ impl MirToLlvmConversion for ReadPtxSregCtaidYOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_ctaid_y",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -131,8 +178,18 @@ impl MirToLlvmConversion for ReadPtxSregCtaidZOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_ctaid_z",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -486,8 +543,18 @@ impl MirToLlvmConversion for ReadPtxSregEnvReg1Op {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_envreg1",
+            );
+        }
+
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
                 ctx,
@@ -513,8 +580,18 @@ impl MirToLlvmConversion for ReadPtxSregEnvReg2Op {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_envreg2",
+            );
+        }
+
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
                 ctx,
@@ -569,8 +646,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidXOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_griddim_x(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -587,8 +673,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidYOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_griddim_y(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -605,8 +700,17 @@ impl MirToLlvmConversion for ReadPtxSregNctaidZOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_griddim_z(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -654,8 +758,17 @@ impl MirToLlvmConversion for ReadPtxSregLaneIdOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_maca_lane_id(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -672,13 +785,13 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskEqOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        convert_zero_operand_scalar_direct(
+        crate::convert::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
-            32,
+            operands_info,
             "llvm_nvvm_read_ptx_sreg_lanemask_eq",
         )
     }
@@ -690,13 +803,13 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskGeOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        convert_zero_operand_scalar_direct(
+        crate::convert::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
-            32,
+            operands_info,
             "llvm_nvvm_read_ptx_sreg_lanemask_ge",
         )
     }
@@ -708,13 +821,13 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskGtOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        convert_zero_operand_scalar_direct(
+        crate::convert::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
-            32,
+            operands_info,
             "llvm_nvvm_read_ptx_sreg_lanemask_gt",
         )
     }
@@ -726,13 +839,13 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskLeOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        convert_zero_operand_scalar_direct(
+        crate::convert::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
-            32,
+            operands_info,
             "llvm_nvvm_read_ptx_sreg_lanemask_le",
         )
     }
@@ -744,13 +857,13 @@ impl MirToLlvmConversion for ReadPtxSregLanemaskLtOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        convert_zero_operand_scalar_direct(
+        crate::convert::intrinsics::basic::convert_lanemask(
             ctx,
             rewriter,
             self.get_operation(),
-            32,
+            operands_info,
             "llvm_nvvm_read_ptx_sreg_lanemask_lt",
         )
     }
@@ -762,8 +875,18 @@ impl MirToLlvmConversion for ReadPtxSregNsmIdOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_nsmid",
+            );
+        }
+
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
                 ctx,
@@ -789,8 +912,18 @@ impl MirToLlvmConversion for ReadPtxSregNwarpIdOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_nwarpid",
+            );
+        }
+
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_zero_operand_scalar_direct(
                 ctx,
@@ -847,8 +980,18 @@ impl MirToLlvmConversion for ReadPtxSregTidXOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_tid_x",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -865,8 +1008,18 @@ impl MirToLlvmConversion for ReadPtxSregTidYOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_tid_y",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,
@@ -883,8 +1036,18 @@ impl MirToLlvmConversion for ReadPtxSregTidZOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operands_info: &OperandsInfo,
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::basic::convert_sreg_read_i32(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_read_ptx_sreg_tid_z",
+            );
+        }
+
         convert_zero_operand_scalar_direct(
             ctx,
             rewriter,

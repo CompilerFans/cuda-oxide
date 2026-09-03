@@ -70,6 +70,21 @@ impl MirToLlvmConversion for TrapOp {
     ) -> Result<()> {
         let op = self.get_operation();
         let void_ty = llvm_types::VoidType::get(ctx);
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            // mxcc exposes `llvm.trap` natively; there is no MXMACA inline
+            // trap asm spelling.
+            let func_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
+            crate::convert::intrinsics::common::call_intrinsic(
+                ctx,
+                rewriter,
+                op,
+                "llvm_trap",
+                func_ty,
+                vec![],
+            )?;
+            rewriter.erase_operation(ctx, op);
+            return Ok(());
+        }
         inline_asm_sideeffect(ctx, rewriter, op, void_ty.into(), vec![], "trap;", "");
         rewriter.erase_operation(ctx, op);
         Ok(())

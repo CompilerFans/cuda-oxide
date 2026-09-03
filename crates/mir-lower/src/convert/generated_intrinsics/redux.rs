@@ -31,6 +31,16 @@ impl MirToLlvmConversion for ReduxSyncAddOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_add",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -49,6 +59,16 @@ impl MirToLlvmConversion for ReduxSyncAndOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_and",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -121,6 +141,16 @@ impl MirToLlvmConversion for ReduxSyncMaxOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_max",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -157,6 +187,16 @@ impl MirToLlvmConversion for ReduxSyncUmaxOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_umax",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -229,6 +269,16 @@ impl MirToLlvmConversion for ReduxSyncMinOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_min",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -265,6 +315,16 @@ impl MirToLlvmConversion for ReduxSyncUminOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_umin",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -283,6 +343,16 @@ impl MirToLlvmConversion for ReduxSyncOrOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_or",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,
@@ -301,6 +371,16 @@ impl MirToLlvmConversion for ReduxSyncXorOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_redux(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+                "llvm_nvvm_redux_sync_xor",
+            );
+        }
+
         convert_redux(
             ctx,
             rewriter,

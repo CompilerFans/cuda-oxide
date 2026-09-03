@@ -29,6 +29,15 @@ impl MirToLlvmConversion for ActiveMaskOp {
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
+        if crate::context::lowering_options(ctx).backend == crate::BackendTarget::Maca {
+            return crate::convert::intrinsics::warp::convert_active_mask(
+                ctx,
+                rewriter,
+                self.get_operation(),
+                operands_info,
+            );
+        }
+
         let op = self.get_operation();
         match context::lowering_options(ctx).intrinsic_backend {
             IntrinsicBackend::LlvmNvptx => convert_active_mask(ctx, rewriter, op, operands_info),

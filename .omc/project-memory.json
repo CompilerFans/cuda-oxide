@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build --workspace 2>&1 | grep -cE \"^error\"; echo \"WS: ${PIPESTATUS[0]}\"",
-    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p cargo-oxide 2>&1 | tail -1 && rtk cargo clippy -p cargo-oxide --all-targets 2>&1 | grep -cE \"^error\"; echo \"CLIPPY: ${PIPESTATUS[0]}\"; rtk grep -c \"cuda_oxide_target_maca\" crates/cargo-oxide/src/commands/codegen_env.rs",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build -p mir-lower 2>&1 | grep -E \"^error\" -A5 | head -14",
+    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p mir-lower --lib 2>&1 | tail -1; timeout 400 bash scripts/smoketest.sh -t maca integer_minmax 2>&1 | tail -4",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
