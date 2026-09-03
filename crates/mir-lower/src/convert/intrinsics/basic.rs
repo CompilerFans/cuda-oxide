@@ -18,7 +18,9 @@
 use crate::BackendTarget;
 use crate::context::lowering_options;
 use crate::convert::intrinsics::common::*;
-use llvm_export::attributes::{ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering};
+use llvm_export::attributes::{
+    ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering, SyncScopeAttr,
+};
 use llvm_export::op_interfaces::{
     BinArithOp, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
@@ -465,10 +467,13 @@ fn convert_membar(
     if opts.backend == BackendTarget::Maca {
         // MXMACA uses standard LLVM fence instructions with syncscopes
         let scope = match asm_template {
-            "membar.cta;" => Some("block".to_string()),
-            "membar.gl;" => Some("device".to_string()),
-            "membar.sys;" => None, // system scope = no syncscope
-            _ => None,
+            "membar.cta;" => {
+                SyncScopeAttr::NamedScope(pliron::builtin::attributes::StringAttr::new("block".to_string()))
+            }
+            "membar.gl;" => {
+                SyncScopeAttr::NamedScope(pliron::builtin::attributes::StringAttr::new("device".to_string()))
+            }
+            _ => SyncScopeAttr::System,
         };
         let ordering = LlvmAtomicOrdering::SeqCst;
         let fence_op = llvm::FenceOp::new(ctx, ordering, scope);
@@ -479,6 +484,7 @@ fn convert_membar(
         inline_asm_convergent(
             ctx,
             rewriter,
+            op,
             void_ty.into(),
             vec![],
             asm_template,

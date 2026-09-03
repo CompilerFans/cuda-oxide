@@ -23,7 +23,7 @@ impl DebugPolicy {
     /// This is the single alias table for the environment variable. The
     /// rustc codegen backend uses it to select the DWARF emission level,
     /// and cargo-oxide uses it to decide build policy (a full-debug build
-    /// disables MIR optimization so aggregate locals survive to DWARF).
+    /// disables the MIR passes that would erase aggregate and constant locals before DWARF).
     /// Keeping both behind one parser means every accepted spelling, such
     /// as `2` for `full`, drives the whole pipeline consistently.
     ///
@@ -124,6 +124,20 @@ impl FinalizationOptions {
     pub(crate) fn nvjitlink_ptx_options(&self) -> Vec<String> {
         let mut options = vec![format!("-arch={}", self.target.sm())];
         self.append_nvjitlink_codegen_options(&mut options);
+        options
+    }
+
+    /// Semantic options for standalone PTX assembly with `ptxas`.
+    pub(crate) fn ptxas_options(&self) -> Vec<String> {
+        let mut options = vec![
+            format!("--gpu-name={}", self.target.sm()),
+            format!("--fmad={}", self.allow_fma_contraction),
+        ];
+        match self.debug {
+            DebugPolicy::None => {}
+            DebugPolicy::LineTables => options.push("--generate-line-info".to_string()),
+            DebugPolicy::Full => options.push("--device-debug".to_string()),
+        }
         options
     }
 
@@ -266,6 +280,19 @@ mod tests {
             base.with_debug_policy(DebugPolicy::Full)
                 .nvjitlink_ltoir_options(FinalizerOutput::Cubin),
             ["-arch=sm_90a", "-lto", "-fma=0", "-g"]
+        );
+
+        let base = FinalizationOptions::new("sm_90a".parse().unwrap()).with_fma_contraction(false);
+        assert_eq!(base.ptxas_options(), ["--gpu-name=sm_90a", "--fmad=false"]);
+        assert_eq!(
+            base.clone()
+                .with_debug_policy(DebugPolicy::LineTables)
+                .ptxas_options(),
+            ["--gpu-name=sm_90a", "--fmad=false", "--generate-line-info"]
+        );
+        assert_eq!(
+            base.with_debug_policy(DebugPolicy::Full).ptxas_options(),
+            ["--gpu-name=sm_90a", "--fmad=false", "--device-debug"]
         );
     }
 

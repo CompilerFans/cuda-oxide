@@ -3,7 +3,10 @@
   <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/examples-compile.yml"><img alt="examples" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/examples-compile.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=examples"></a>
   <a href="https://discord.gg/ZUEr4AhH5C"><img alt="discord" src="https://img.shields.io/discord/1515530041767759993?style=flat-square&logo=discord&logoColor=white&label=discord&color=5865F2"></a>
   <br>
-  <img src="assets/logo.png" alt="cuda-oxide logo" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
+    <img src="assets/banner-light.png" alt="cuda-oxide: write CUDA (SIMT) kernels in pure Rust" width="640">
+  </picture>
 </p>
 
 # cuda-oxide
@@ -160,7 +163,7 @@ Inside the cuda-oxide repo, `cargo oxide` works out of the box via a workspace a
 For use outside the repo (your own projects), install it with the pinned nightly toolchain:
 
 ```bash
-cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
+cargo +nightly-2026-08-28 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
 ```
 
 On first run, `cargo-oxide` will automatically fetch and build the codegen backend.
@@ -179,8 +182,8 @@ nix run github:NVlabs/cuda-oxide#new my-project   # bootstrap a project
 ```bash
 # Toolchain installed automatically via rust-toolchain.toml
 # Manual install if needed:
-rustup toolchain install nightly-2026-04-03
-rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-03
+rustup toolchain install nightly-2026-08-28
+rustup component add rust-src rustc-dev rust-analyzer clippy rustfmt llvm-tools --toolchain nightly-2026-08-28
 ```
 
 #### CUDA
@@ -210,7 +213,7 @@ sudo ./llvm.sh 21
 llc-21 --version | grep nvptx
 ```
 
-The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-22` and `llc-21` on `PATH` (in that order).
+The pipeline prefers `llc` in Rust toolchain, and auto-discovers `llc-23`, `llc-22`, and `llc-21` on `PATH` (in that order).
 To pin a specific binary, set `CUDA_OXIDE_LLC=/usr/bin/llc-21`.
 
 > We emit TMA / tcgen05 / WGMMA intrinsics that `llc` from LLVM 20 and earlier can't handle.
@@ -296,7 +299,9 @@ cargo oxide run gemm_sol_final
 | `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`, ...)  |
 | `cuda-async`        | Async execution layer (`DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`) |
 | `libnvvm-sys`       | `dlopen` bindings to libNVVM (used by `cuda-host::ltoir`)                 |
+| `cuda-target-spec`  | Shared CUDA target parsing and recorded LLVM PTX-floor policy             |
 | `nvjitlink-sys`     | `dlopen` bindings to nvJitLink (used by `cuda-host::ltoir`)               |
+| `ptx-parse`         | Lossless structural views over PTX source text                            |
 
 ### Compiler Crates
 
@@ -310,6 +315,7 @@ cargo oxide run gemm_sol_final
 | `iket-lower`         | `dialect-iket` profiles + instrumentation lowering    |
 | `llvm-export`        | pliron-llvm shim + textual `.ll` exporter             |
 | `dialect-nvvm`       | pliron dialect modelling NVVM intrinsics              |
+| `dialect-ptx`        | pliron dialect modelling structured PTX               |
 | `mir-transforms`     | Optimization passes over the MIR dialect (loop unroll, ...) |
 | `nvvm-transforms`    | Target-aware LLVM dialect legalization for NVVM      |
 | `cuda-oxide-codegen` | Experimental rustc-independent PTX backend           |
@@ -320,10 +326,11 @@ cargo oxide run gemm_sol_final
 |---------------------------|----------------------------------------------------------------|
 | `cargo-oxide`             | Cargo subcommand (`cargo oxide run`, etc.)                     |
 | `cuda-intrinsics-gen`     | Extractor and deterministic source generator for the intrinsics |
-| `cuda-artifact-finalizer` | Driver-independent NVVM IR and LTOIR finalization              |
+| `cuda-artifact-finalizer` | Driver-independent NVVM IR, LTOIR, and PTX finalization         |
 | `oxide-artifacts`         | Architecture-neutral embedded device artifact metadata         |
 | `reserved-oxide-symbols`  | Workspace-private `cuda_oxide_*` symbol-name contract          |
 | `fuzzer`                  | Differential codegen fuzzer support (rustlantis adapter)       |
+| `ptx-schedule`            | PTX schedule-perturbation fuzzing (nanosleep injection campaigns) |
 
 ### Documentation
 

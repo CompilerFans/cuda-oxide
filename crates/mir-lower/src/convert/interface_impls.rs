@@ -29,20 +29,24 @@ use dialect_mir::ops::{
     MirBitXorOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp, MirCheckedSubOp, MirCmpOp,
     MirCondBranchOp, MirConstantOp, MirConstructArrayOp, MirConstructDisjointSliceOp,
     MirConstructEnumOp, MirConstructSliceOp, MirConstructStructOp, MirConstructTupleOp,
-    MirDbgValueOp, MirDivOp, MirEnumPayloadOp, MirEqOp, MirExtractArrayElementOp,
-    MirExtractFieldOp, MirFieldAddrOp, MirFloatConstantOp, MirGeOp, MirGetDiscriminantOp,
-    MirGotoOp, MirGtOp, MirInsertFieldOp, MirLeOp, MirLoadOp, MirLtOp, MirMemcpyOp, MirMemmoveOp,
-    MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp, MirRemOp, MirReturnOp,
-    MirSetDiscriminantOp, MirShlOp, MirShrOp, MirStorageDeadOp, MirStorageLiveOp, MirStoreOp,
-    MirSubOp, MirUndefOp, MirUnreachableOp, MirUnrollHintOp,
+    MirDbgValueListOp, MirDbgValueOp, MirDivOp, MirEnumPayloadOp, MirEqOp,
+    MirExtractArrayElementOp, MirExtractFieldOp, MirFieldAddrOp, MirFloatConstantOp, MirGeOp,
+    MirGetDiscriminantOp, MirGotoOp, MirGtOp, MirInsertFieldOp, MirLeOp, MirLoadOp, MirLtOp,
+    MirMemcpyOp, MirMemmoveOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp,
+    MirRemOp, MirReturnOp, MirSetDiscriminantOp, MirShlOp, MirShrOp, MirStorageDeadOp,
+    MirStorageLiveOp, MirStoreOp, MirSubOp, MirUndefOp, MirUnreachableOp, MirUnrollHintOp,
 };
 use dialect_nvvm::ops::{
     AssertFailOp, CvtaGenericToSharedOffsetOp, InlinePtxOp, MmaM16N16K16F32Bf16Op,
     MmaM16N16K16F32F16Op, MmaM16N16K16I32I8Op, NvvmAtomicCmpxchgOp, NvvmAtomicFenceOp,
     NvvmAtomicLoadOp, NvvmAtomicRmwOp, NvvmAtomicStoreOp, ReadPtxSregClusterIdxOp,
     ReadPtxSregNclusterIdOp, VprintfOp, WgmmaMakeSmemDescOp, WgmmaMmaGroupM64N64K16F32Bf16Op,
-    WgmmaMmaGroupValuesM64N64K16F32Bf16Op, WgmmaMmaLoopValuesM64N64K16F32Bf16Op,
-    WgmmaMmaM64N64K16F32Bf16Op, WgmmaMmaPipelineValuesM64N64K16F32Bf16Op,
+    WgmmaMmaGroupValuesM64N64K8F32Tf32Op, WgmmaMmaGroupValuesM64N64K16F32Bf16Op,
+    WgmmaMmaGroupValuesM64N64K16F32F16Op, WgmmaMmaGroupValuesM64N128K16F32Bf16Op,
+    WgmmaMmaLoopPipelineValuesM64N64K16F32Bf16Op, WgmmaMmaLoopValuesM64N64K16F32Bf16Op,
+    WgmmaMmaLoopValuesM64N64K16F32F16Op, WgmmaMmaM64N64K8F32Tf32Op, WgmmaMmaM64N64K16F32Bf16Op,
+    WgmmaMmaM64N64K16F32F16Op, WgmmaMmaM64N128K16F32Bf16Op,
+    WgmmaMmaPipelineValuesM64N64K16F32Bf16Op,
 };
 
 // ---- Arithmetic ops --------------------------------------------------------
@@ -450,6 +454,23 @@ impl MirToLlvmConversion for MirDbgValueOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::ops::memory::convert_dbg_value(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirDbgValueListOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::memory::convert_dbg_value_list(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
     }
 }
 
@@ -1055,6 +1076,42 @@ impl MirToLlvmConversion for WgmmaMmaM64N64K16F32Bf16Op {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaM64N64K16F32F16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaM64N128K16F32Bf16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaM64N64K8F32Tf32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for WgmmaMmaGroupM64N64K16F32Bf16Op {
     fn convert(
         &self,
@@ -1089,6 +1146,57 @@ impl MirToLlvmConversion for WgmmaMmaGroupValuesM64N64K16F32Bf16Op {
 }
 
 #[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaGroupValuesM64N64K16F32F16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_group_values_f16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaGroupValuesM64N128K16F32Bf16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_group_values_m64n128_bf16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaGroupValuesM64N64K8F32Tf32Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_group_values_tf32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
 impl MirToLlvmConversion for WgmmaMmaLoopValuesM64N64K16F32Bf16Op {
     fn convert(
         &self,
@@ -1097,6 +1205,40 @@ impl MirToLlvmConversion for WgmmaMmaLoopValuesM64N64K16F32Bf16Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::wgmma::convert_mma_loop_values(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaLoopValuesM64N64K16F32F16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_loop_values_f16(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for WgmmaMmaLoopPipelineValuesM64N64K16F32Bf16Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::wgmma::convert_mma_loop_pipeline_values(
             ctx,
             rewriter,
             self.get_operation(),

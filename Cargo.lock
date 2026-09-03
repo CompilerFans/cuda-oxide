@@ -210,6 +210,8 @@ dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
  "oxide-artifacts",
+ "ptx-parse",
+ "ptx-schedule",
  "reserved-oxide-symbols",
  "serde_json",
  "sha2",
@@ -353,6 +355,8 @@ version = "0.2.1"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
@@ -408,6 +412,7 @@ dependencies = [
  "cuda-macros",
  "half",
  "oxide-artifacts",
+ "ptx-parse",
  "sha2",
  "thiserror",
 ]
@@ -421,6 +426,8 @@ name = "cuda-intrinsics-gen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cuda-target-spec",
+ "ptx-parse",
  "serde",
  "serde_json",
  "sha2",
@@ -445,6 +452,7 @@ dependencies = [
 name = "cuda-oxide-codegen"
 version = "0.1.0"
 dependencies = [
+ "cuda-target-spec",
  "dialect-iket",
  "dialect-mir",
  "dialect-nvvm",
@@ -455,10 +463,15 @@ dependencies = [
  "mir-transforms",
  "nvvm-transforms",
  "pliron",
+ "ptx-parse",
  "rustc-demangle",
  "tempfile",
  "thiserror",
 ]
+
+[[package]]
+name = "cuda-target-spec"
+version = "0.1.0"
 
 [[package]]
 name = "dialect-iket"
@@ -495,6 +508,15 @@ dependencies = [
  "pliron",
  "pliron-derive",
  "thiserror",
+]
+
+[[package]]
+name = "dialect-ptx"
+version = "0.1.0"
+dependencies = [
+ "pliron",
+ "pliron-derive",
+ "ptx-parse",
 ]
 
 [[package]]
@@ -568,6 +590,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures"
@@ -705,9 +733,7 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -715,6 +741,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -800,6 +831,7 @@ dependencies = [
 name = "libnvvm-sys"
 version = "0.2.1"
 dependencies = [
+ "cuda-target-spec",
  "libloading",
  "thiserror",
 ]
@@ -994,15 +1026,16 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pliron"
-version = "0.16.0"
-source = "git+https://github.com/pliron-org/pliron?rev=0d3f25df6d0e76b6c6f23d6e17172142b50c715c#0d3f25df6d0e76b6c6f23d6e17172142b50c715c"
+version = "0.17.0"
+source = "git+https://github.com/pliron-org/pliron?rev=823d9d8087652cd3f2d006a7ea534df921a23564#823d9d8087652cd3f2d006a7ea534df921a23564"
 dependencies = [
  "awint",
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "hi_sparse_bitset",
+ "indexmap",
  "inventory",
  "linkme",
  "log",
@@ -1012,6 +1045,7 @@ dependencies = [
  "rustc-hash",
  "rustc_apfloat",
  "slotmap",
+ "smallvec",
  "spin",
  "thiserror",
  "utf8-chars",
@@ -1019,11 +1053,12 @@ dependencies = [
 
 [[package]]
 name = "pliron-derive"
-version = "0.16.0"
-source = "git+https://github.com/pliron-org/pliron?rev=0d3f25df6d0e76b6c6f23d6e17172142b50c715c#0d3f25df6d0e76b6c6f23d6e17172142b50c715c"
+version = "0.17.0"
+source = "git+https://github.com/pliron-org/pliron?rev=823d9d8087652cd3f2d006a7ea534df921a23564#823d9d8087652cd3f2d006a7ea534df921a23564"
 dependencies = [
  "combine",
  "convert_case",
+ "indexmap",
  "proc-macro2",
  "quote",
  "rustc-hash",
@@ -1032,8 +1067,8 @@ dependencies = [
 
 [[package]]
 name = "pliron-llvm"
-version = "0.16.0"
-source = "git+https://github.com/pliron-org/pliron?rev=0d3f25df6d0e76b6c6f23d6e17172142b50c715c#0d3f25df6d0e76b6c6f23d6e17172142b50c715c"
+version = "0.17.0"
+source = "git+https://github.com/pliron-org/pliron?rev=823d9d8087652cd3f2d006a7ea534df921a23564#823d9d8087652cd3f2d006a7ea534df921a23564"
 dependencies = [
  "bitflags",
  "log",
@@ -1058,6 +1093,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "ptx-parse"
+version = "0.1.0"
+
+[[package]]
+name = "ptx-schedule"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dialect-ptx",
+ "oxide-artifacts",
+ "ptx-parse",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

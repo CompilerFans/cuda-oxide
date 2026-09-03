@@ -34,7 +34,9 @@
 use crate::BackendTarget;
 use crate::context::lowering_options;
 use crate::convert::intrinsics::common::*;
-use llvm_export::attributes::{ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering};
+use llvm_export::attributes::{
+    ICmpPredicateAttr, IntegerOverflowFlagsAttr, LlvmAtomicOrdering, SyncScopeAttr,
+};
 use llvm_export::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
@@ -48,6 +50,7 @@ use pliron::irbuild::rewriter::Rewriter;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
+use pliron::r#type::Typed;
 
 /// Convert i32 shuffle operation to LLVM intrinsic call.
 ///
@@ -352,6 +355,7 @@ pub(crate) fn convert_shuffle_i64(
     let asm_op = inline_asm_convergent(
         ctx,
         rewriter,
+        op,
         i64_ty.into(),
         vec![val, lane_or_delta, mask],
         &asm_template,
@@ -576,7 +580,8 @@ fn emit_maca_match_any(
 ///
 /// Op operand layout is `[mask, value]` (matching the other `*_sync`
 /// collectives), but the LLVM intrinsic signature is `(src, membermask)`, so
-/// we forward the operands flipped as `[value, mask]`. Result is i32.
+/// we forward the operands flipped as `[value, mask]`. The value and result
+/// types are carried by the dialect record.
 pub(crate) fn convert_redux(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -602,12 +607,9 @@ pub(crate) fn convert_redux(
     rewriter.insert_operation(ctx, mask_i32.get_operation());
     let mask_i32 = mask_i32.get_operation().deref(ctx).get_result(0);
 
-    let func_ty = llvm_types::FuncType::get(
-        ctx,
-        i32_ty.into(),
-        vec![i32_ty.into(), i32_ty.into()],
-        false,
-    );
+    let value_ty = value.get_type(ctx);
+    let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let func_ty = llvm_types::FuncType::get(ctx, result_ty, vec![value_ty, i32_ty.into()], false);
 
     // LLVM intrinsic wants (src, membermask): flip to [value, mask].
     let call_op = call_intrinsic(
@@ -852,6 +854,7 @@ pub(crate) fn convert_active_mask(
         inline_asm_convergent(
             ctx,
             rewriter,
+            op,
             i32_ty.into(),
             vec![],
             "activemask.b32 $0;",
@@ -886,13 +889,21 @@ pub(crate) fn convert_bar_warp_sync(
             return pliron::input_err_noloc!("bar.warp.sync requires 1 operand [mask]");
         }
         let release =
-            llvm::FenceOp::new(ctx, LlvmAtomicOrdering::Release, Some("warp".to_string()));
+            llvm::FenceOp::new(
+                ctx,
+                LlvmAtomicOrdering::Release,
+                SyncScopeAttr::NamedScope(pliron::builtin::attributes::StringAttr::new("warp".to_string())),
+            );
         rewriter.insert_operation(ctx, release.get_operation());
         let void_ty = llvm_types::VoidType::get(ctx);
         let func_ty = llvm_types::FuncType::get(ctx, void_ty.into(), vec![], false);
         call_intrinsic(ctx, rewriter, op, "llvm_mxc_barrier_warp", func_ty, vec![])?;
         let acquire =
-            llvm::FenceOp::new(ctx, LlvmAtomicOrdering::Acquire, Some("warp".to_string()));
+            llvm::FenceOp::new(
+                ctx,
+                LlvmAtomicOrdering::Acquire,
+                SyncScopeAttr::NamedScope(pliron::builtin::attributes::StringAttr::new("warp".to_string())),
+            );
         rewriter.insert_operation(ctx, acquire.get_operation());
         rewriter.erase_operation(ctx, op);
         return Ok(());
@@ -962,7 +973,13 @@ pub(crate) fn convert_match_all(
     rewriter.insert_operation(ctx, mask_i32.get_operation());
     let mask_i32 = mask_i32.get_operation().deref(ctx).get_result(0);
 
-    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i1_ty.into()]);
+    let struct_ty = llvm_types::StructType::get_unnamed(
+        ctx,
+        (
+            vec![i32_ty.into(), i1_ty.into()],
+            llvm_types::StructLayout::Unpacked,
+        ),
+    );
     let func_ty =
         llvm_types::FuncType::get(ctx, struct_ty.into(), vec![i32_ty.into(), value_ty], false);
 
@@ -1004,7 +1021,13 @@ pub(crate) fn convert_elect_sync_typed(
         return pliron::input_err_noloc!("elect.sync requires 1 operand [mask]");
     }
 
-    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i1_ty.into()]);
+    let struct_ty = llvm_types::StructType::get_unnamed(
+        ctx,
+        (
+            vec![i32_ty.into(), i1_ty.into()],
+            llvm_types::StructLayout::Unpacked,
+        ),
+    );
     let func_ty = llvm_types::FuncType::get(ctx, struct_ty.into(), vec![i32_ty.into()], false);
     let call = call_intrinsic(
         ctx,
@@ -1059,10 +1082,17 @@ pub(crate) fn convert_elect_sync_inline(
     // Two register outputs: $0 = leader lane id, $1 = predicate materialized as
     // 0/1; $2 = membermask input. The `.pred p` is scoped to the asm block.
     let asm_template = "{ .reg .pred p; elect.sync $0|p, $2; selp.b32 $1, 1, 0, p; }";
-    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![i32_ty.into(), i32_ty.into()]);
+    let struct_ty = llvm_types::StructType::get_unnamed(
+        ctx,
+        (
+            vec![i32_ty.into(), i32_ty.into()],
+            llvm_types::StructLayout::Unpacked,
+        ),
+    );
     let asm_op = inline_asm_convergent(
         ctx,
         rewriter,
+        op,
         struct_ty.into(),
         vec![mask],
         asm_template,

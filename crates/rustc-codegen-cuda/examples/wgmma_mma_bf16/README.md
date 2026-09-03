@@ -7,13 +7,13 @@ MIR import, WGMMA region selection, LLVM lowering, and PTX generation.
 
 ## What this tests
 
-The crate contains two compile-only kernels.
+The crate contains five compile-only kernels.
 
-### Full drain
+### m64n64 full drain
 
 ```text
 wgmma_fence
-mma acc0
+mma m64n64 acc0
 commit_group
 wait_group<0>
 ```
@@ -22,7 +22,32 @@ For the canonical `[[f32; 8]; 4]` accumulator, the compiler selects the
 value-threaded path and exposes the 32 accumulator values to LLVM only outside
 the complete asynchronous WGMMA lifetime.
 
-### Partial wait
+### Repeated reborrows
+
+```text
+wgmma_fence
+mma &mut acc
+mma &mut acc
+commit_group
+wait_group<0>
+```
+
+Each call creates a distinct Rust `&mut` SSA value. The compiler follows both
+reborrows back to the same accumulator storage when checking the WGMMA region.
+
+### Counted-loop reborrow
+
+```text
+wgmma_fence
+repeat 4 times: mma &mut acc; advance descriptors
+commit_group
+wait_group<0>
+```
+
+The reborrow is created inside the loop. The compiler follows it back to the
+pre-loop accumulator storage before hoisting the value-threaded adapter.
+
+### m64n64 partial wait
 
 ```text
 wgmma_fence
@@ -45,14 +70,29 @@ accumulator is observed.
 The example deliberately stops after two groups. Round-robin slot reuse and
 the associated legality checks are covered by `mir-lower` integration tests.
 
+### m64n128 full drain
+
+```text
+wgmma_fence
+mma m64n128 wide_acc
+commit_group
+wait_group<0>
+```
+
+The canonical `[[f32; 8]; 8]` accumulator carries 64 `f32` values per thread.
+The compiler keeps all 64 values tied through one convergent inline-PTX scope
+and exposes them only after the final full drain. Counted loops and partial
+waits remain intentionally unsupported for this shape.
+
 ## Usage
 
 ```bash
 cargo oxide build wgmma_mma_bf16 --arch sm_90a
 ```
 
-The command must complete successfully and generate PTX containing the BF16
-WGMMA instruction and the partial wait.
+The command must complete successfully and generate PTX containing both BF16
+`m64n64k16` and `m64n128k16` WGMMA instructions, a counted-loop carrier, and
+the m64n64 partial wait.
 
 To run the repository smoketest:
 
@@ -63,16 +103,16 @@ scripts/smoketest.sh -x -v '^wgmma_mma_bf16$'
 ## Expected smoketest marker
 
 ```text
-SUCCESS: BF16 WGMMA value-threaded and partial-wait lowering compiled.
+SUCCESS: BF16 WGMMA value-threaded, reborrow, counted-loop, and partial-wait lowering compiled.
 ```
 
 ## Important
 
 This is a compile-only example.
 
-Both kernels use zero-valued WGMMA descriptors so compilation and PTX
-generation can be tested without allocating Hopper shared-memory tiles. The
-kernels must not be launched with those descriptors.
+All kernels use zero-valued WGMMA descriptors so compilation and PTX generation
+can be tested without allocating Hopper shared-memory tiles. The kernels must
+not be launched with those descriptors.
 
 Functional execution requires an `sm_90a` Hopper GPU, valid shared-memory
 descriptors, and warpgroup-uniform participation.
@@ -87,10 +127,14 @@ conservative shapes:
 - straight-line static partial-wait pipelines using `N + 1` independent
   accumulator slots for `wait_group<N>`.
 
+BF16 `m64n128k16.f32.bf16.bf16` supports canonical linear full-drain regions
+only, using a 64-value `[[f32; 8]; 8]` accumulator carrier.
+
 Every accepted asynchronous lifetime ends in `wait_group<0>` before
 accumulator values escape.
 
-Unsupported pointer shapes retain the deferred pointer-form fallback where the
-full-drain sequence can still be proven safe. Dynamic waits, unsupported
-control flow, malformed pipeline schedules, and the F16/TF32 compatibility
-entry points fail closed.
+Unsupported m64n64 BF16 pointer shapes retain the deferred pointer-form fallback
+where the full-drain sequence can still be proven safe. m64n128 has no pointer
+fallback. Dynamic waits, unsupported control flow, malformed pipeline schedules,
+m64n128 non-linear shapes, and unsupported data-type/shape combinations fail
+closed.

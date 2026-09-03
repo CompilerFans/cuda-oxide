@@ -41,6 +41,33 @@ pub enum MirCastKindAttr {
     Subtype,
 }
 
+/// The Rust semantic boundary that authorizes a pointer-kind transition.
+///
+/// Ordinary MIR operations may preserve a pointer kind or deliberately erase
+/// it, but they may not recover or change a concrete Rust pointer category.
+/// A `mir.cast` that does establish a new concrete category must carry one of
+/// these authorities so the provenance-changing boundary remains explicit and
+/// auditable in the dialect.
+#[pliron_attr(name = "mir.pointer_kind_authority", format, verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub enum MirPointerKindAuthorityAttr {
+    /// A rustc `Rvalue::Ref` (`&place` / `&mut place`).
+    Reborrow,
+    /// A rustc `Rvalue::AddressOf` (`&raw const` / `&raw mut`).
+    RawAddress,
+    /// A pointer-producing cast or coercion explicitly present in rustc MIR.
+    RustCast,
+    /// Materialization of a pointer-valued Rust constant, static, or promoted
+    /// allocation at the exact type declared by rustc.
+    StaticAddress,
+    /// Adaptation to an exact Rust function or intrinsic ABI type.
+    AbiBoundary,
+    /// A user-authored inline-assembly output assigned the exact destination
+    /// type supplied by rustc MIR. This records the unsafe source boundary;
+    /// it does not independently prove that the assembly produced valid bits.
+    InlineAsm,
+}
+
 /// Boolean attribute for reference mutability.
 ///
 /// Replaces the overloaded `IntegerAttr` pattern with a self-documenting
@@ -77,6 +104,20 @@ pub struct VariantIndexAttr(pub u32);
 #[pliron_attr(name = "mir.unroll", format = "$0", verifier = "succ")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct UnrollAttr(pub u32);
+
+/// Marks an aggregate that exists only to adapt one compiler-owned
+/// multi-result operation to a Rust aggregate return ABI.
+///
+/// The marker is intentionally attached by the MIR importer, not inferred by
+/// an optimisation pass. That lets the forwarding pass distinguish this
+/// compiler-created boundary from an ordinary user aggregate and fail closed
+/// whenever the exact producer/store/projection shape is not preserved.
+#[pliron_attr(name = "mir.compiler_result_bundle", format = "$0", verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub struct CompilerResultBundleAttr(pub bool);
+
+/// Operation attribute key carrying [`CompilerResultBundleAttr`].
+pub const COMPILER_RESULT_BUNDLE_ATTR_KEY: &str = "compiler_result_bundle";
 
 /// IEEE 754 binary16 floating-point attribute for Rust MIR `f16` constants.
 #[pliron_attr(name = "mir.fp16_attr", format = "$0", verifier = "succ")]
@@ -139,9 +180,11 @@ impl FloatAttr for MirFP16Attr {
 
 pub fn register(ctx: &mut Context) {
     MirCastKindAttr::register(ctx);
+    MirPointerKindAuthorityAttr::register(ctx);
     MutabilityAttr::register(ctx);
     FieldIndexAttr::register(ctx);
     VariantIndexAttr::register(ctx);
     UnrollAttr::register(ctx);
+    CompilerResultBundleAttr::register(ctx);
     MirFP16Attr::register(ctx);
 }

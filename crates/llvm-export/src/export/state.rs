@@ -10,10 +10,14 @@ use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::ops::{DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap};
+use crate::ops::{
+    DebugGlobalVariableInfo, DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap,
+};
 
 use super::{
-    config::{DebugKind, KernelCallingConvention, NvvmIrDialect},
+    config::{
+        DebugKind, FunctionLocalStaticPlacement, KernelCallingConvention, NvvmIrDialect,
+    },
     externs::DeviceExternDecl,
 };
 
@@ -60,6 +64,17 @@ pub(super) struct KernelInfo {
     pub(super) name: String,
 }
 
+/// One direct aggregate argument/return whose source ABI alignment exceeds
+/// the natural alignment representable by its LLVM type.
+///
+/// NVVM's `align` function property numbers the return as position 0 and
+/// arguments from 1.
+pub(super) struct FunctionAbiAlignment {
+    pub(super) name: String,
+    pub(super) position: u16,
+    pub(super) alignment: u16,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct GlobalSymbolInfo {
     pub(super) value_type: TypeHandle,
@@ -86,6 +101,9 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) all_kernels: Vec<KernelInfo>,
     /// Calling convention printed on kernel declarations and definitions.
     pub(super) kernel_calling_convention: KernelCallingConvention,
+    /// Direct aggregate argument/return alignments that LLVM structural types
+    /// cannot encode and NVVM therefore requires as `"align"` annotations.
+    pub(super) function_abi_alignments: Vec<FunctionAbiAlignment>,
     /// Track device function names for @llvm.used (standalone device fn compilation)
     pub(super) device_functions: Vec<String>,
     /// Defined globals retain external linkage because CUDA host code can
@@ -123,6 +141,8 @@ pub(super) struct ModuleExportState<'a> {
     next_metadata_id: usize,
     /// Which debug metadata tier this export should emit.
     pub(super) debug_kind: DebugKind,
+    /// Where function-local statics are retained (per the consuming LLVM).
+    pub(super) debug_function_local_static_placement: FunctionLocalStaticPlacement,
     /// NVVM textual dialect, or `None` for the ordinary PTX/llc path.
     pub(super) nvvm_ir_dialect: Option<NvvmIrDialect>,
     /// Address space in which `alloca` results are materialized (0 = generic).
@@ -137,6 +157,12 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_subroutine_type: Option<usize>,
     /// `DISubprogram` file paths, used to create file-correct nested scopes.
     pub(super) debug_subprogram_files: FxHashMap<usize, PathBuf>,
+    /// The one real `DISubprogram` allocated for each exported function name.
+    /// AS3 globals are emitted before functions, so their owners are reserved
+    /// in a module prepass and reused when the definition is written.
+    pub(super) debug_function_subprograms: FxHashMap<String, usize>,
+    /// Source scope for functions that own function-local shared statics.
+    pub(super) debug_shared_function_scopes: FxHashMap<String, DebugSharedFunctionScope>,
     /// Fallback line/column for calls that LLVM requires to have a location.
     pub(super) debug_subprogram_fallbacks: FxHashMap<usize, (i32, i32)>,
     /// `DILexicalBlockFile` nodes keyed by `(parent scope, file path)`.
@@ -153,6 +179,20 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_locations: FxHashMap<(usize, i32, i32, Option<usize>), usize>,
     /// `DIType` nodes keyed by the simple debug type they describe.
     pub(super) debug_types: FxHashMap<DebugLocalTypeKind, usize>,
+    /// Uniqued nested `DINamespace` nodes, keyed by parent scope and segment.
+    pub(super) debug_namespaces: FxHashMap<(Option<usize>, String), usize>,
+    /// Global expressions already created for a physical linkage name.
+    /// A repeated linkage must carry the exact same source identity.
+    pub(super) debug_global_variables:
+        FxHashMap<String, (DebugGlobalVariableInfo, u32, Option<String>, usize)>,
+    /// Module globals retained by the compile unit.
+    pub(super) debug_global_expressions: Vec<usize>,
+    /// Function-local static expressions retained by their owning
+    /// `DISubprogram` (keyed by its metadata id), under the
+    /// [`FunctionLocalStaticPlacement::SubprogramRetainedNodes`] placement.
+    pub(super) debug_subprogram_retained_globals: FxHashMap<usize, Vec<usize>>,
+    /// Whether the compile unit's immutable globals tuple has been finalized.
+    pub(super) debug_globals_finalized: bool,
     /// `DILocalVariable` nodes keyed by scope, source line, and local identity.
     pub(super) debug_local_variables:
         FxHashMap<(usize, PathBuf, i32, DebugLocalVariableInfo), usize>,
@@ -170,6 +210,12 @@ pub(super) struct ResolvedDebugScope {
     pub(super) inlined_at: Option<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DebugSharedFunctionScope {
+    pub(super) namespace: Vec<String>,
+    pub(super) name: String,
+}
+
 impl<'a> ModuleExportState<'a> {
     pub(super) fn new(
         ctx: &'a pliron::context::Context,
@@ -177,6 +223,7 @@ impl<'a> ModuleExportState<'a> {
         debug_kind: DebugKind,
         nvvm_ir_dialect: Option<NvvmIrDialect>,
         alloca_address_space: u32,
+        debug_function_local_static_placement: FunctionLocalStaticPlacement,
     ) -> Self {
         Self {
             ctx,
@@ -185,6 +232,7 @@ impl<'a> ModuleExportState<'a> {
             launch_bounds_kernels: Vec::new(),
             all_kernels: Vec::new(),
             kernel_calling_convention,
+            function_abi_alignments: Vec::new(),
             device_functions: Vec::new(),
             public_globals: Vec::new(),
             retained_globals: Vec::new(),
@@ -196,12 +244,15 @@ impl<'a> ModuleExportState<'a> {
             global_sources: FxHashMap::default(),
             next_metadata_id: 0,
             debug_kind,
+            debug_function_local_static_placement,
             nvvm_ir_dialect,
             alloca_address_space,
             debug_compile_unit: None,
             debug_files: FxHashMap::default(),
             debug_subroutine_type: None,
             debug_subprogram_files: FxHashMap::default(),
+            debug_function_subprograms: FxHashMap::default(),
+            debug_shared_function_scopes: FxHashMap::default(),
             debug_subprogram_fallbacks: FxHashMap::default(),
             debug_file_scopes: FxHashMap::default(),
             debug_lexical_blocks: FxHashMap::default(),
@@ -210,6 +261,11 @@ impl<'a> ModuleExportState<'a> {
             debug_resolved_source_scopes: FxHashMap::default(),
             debug_locations: FxHashMap::default(),
             debug_types: FxHashMap::default(),
+            debug_namespaces: FxHashMap::default(),
+            debug_global_variables: FxHashMap::default(),
+            debug_global_expressions: Vec::new(),
+            debug_subprogram_retained_globals: FxHashMap::default(),
+            debug_globals_finalized: false,
             debug_local_variables: FxHashMap::default(),
             debug_nodes: Vec::new(),
             debug_declare_used: false,

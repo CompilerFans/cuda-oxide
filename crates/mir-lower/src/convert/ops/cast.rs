@@ -39,7 +39,8 @@
 //! | ptr → struct (thin→fat, no niche)              | `insertvalue` into undef                    |
 //! | ptr → integer                                  | genericize named-space pointers, `ptrtoint` |
 //! | integer → ptr                                  | `inttoptr`                                  |
-//! | struct → struct (transmute)                    | `alloca` + `store` + `load`                 |
+//! | slice-shaped struct → slice-shaped struct     | fieldwise SSA; `addrspacecast` data as needed |
+//! | other struct → struct                          | `alloca` + `store` + `load`                 |
 //! | ptr → ptr (diff addrspace)                     | `addrspacecast`                             |
 //! | struct → integer, equal size                   | `alloca` + `store` + `load`                 |
 //! | struct → integer, mismatched size              | cuda-oxide error (see issue #21)            |
@@ -58,7 +59,7 @@ use crate::convert::types::{
 use crate::helpers;
 use dialect_mir::attributes::MirCastKindAttr;
 use dialect_mir::ops::MirCastOp;
-use dialect_mir::types::{MirArrayType, MirPtrType};
+use dialect_mir::types::{MirArrayType, MirPtrType, address_space};
 use llvm_export::op_interfaces::{
     BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
 };
@@ -113,6 +114,24 @@ pub fn convert(
     let llvm_ty = convert_type(ctx, mir_result_ty).map_err(|e| pliron::input_error!(loc, "{e}"))?;
     let val_ty = val.get_type(ctx);
 
+    // Rust pointer/reference kind is a MIR semantic distinction, not an LLVM
+    // representation distinction. With opaque LLVM pointers (and the canonical
+    // `{ptr, i64}` slice layout), changing only pointer kind can therefore
+    // produce identical lowered source/destination types. Forward the value
+    // directly instead of manufacturing a bitcast or a struct memory
+    // round-trip. Address-space-changing casts still take the normal path.
+    if val_ty == llvm_ty
+        && matches!(
+            &cast_kind,
+            MirCastKindAttr::PtrToPtr
+                | MirCastKindAttr::PointerCoercionMutToConst
+                | MirCastKindAttr::Subtype
+        )
+    {
+        rewriter.replace_operation_with_values(ctx, op, vec![val]);
+        return Ok(());
+    }
+
     let llvm_op = match &cast_kind {
         MirCastKindAttr::Transmute => emit_transmute(ctx, rewriter, val, val_ty, llvm_ty)?,
 
@@ -133,7 +152,7 @@ pub fn convert(
         }
 
         MirCastKindAttr::IntToFloat => {
-            convert_int_to_float(ctx, rewriter, val, llvm_ty, mir_opd_ty)?
+            convert_int_to_float(ctx, rewriter, op, val, val_ty, llvm_ty, mir_opd_ty)?
         }
 
         MirCastKindAttr::FloatToInt => {
@@ -216,7 +235,9 @@ fn convert_int_to_int(
 fn convert_int_to_float(
     ctx: &mut Context,
     _rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
     val: pliron::value::Value,
+    val_ty: pliron::r#type::TypeHandle,
     llvm_ty: pliron::r#type::TypeHandle,
     mir_opd_ty: pliron::r#type::TypeHandle,
 ) -> Result<Ptr<Operation>> {
@@ -230,6 +251,23 @@ fn convert_int_to_float(
             .signedness()
             == Signedness::Signed
     };
+
+    let int_width = val_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .ok_or_else(|| {
+            pliron::input_error!(
+                op.deref(ctx).loc(),
+                "IntToFloat: operand type is not an integer"
+            )
+        })?;
+    if int_width > 64 {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "IntToFloat: integer source widths wider than 64 bits are not yet supported on the device"
+        );
+    }
 
     if is_signed {
         Ok(llvm::SIToFPOp::new(ctx, val, llvm_ty).get_operation())
@@ -332,6 +370,36 @@ fn convert_float_to_int(
     Ok(llvm_call.get_operation())
 }
 
+/// Return the element count of the sized array that becomes a slice tail
+/// during an unsize coercion.
+///
+/// The array may be the direct pointee (`&[T; N] -> &[T]`) or may sit behind
+/// one or more trailing struct fields (`&Outer<Inner<[T; N]>> ->
+/// &Outer<Inner<[T]>>`). Rust DST unsizing follows that trailing-field chain,
+/// so mirror it here instead of assuming the array is only one field deep.
+fn unsize_array_tail_len(ctx: &Context, mut ty: pliron::r#type::TypeHandle) -> Option<u64> {
+    loop {
+        let next = {
+            let ty_ref = ty.deref(ctx);
+
+            if let Some(array_ty) = ty_ref.downcast_ref::<MirArrayType>() {
+                return Some(array_ty.size());
+            }
+
+            let struct_ty = ty_ref.downcast_ref::<dialect_mir::types::MirStructType>()?;
+            let field_types = struct_ty.field_types();
+            let last_decl_idx = match struct_ty.memory_order().last().copied() {
+                Some(idx) => idx,
+                None => field_types.len().checked_sub(1)?,
+            };
+
+            *field_types.get(last_decl_idx)?
+        };
+
+        ty = next;
+    }
+}
+
 /// Emit an Unsize coercion: `&[T; N]` → `&[T]` (or `*[T; N]` → `[T]`).
 ///
 /// When the MIR source is a pointer to an array and the LLVM destination is a
@@ -351,33 +419,9 @@ fn emit_unsize_cast(
 ) -> Result<Ptr<Operation>> {
     let array_len = {
         let mir_ref = mir_opd_ty.deref(ctx);
-        mir_ref.downcast_ref::<MirPtrType>().and_then(|ptr_ty| {
-            let pointee_ref = ptr_ty.pointee.deref(ctx);
-            if let Some(arr) = pointee_ref.downcast_ref::<MirArrayType>() {
-                // `&[T; N] -> &[T]`: the classic array unsize.
-                Some(arr.size())
-            } else if let Some(struct_ty) =
-                pointee_ref.downcast_ref::<dialect_mir::types::MirStructType>()
-            {
-                // `&S<[T; N]> -> &S<[T]>` where the struct's LAST field is
-                // the array that becomes the unsized tail (e.g. the
-                // `PolymorphicIter` inside `core::array::IntoIter`, which
-                // every `for x in arr` loop unsizes; issue #138). The fat
-                // pointer's metadata is that array's element count.
-                let field_types = struct_ty.field_types();
-                let last_decl_idx = match struct_ty.memory_order().last().copied() {
-                    Some(idx) => idx,
-                    None => field_types.len().checked_sub(1)?,
-                };
-                field_types.get(last_decl_idx).and_then(|t| {
-                    t.deref(ctx)
-                        .downcast_ref::<MirArrayType>()
-                        .map(|a| a.size())
-                })
-            } else {
-                None
-            }
-        })
+        mir_ref
+            .downcast_ref::<MirPtrType>()
+            .and_then(|ptr_ty| unsize_array_tail_len(ctx, ptr_ty.pointee))
     };
 
     if let Some(len) = array_len {
@@ -441,6 +485,108 @@ fn emit_unsize_cast(
     emit_pointer_cast(ctx, rewriter, op, val, val_ty, llvm_ty)
 }
 
+/// Return the data-pointer and metadata field types for the canonical slice-fat-pointer
+/// LLVM shape `{ ptr, integer }`.
+///
+/// This recognizer is intentionally narrow. In the semantic pointer-cast path,
+/// `{ ptr, integer }` is the slice fat-pointer representation, while trait-object
+/// fat pointers use pointer metadata and therefore do not match. Requiring the
+/// metadata type to remain identical in the caller prevents this path from
+/// becoming a general aggregate coercion.
+fn slice_fat_pointer_fields(
+    ctx: &Context,
+    ty: pliron::r#type::TypeHandle,
+) -> Option<(pliron::r#type::TypeHandle, pliron::r#type::TypeHandle)> {
+    let ty_ref = ty.deref(ctx);
+    let struct_ty = ty_ref.downcast_ref::<llvm_export::types::StructType>()?;
+    if struct_ty.num_fields() != 2 {
+        return None;
+    }
+
+    let data_ty = struct_ty.field_type(0);
+    let metadata_ty = struct_ty.field_type(1);
+    let data_is_pointer = data_ty.deref(ctx).is::<llvm_export::types::PointerType>();
+    let metadata_is_integer = metadata_ty.deref(ctx).is::<IntegerType>();
+    (data_is_pointer && metadata_is_integer).then_some((data_ty, metadata_ty))
+}
+
+/// Lower a slice-fat-pointer cast entirely in SSA.
+///
+/// The data-pointer half carries address-space semantics and is converted with
+/// `addrspacecast` when the source and destination spaces differ. The integer
+/// metadata half is copied unchanged. No aggregate bytes are materialized in
+/// memory, so an addrspace(3) pointer is never exposed as its target-dependent
+/// physical representation.
+fn try_emit_slice_fat_pointer_cast(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    val: pliron::value::Value,
+    val_ty: pliron::r#type::TypeHandle,
+    llvm_ty: pliron::r#type::TypeHandle,
+) -> Result<Option<Ptr<Operation>>> {
+    let Some((src_data_ty, src_metadata_ty)) = slice_fat_pointer_fields(ctx, val_ty) else {
+        return Ok(None);
+    };
+    let Some((dst_data_ty, dst_metadata_ty)) = slice_fat_pointer_fields(ctx, llvm_ty) else {
+        return Ok(None);
+    };
+
+    // Slice casts preserve metadata exactly. Refuse to reinterpret, widen, or
+    // truncate the metadata field here; a non-identical metadata type is not
+    // the canonical slice-fat-pointer coercion this helper recognizes.
+    if src_metadata_ty != dst_metadata_ty {
+        return Ok(None);
+    }
+
+    let src_data_as = src_data_ty
+        .deref(ctx)
+        .downcast_ref::<PointerType>()
+        .expect("slice fat-pointer data field must be a pointer")
+        .address_space();
+    let dst_data_as = dst_data_ty
+        .deref(ctx)
+        .downcast_ref::<PointerType>()
+        .expect("slice fat-pointer data field must be a pointer")
+        .address_space();
+
+    // Cluster-shared pointers have distinct lowering semantics and are intentionally
+    // outside this legalization. Preserve the existing aggregate fallback for AS7.
+    if src_data_as == address_space::CLUSTER_SHARED || dst_data_as == address_space::CLUSTER_SHARED
+    {
+        return Ok(None);
+    }
+
+    let extract_data = llvm::ExtractValueOp::new(ctx, val, vec![0])
+        .map_err(|e| pliron::input_error_noloc!("slice pointer cast data extraction: {e}"))?;
+    rewriter.insert_operation(ctx, extract_data.get_operation());
+    let data = extract_data.get_operation().deref(ctx).get_result(0);
+
+    let extract_metadata = llvm::ExtractValueOp::new(ctx, val, vec![1])
+        .map_err(|e| pliron::input_error_noloc!("slice pointer cast metadata extraction: {e}"))?;
+    rewriter.insert_operation(ctx, extract_metadata.get_operation());
+    let metadata = extract_metadata.get_operation().deref(ctx).get_result(0);
+
+    let data = if src_data_as != dst_data_as {
+        let cast = llvm::AddrSpaceCastOp::new(ctx, data, dst_data_ty);
+        rewriter.insert_operation(ctx, cast.get_operation());
+        cast.get_operation().deref(ctx).get_result(0)
+    } else {
+        data
+    };
+
+    let undef = llvm::UndefOp::new(ctx, llvm_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let undef_value = undef.get_operation().deref(ctx).get_result(0);
+
+    let insert_data = llvm::InsertValueOp::new(ctx, undef_value, data, vec![0]);
+    rewriter.insert_operation(ctx, insert_data.get_operation());
+    let with_data = insert_data.get_operation().deref(ctx).get_result(0);
+
+    Ok(Some(
+        llvm::InsertValueOp::new(ctx, with_data, metadata, vec![1]).get_operation(),
+    ))
+}
+
 /// Emit a pointer-compatible cast, handling the struct↔ptr patterns that arise
 /// because our type system represents fat pointers (slices) as `{ ptr, i64 }` structs.
 ///
@@ -448,6 +594,8 @@ fn emit_unsize_cast(
 /// - struct → ptr: `extractvalue` field 0 (extract data pointer from fat pointer)
 /// - ptr → struct: `insertvalue` into undef at field 0 (wrap thin ptr in fat pointer)
 /// - ptr → ptr (different address space): `addrspacecast`
+/// - slice-shaped struct → slice-shaped struct: extract data + metadata,
+///   address-space-cast the data pointer when needed, then rebuild in SSA
 /// - array ↔ anything: memory round-trip (`alloca` + `store` + `load`),
 ///   because `bitcast` is only defined between non-aggregate first-class
 ///   types (e.g. `u32::from_ne_bytes` transmutes `[u8; 4]` → `u32`)
@@ -490,7 +638,11 @@ fn emit_pointer_cast(
     } else if src_is_int && dst_is_ptr {
         Ok(emit_int_to_ptr(ctx, rewriter, val, llvm_ty))
     } else if src_is_struct && dst_is_struct {
-        emit_transmute_via_memory(ctx, rewriter, val, val_ty, llvm_ty)
+        if let Some(cast) = try_emit_slice_fat_pointer_cast(ctx, rewriter, val, val_ty, llvm_ty)? {
+            Ok(cast)
+        } else {
+            emit_transmute_via_memory(ctx, rewriter, val, val_ty, llvm_ty)
+        }
     } else if let (Some(s), Some(d)) = (src_as, dst_as) {
         if s != d {
             let cast_ty = llvm_export::types::PointerType::get(ctx, d).into();
@@ -962,13 +1114,15 @@ fn float_bit_width(ctx: &Context, ty: pliron::r#type::TypeHandle) -> Result<usiz
 }
 
 #[cfg(test)]
+// Tests build kinded fixture types directly; production minting lives in mir-importer's facts.rs.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use crate::convert::ops::test_util::*;
-    use dialect_mir::attributes::MirCastKindAttr;
+    use dialect_mir::attributes::{MirCastKindAttr, MirPointerKindAuthorityAttr};
     use dialect_mir::ops as mir;
     use dialect_mir::types::{
-        EnumCarrierKind, EnumEncoding, EnumLayoutKind, EnumVariant, MirEnumType, MirPtrType,
-        MirStructType,
+        EnumCarrierKind, EnumEncoding, EnumLayoutKind, EnumVariant, MirEnumType, MirPointerKind,
+        MirPtrType, MirStructType,
     };
     use llvm_export::ops as llvm;
     use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
@@ -1000,7 +1154,14 @@ mod tests {
             vec![],
             0,
         );
-        mir::MirCastOp::new(cast_op).set_attr_cast_kind(ctx, kind);
+        let cast = mir::MirCastOp::new(cast_op);
+        cast.set_attr_cast_kind(ctx, kind.clone());
+        if dialect_mir::types::type_contains_concrete_pointer_kind(ctx, dst_ty)
+            || (kind == MirCastKindAttr::Transmute
+                && !dialect_mir::types::pointer_kinds_in_type(ctx, dst_ty).is_empty())
+        {
+            cast.set_pointer_kind_authority(ctx, MirPointerKindAuthorityAttr::RustCast);
+        }
         cast_op.insert_at_back(block, ctx);
 
         let cast_result = cast_op.deref(ctx).get_result(0);
@@ -1071,6 +1232,28 @@ mod tests {
             .downcast_ref::<llvm_export::types::PointerType>()
             .expect("expected LLVM pointer type")
             .address_space()
+    }
+
+    fn slice_like_pointer_struct(
+        ctx: &mut Context,
+        name: &str,
+        element_width: u32,
+        address_space: u32,
+    ) -> TypeHandle {
+        let element = int_ty(ctx, element_width, Signedness::Unsigned);
+        let data: TypeHandle = MirPtrType::get(ctx, element, true, address_space).into();
+        let metadata = int_ty(ctx, 64, Signedness::Unsigned);
+        MirStructType::get_with_full_layout(
+            ctx,
+            name.into(),
+            vec!["data".into(), "len".into()],
+            vec![data, metadata],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into()
     }
 
     fn integer_niche_enum(ctx: &mut Context) -> TypeHandle {
@@ -1168,6 +1351,66 @@ mod tests {
                 lower_single_cast(&mut ctx, source, destination, MirCastKindAttr::Transmute);
             assert_physical_transmute_round_trip(&ctx, module);
         }
+    }
+
+    #[test]
+    fn pointer_kind_only_coercion_has_no_llvm_instruction() {
+        let mut ctx = make_ctx();
+        let pointee = int_ty(&mut ctx, 32, Signedness::Unsigned);
+        let raw_mut: TypeHandle =
+            MirPtrType::get_generic_with_kind(&mut ctx, pointee, true, MirPointerKind::RawMut)
+                .into();
+        let raw_const: TypeHandle =
+            MirPtrType::get_generic_with_kind(&mut ctx, pointee, false, MirPointerKind::RawConst)
+                .into();
+
+        let module = lower_single_cast(
+            &mut ctx,
+            raw_mut,
+            raw_const,
+            MirCastKindAttr::PointerCoercionMutToConst,
+        );
+        let body = kernel_blocks(&ctx, module);
+
+        assert_eq!(count_ops::<mir::MirCastOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::BitcastOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::AddrSpaceCastOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn lowering_rejects_pointer_kind_laundering_before_erasure() {
+        let mut ctx = make_ctx();
+        let pointee = int_ty(&mut ctx, 32, Signedness::Unsigned);
+        let erased: TypeHandle = MirPtrType::get_generic(&mut ctx, pointee, true).into();
+        let unique: TypeHandle =
+            MirPtrType::get_generic_with_kind(&mut ctx, pointee, true, MirPointerKind::UniqueRef)
+                .into();
+        let (module, block) = build_kernel(&mut ctx, vec![erased], vec![unique]);
+        let source = block.deref(&ctx).get_argument(0);
+        let cast_op = Operation::new(
+            &mut ctx,
+            mir::MirCastOp::get_concrete_op_info(),
+            vec![unique],
+            vec![source],
+            vec![],
+            0,
+        );
+        mir::MirCastOp::new(cast_op).set_attr_cast_kind(&ctx, MirCastKindAttr::PtrToPtr);
+        cast_op.insert_at_back(block, &ctx);
+        let cast_result = cast_op.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![cast_result]);
+
+        let error = crate::lower_mir_to_llvm(&mut ctx, module)
+            .expect_err("lowering must verify pointer kinds before erasing them");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit Rust pointer-kind authority"),
+            "unexpected diagnostic: {error}"
+        );
     }
 
     #[test]
@@ -1559,6 +1802,38 @@ mod tests {
     }
 
     #[test]
+    fn int_to_float_rejects_integer_source_wider_than_64_bits() {
+        let mut ctx = make_ctx();
+        let i128_ty = int_ty(&mut ctx, 128, Signedness::Signed);
+        let f64_ty: TypeHandle = FP64Type::get(&ctx).into();
+
+        let module = build_single_cast(&mut ctx, i128_ty, f64_ty, MirCastKindAttr::IntToFloat);
+        let error = crate::lower_mir_to_llvm(&mut ctx, module).expect_err(
+            "i128 -> f64 cast must be rejected before an unsupported soft-float helper is emitted",
+        );
+        assert!(
+            error.to_string().contains("wider than 64 bits"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn int_to_float_rejects_unsigned_integer_source_wider_than_64_bits() {
+        let mut ctx = make_ctx();
+        let u128_ty = int_ty(&mut ctx, 128, Signedness::Unsigned);
+        let f64_ty: TypeHandle = FP64Type::get(&ctx).into();
+
+        let module = build_single_cast(&mut ctx, u128_ty, f64_ty, MirCastKindAttr::IntToFloat);
+        let error = crate::lower_mir_to_llvm(&mut ctx, module).expect_err(
+            "u128 -> f64 cast must be rejected before an unsupported soft-float helper is emitted",
+        );
+        assert!(
+            error.to_string().contains("wider than 64 bits"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    #[test]
     fn float_to_int_unsigned_lowers_to_unsigned_saturating_intrinsic_call() {
         let mut ctx = make_ctx();
         let f32_ty: TypeHandle = FP32Type::get(&ctx).into();
@@ -1634,7 +1909,9 @@ mod tests {
         let mut ctx = make_ctx();
         let usize_ty = int_ty(&mut ctx, 64, Signedness::Unsigned);
         let pointee_ty = int_ty(&mut ctx, 32, Signedness::Signless);
-        let ptr_ty: TypeHandle = MirPtrType::get(&mut ctx, pointee_ty, false, 0).into();
+        let ptr_ty: TypeHandle =
+            MirPtrType::get_with_kind(&mut ctx, pointee_ty, false, 0, MirPointerKind::RawConst)
+                .into();
 
         let module_ptr = lower_single_cast(
             &mut ctx,
@@ -1662,8 +1939,14 @@ mod tests {
             let mut ctx = make_ctx();
             let usize_ty = int_ty(&mut ctx, 64, Signedness::Unsigned);
             let pointee_ty = int_ty(&mut ctx, 32, Signedness::Signless);
-            let ptr_ty: TypeHandle =
-                MirPtrType::get(&mut ctx, pointee_ty, false, address_space).into();
+            let ptr_ty: TypeHandle = MirPtrType::get_with_kind(
+                &mut ctx,
+                pointee_ty,
+                false,
+                address_space,
+                MirPointerKind::RawConst,
+            )
+            .into();
 
             let module_ptr = lower_single_cast(
                 &mut ctx,
@@ -1730,6 +2013,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slice_fat_pointer_cast_with_shared_data_rebuilds_in_ssa() {
+        for shared_is_source in [true, false] {
+            let mut ctx = make_ctx();
+            let shared = llvm_export::types::address_space::SHARED;
+            let generic = llvm_export::types::address_space::GENERIC;
+            let (source_space, destination_space) = if shared_is_source {
+                (shared, generic)
+            } else {
+                (generic, shared)
+            };
+            let source =
+                slice_like_pointer_struct(&mut ctx, "SourceSliceFatPointer", 32, source_space);
+            let destination = slice_like_pointer_struct(
+                &mut ctx,
+                "DestinationSliceFatPointer",
+                16,
+                destination_space,
+            );
+
+            let module =
+                lower_single_cast(&mut ctx, source, destination, MirCastKindAttr::PtrToPtr);
+            let body = kernel_blocks(&ctx, module);
+
+            assert_eq!(
+                count_ops::<llvm::AllocaOp>(&ctx, &body),
+                0,
+                "slice fat-pointer casts must stay in SSA"
+            );
+            assert_eq!(
+                count_ops::<llvm::StoreOp>(&ctx, &body),
+                0,
+                "slice fat-pointer casts must not expose aggregate bytes"
+            );
+            assert_eq!(
+                count_ops::<llvm::LoadOp>(&ctx, &body),
+                0,
+                "slice fat-pointer casts must not reload target-dependent pointer bytes"
+            );
+            assert!(
+                count_ops::<llvm::ExtractValueOp>(&ctx, &body) >= 2,
+                "slice fat-pointer casts must extract data and metadata"
+            );
+            assert!(
+                count_ops::<llvm::InsertValueOp>(&ctx, &body) >= 2,
+                "slice fat-pointer casts must rebuild data and metadata"
+            );
+
+            let expected_space = destination_space;
+            let casts = find_all::<llvm::AddrSpaceCastOp>(&ctx, &body);
+            assert!(
+                casts.iter().any(|cast| {
+                    let result = cast.get_operation().deref(&ctx).get_result(0);
+                    pointer_addrspace(&ctx, result.get_type(&ctx)) == expected_space
+                }),
+                "slice data pointer must be addrspacecast into the destination space"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_slice_fat_pointer_cast_avoids_memory_round_trip() {
+        let mut ctx = make_ctx();
+        let generic = llvm_export::types::address_space::GENERIC;
+        let source = slice_like_pointer_struct(&mut ctx, "SourceSliceFatPointer", 32, generic);
+        let destination =
+            slice_like_pointer_struct(&mut ctx, "DestinationSliceFatPointer", 16, generic);
+
+        let module = lower_single_cast(&mut ctx, source, destination, MirCastKindAttr::PtrToPtr);
+        let body = kernel_blocks(&ctx, module);
+
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 0);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
+    }
+
+    #[test]
+    fn cluster_shared_slice_fat_pointer_cast_keeps_existing_fallback() {
+        for cluster_shared_is_source in [true, false] {
+            let mut ctx = make_ctx();
+            let cluster_shared = dialect_mir::types::address_space::CLUSTER_SHARED;
+            let generic = dialect_mir::types::address_space::GENERIC;
+            let (source_space, destination_space) = if cluster_shared_is_source {
+                (cluster_shared, generic)
+            } else {
+                (generic, cluster_shared)
+            };
+            let source =
+                slice_like_pointer_struct(&mut ctx, "SourceSliceFatPointer", 32, source_space);
+            let destination = slice_like_pointer_struct(
+                &mut ctx,
+                "DestinationSliceFatPointer",
+                16,
+                destination_space,
+            );
+
+            let module =
+                lower_single_cast(&mut ctx, source, destination, MirCastKindAttr::PtrToPtr);
+            let body = kernel_blocks(&ctx, module);
+
+            assert!(
+                count_ops::<llvm::AllocaOp>(&ctx, &body) > 0,
+                "cluster-shared slice-shaped casts must keep the existing aggregate fallback"
+            );
+        }
+    }
+
     /// `&mut [T; N]` in shared memory (addrspace 3) unsized to `&mut [T]`:
     /// the slice's field-0 pointer slot is generic (addrspace 0), so the data
     /// pointer must be `addrspacecast` before the `insert_value` (PTX
@@ -1742,7 +2132,8 @@ mod tests {
         let f32_ty: TypeHandle = FP32Type::get(&ctx).into();
         let arr_ty: TypeHandle = dialect_mir::types::MirArrayType::get(&mut ctx, f32_ty, 16).into();
         let src_ty: TypeHandle = MirPtrType::get_shared(&mut ctx, arr_ty, true).into();
-        let dst_ty: TypeHandle = dialect_mir::types::MirSliceType::get(&mut ctx, f32_ty).into();
+        let dst_ty: TypeHandle =
+            dialect_mir::types::MirSliceType::get_with_mutability(&mut ctx, f32_ty, true).into();
 
         let module_ptr = lower_single_cast(
             &mut ctx,
@@ -1777,7 +2168,8 @@ mod tests {
         let f32_ty: TypeHandle = FP32Type::get(&ctx).into();
         let arr_ty: TypeHandle = dialect_mir::types::MirArrayType::get(&mut ctx, f32_ty, 16).into();
         let src_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, arr_ty, true).into();
-        let dst_ty: TypeHandle = dialect_mir::types::MirSliceType::get(&mut ctx, f32_ty).into();
+        let dst_ty: TypeHandle =
+            dialect_mir::types::MirSliceType::get_with_mutability(&mut ctx, f32_ty, true).into();
 
         let module_ptr = lower_single_cast(
             &mut ctx,

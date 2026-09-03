@@ -11,9 +11,10 @@
 
 use crate::error::PipelineError;
 use crate::export::{
-    DeviceExternDecl, export_llvm_ir, module_uses_libdevice, render_llvm_ir,
-    resolve_nvvm_target_with_generated, unresolved_external_symbols,
-    unresolved_libdevice_ptx_declarations, validate_nvvm_debug_support,
+    DebugExport, DeviceExternDecl, export_llvm_ir, function_local_static_placement_for_llc,
+    module_uses_libdevice, render_llvm_ir, resolve_nvvm_target_with_generated,
+    unresolved_external_symbols, unresolved_libdevice_ptx_declarations,
+    validate_nvvm_debug_support,
 };
 use crate::generated::{
     GeneratedMarkerPolicy, collect_generated_intrinsic_requirements_for_backend,
@@ -25,10 +26,12 @@ use crate::lower::{add_device_extern_declarations, lower_to_llvm_with_backend};
 use crate::maca::generate_maca_device_binary;
 use crate::options::{BackendOptions, IketInstrumentation, TargetBackend};
 use crate::prep::{MirPreparation, prepare_mir_module};
-use crate::ptx::{PtxModule, generate_ptx, generate_ptx_with_toolchain};
+use crate::ptx::{
+    PtxModule, discover_llvm_toolchain, generate_ptx_discovered, generate_ptx_with_toolchain,
+};
 use crate::target::detect_features_in_llvm_text;
 use crate::verify::verify_operation;
-use llvm_export::export::{DebugKind, NvvmIrDialect};
+use llvm_export::export::{DebugKind, FunctionLocalStaticPlacement, NvvmIrDialect};
 use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
 use pliron::operation::Operation;
@@ -198,7 +201,7 @@ pub fn compile_translated_module(
 
     // IKET's placeholder ABI is keyed by the concrete sm_* family, but the
     // definitive target is normally resolved only after LLVM lowering
-    // (`generate_ptx` on the PTX path, `resolve_nvvm_target_with_generated`
+    // (`generate_ptx_discovered` on the PTX path, `resolve_nvvm_target_with_generated`
     // on the NVVM path), where a device hint that cannot lower a detected
     // feature is silently raised to the feature floor. Materializing from
     // the pre-resolution hint could then bake a placeholder shape for a
@@ -277,6 +280,12 @@ pub fn compile_translated_module(
         }
         add_device_extern_declarations(ctx, module, request.device_externs)?;
     }
+
+    // IKET materialization and extern insertion both run after the ordinary
+    // MIR preparation gates. Verify the resulting mixed module before backend
+    // selection and lowering so no late producer can bypass MIR pointer-kind
+    // or call-signature invariants.
+    verify_operation(ctx, module, "module immediately before MIR lowering")?;
 
     // Discover libdevice.10.bc early so the backend decision can account for
     // IR-level linking. When available, `needs_libdevice` no longer forces the
@@ -385,7 +394,10 @@ pub fn compile_translated_module(
             request.device_externs,
             false,
             None,
-            request.debug_kind,
+            DebugExport {
+                kind: request.debug_kind,
+                function_local_static_placement: FunctionLocalStaticPlacement::CompileUnitGlobals,
+            },
             crate::options::TargetBackend::Cuda,
         )?;
         Some(detect_features_in_llvm_text(&preview))
@@ -472,6 +484,26 @@ pub fn compile_translated_module(
             .trace
             .emit(format!("\n=== Exporting to LLVM IR ({mode} mode) ==="));
     }
+    // A function-local static has one verifier-accepted home per LLVM major
+    // (see `FunctionLocalStaticPlacement`), so the PTX path resolves the
+    // `llc` that will assemble this module before the debug graph is
+    // exported. libNVVM's LLVM takes the compile-unit form.
+    let mut discovered_toolchain: Option<LlvmToolchain> = None;
+    let ptx_toolchain: Option<&LlvmToolchain> = if emit_nvvm_ir {
+        None
+    } else {
+        Some(match request.toolchain {
+            ToolchainPolicy::Explicit(toolchain) => toolchain,
+            ToolchainPolicy::Discover => {
+                &*discovered_toolchain.insert(discover_llvm_toolchain(backend)?)
+            }
+        })
+    };
+    let function_local_static_placement = ptx_toolchain.map_or(
+        FunctionLocalStaticPlacement::CompileUnitGlobals,
+        |toolchain| function_local_static_placement_for_llc(toolchain.llc_major),
+    );
+
     remove_stale_files(request.files.stale_before_export)?;
     let exported = export_llvm_ir(
         ctx,
@@ -480,7 +512,10 @@ pub fn compile_translated_module(
         request.files.llvm_ir,
         emit_nvvm_ir,
         nvvm_dialect,
-        request.debug_kind,
+        DebugExport {
+            kind: request.debug_kind,
+            function_local_static_placement,
+        },
         request.backend.backend,
     )?;
     if request.trace.verbose {
@@ -546,16 +581,18 @@ pub fn compile_translated_module(
         output: request.files.ptx,
         public_symbols: &exported.public_symbols,
     };
+    let toolchain = ptx_toolchain.expect("the PTX toolchain is resolved before export");
     let generated = match request.toolchain {
-        ToolchainPolicy::Discover => generate_ptx(
+        ToolchainPolicy::Discover => generate_ptx_discovered(
             ptx_module,
             request.debug_kind,
             backend,
+            toolchain,
             request.trace.sink,
             &generated_requirements,
             ptx_libdevice,
         )?,
-        ToolchainPolicy::Explicit(toolchain) => generate_ptx_with_toolchain(
+        ToolchainPolicy::Explicit(_) => generate_ptx_with_toolchain(
             ptx_module,
             request.debug_kind,
             backend,
@@ -580,7 +617,12 @@ pub fn compile_translated_module(
                 request.files.ptx.display()
             ))
         })?;
-        let unresolved = unresolved_libdevice_ptx_declarations(&ptx_text);
+        let unresolved = unresolved_libdevice_ptx_declarations(&ptx_text).map_err(|error| {
+            PipelineError::PtxGeneration(format!(
+                "failed to parse generated PTX to check for unresolved libdevice symbols ({}): {error}",
+                request.files.ptx.display()
+            ))
+        })?;
         if !unresolved.is_empty() {
             return Err(PipelineError::UnsupportedLinking {
                 symbols: unresolved,

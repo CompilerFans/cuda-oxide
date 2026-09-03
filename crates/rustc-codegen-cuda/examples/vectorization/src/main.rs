@@ -135,6 +135,25 @@ mod view_kernels {
     use cuda_device::vector::{self, F32x4};
     use cuda_device::{DisjointSlice, kernel, thread};
 
+    #[repr(C, packed)]
+    #[allow(dead_code)]
+    struct PackedEmptyElement {
+        tag: u8,
+        value: u32,
+    }
+
+    #[allow(dead_code)]
+    union UnionEmptyElement {
+        pointer: *mut u32,
+        bits: u64,
+    }
+
+    #[inline(never)]
+    fn promoted_empty_ptr<T>() -> *mut T {
+        let empty: &mut [T; 0] = &mut [];
+        empty.as_mut_ptr()
+    }
+
     /// Copy one `F32x4` quad per thread between flat `f32` buffers through
     /// checked [`vector::as_vectors`] views. The quad is moved whole, never
     /// decomposed into lanes, so both the load and the store fuse into
@@ -155,6 +174,22 @@ mod view_kernels {
         if i < quads.len() && i < out_quads.len() {
             out_quads[i] = quads[i];
         }
+    }
+
+    /// Compile-only coverage for rustc-promoted `&mut [T; 0]` when `T` has a
+    /// packed layout, a union, a unit, or a fat-pointer value. No element
+    /// storage exists, but the promoted pointer must retain `T`'s alignment
+    /// and exact semantic type.
+    #[kernel]
+    pub fn promoted_empty_array_kinds(mut output: DisjointSlice<usize>) {
+        let Some(slot) = output.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let packed = promoted_empty_ptr::<PackedEmptyElement>() as usize;
+        let union = promoted_empty_ptr::<UnionEmptyElement>() as usize;
+        let unit = promoted_empty_ptr::<()>() as usize;
+        let slice_value = promoted_empty_ptr::<&'static [u8]>() as usize;
+        *slot = packed ^ union ^ unit ^ slice_value;
     }
 }
 
@@ -235,12 +270,13 @@ fn main() {
     }
 
     if let Some(ptx) = &ptx {
+        let document = ptx_parse::Document::parse(ptx).expect("parse embedded PTX");
         println!(
             "{:<11} {:<14} {:>4} {:>5}  {:<22} vectorized",
             "rust", "cuda", "size", "align", "ptx load"
         );
         for r in &rows {
-            let body = kernel_body(ptx, r.kernel);
+            let body = kernel_body(&document, r.kernel);
             let load = first_mem_op(body);
             let vectorized =
                 load.contains(".v2.") || load.contains(".v4.") || load.contains(".v8.");
@@ -267,7 +303,7 @@ fn main() {
         // The in-kernel `as_vectors::<F32x4>` view over a flat `&[f32]` parameter
         // must reach the same 128-bit transactions as the over-aligned parameter
         // types above: this is the checked-view path the `vector` module ships.
-        let view_body = kernel_body(ptx, "f32x4_view_copy");
+        let view_body = kernel_body(&document, "f32x4_view_copy");
         for dir in ["ld", "st"] {
             match find_128bit_global(view_body, dir) {
                 Some(line) => println!("f32x4_view_copy: {line}"),
@@ -335,14 +371,13 @@ fn embedded_ptx_text() -> Option<String> {
     )
 }
 
-/// PTX text of a `.visible .entry <name>` kernel, header to closing `}`.
-fn kernel_body<'a>(ptx: &'a str, name: &str) -> &'a str {
-    let start = ptx
-        .find(&format!(".visible .entry {name}("))
-        .unwrap_or_else(|| panic!("kernel `{name}` not found in PTX"));
-    let body = &ptx[start..];
-    let end = body.find("\n}").map_or(body.len(), |e| e + 2);
-    &body[..end]
+/// PTX text of a `.entry <name>` kernel, header through closing brace.
+fn kernel_body<'source>(document: &ptx_parse::Document<'source>, name: &str) -> &'source str {
+    document
+        .callables_named(name)
+        .find(|callable| callable.kind() == ptx_parse::CallableKind::Entry)
+        .and_then(|callable| callable.body_text().map(|_| callable.text()))
+        .unwrap_or_else(|| panic!("kernel `{name}` not found or incomplete in PTX"))
 }
 
 /// First 128-bit vector global memory op of direction `dir` (`ld`/`st`) in a

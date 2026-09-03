@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1786719697468,
+  "lastScanned": 1788409966850,
   "projectRoot": "/home/compiler_gfx/project/cuda-oxide",
   "techStack": {
     "languages": [
@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "python3 - << 'EOF'\np = 'Cargo.toml'\nsrc = open(p).read()\nsrc = src.replace('''    \"crates/cuda-async\",\n    \"crates/libnvvm-sys\",\n    \"crates/nvjitlink-sys\",\n    # MXMACA bindings\n    \"crates/maca-bindings\",\n    \"crates/maca-core\",\n    \"crates/maca-host\",\n    # Examples\n''', '''    \"crates/cuda-async\",\n    \"crates/libnvvm-sys\",\n    \"crates/nvjitlink-sys\",\n    # Examples\n''')\nopen(p,'w').write(src)\nprint(\"members cleaned\")\nEOF\ngrep -c maca Cargo.toml; export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && cargo build --workspace 2>&1 | grep -E \"^error\" -A4 | head -10; echo \"WS: ${PIPESTATUS[0]}\"",
-    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p llvm-export -p mir-lower -p cuda-bindings -p cuda-oxide-codegen --lib 2>&1 | tail -2",
+    "buildCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo build --workspace 2>&1 | grep -cE \"^error\"; echo \"WS: ${PIPESTATUS[0]}\"",
+    "testCommand": "export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu && export CUDA_TOOLKIT_PATH=/opt/maca/tools/cu-bridge && export BINDGEN_EXTRA_CLANG_ARGS=\"-I/usr/lib/gcc/x86_64-linux-gnu/11/include -I/opt/maca/include/mcr -I/opt/maca/include\" && rtk cargo test -p cargo-oxide 2>&1 | tail -1 && rtk cargo clippy -p cargo-oxide --all-targets 2>&1 | grep -cE \"^error\"; echo \"CLIPPY: ${PIPESTATUS[0]}\"; rtk grep -c \"cuda_oxide_target_maca\" crates/cargo-oxide/src/commands/codegen_env.rs",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
@@ -50,7 +50,7 @@
       "path": "assets",
       "purpose": "Static assets",
       "fileCount": 1,
-      "lastAccessed": 1786719697464,
+      "lastAccessed": 1788409966847,
       "keyFiles": [
         "logo.png"
       ]
@@ -59,14 +59,14 @@
       "path": "crates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1786719697465,
+      "lastAccessed": 1788409966848,
       "keyFiles": []
     },
     "cuda-oxide-book": {
       "path": "cuda-oxide-book",
       "purpose": null,
       "fileCount": 6,
-      "lastAccessed": 1786719697465,
+      "lastAccessed": 1788409966848,
       "keyFiles": [
         "Makefile",
         "README.md",
@@ -79,7 +79,7 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 2,
-      "lastAccessed": 1786719697465,
+      "lastAccessed": 1788409966848,
       "keyFiles": [
         "maca-migration-handoff.md",
         "maca-migration-tracker.md"
@@ -89,25 +89,40 @@
       "path": "examples",
       "purpose": "Example code",
       "fileCount": 0,
-      "lastAccessed": 1786719697466,
+      "lastAccessed": 1788409966848,
       "keyFiles": []
+    },
+    "intrinsics": {
+      "path": "intrinsics",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1788409966849,
+      "keyFiles": [
+        "abi-v1.toml",
+        "catalog.json",
+        "generated-reference.md",
+        "imported.json",
+        "overlay.toml"
+      ]
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
-      "fileCount": 3,
-      "lastAccessed": 1786719697466,
+      "fileCount": 13,
+      "lastAccessed": 1788409966849,
       "keyFiles": [
-        "check-error-example-status.sh",
-        "debug-smoketest.sh",
-        "smoketest.sh"
+        "check-book-api-names.sh",
+        "check-cli-doc-coverage.sh",
+        "check-crate-inventory.sh",
+        "check-dependency-licenses.sh",
+        "check-device-only-build.sh"
       ]
     },
     "target": {
       "path": "target",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1786719697467,
+      "lastAccessed": 1788409966850,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -116,7 +131,7 @@
       "path": "target/tests",
       "purpose": "Test files",
       "fileCount": 0,
-      "lastAccessed": 1786719697467,
+      "lastAccessed": 1788409966850,
       "keyFiles": []
     }
   },

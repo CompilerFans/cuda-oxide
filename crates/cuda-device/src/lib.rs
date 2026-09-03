@@ -29,6 +29,9 @@ pub const WAVE_SIZE: u32 = 32;
 /// truncates to the hardware's 32-bit mask registers; on MetaX C500 all
 /// 64 bits are used.
 pub type WaveMask = u64;
+// Proc-macro expansions use the public crate path so the same expansion works
+// both here and in downstream device crates.
+extern crate self as cuda_device;
 
 pub use cuda_macros::{
     cluster_launch, constant, convergent, cooperative_launch, cuda_module, device, gpu_printf,
@@ -54,10 +57,13 @@ pub mod disjoint;
 pub mod dotprod;
 pub mod f16;
 pub mod f16x2;
+pub mod f32x2;
 pub mod fence;
 pub mod float;
 pub mod grid;
+pub mod i16x2;
 pub mod iket;
+pub mod int;
 pub mod mma_frag;
 pub mod prmt;
 pub mod ptx;

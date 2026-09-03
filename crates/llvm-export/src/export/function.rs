@@ -33,7 +33,7 @@ use pliron::{
 use crate::{
     attributes::FPHalfAttr,
     ops::{self, FuncOp, GlobalOpExt},
-    types::{ArrayType, FuncType, PointerType, StructType},
+    types::{ArrayType, FuncType, PointerType, StructLayout, StructType},
 };
 
 use super::{
@@ -41,8 +41,8 @@ use super::{
     literals::{format_float_literal, format_half_literal},
     names::{decode_intrinsic_identifier, has_device_prefix, strip_device_prefix},
     state::{
-        KernelBlockGeometry, KernelClusterConfig, KernelInfo, KernelLaunchBounds,
-        ModuleExportState, PredecessorMap,
+        FunctionAbiAlignment, KernelBlockGeometry, KernelClusterConfig, KernelInfo,
+        KernelLaunchBounds, ModuleExportState, PredecessorMap,
     },
 };
 
@@ -56,6 +56,19 @@ fn sanitize_comment(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Final LLVM spelling of a pliron function symbol.
+///
+/// Shared-global owner attributes carry the raw symbol, so the module prepass,
+/// function definition, and global attachment must all normalize it exactly
+/// once through the same helper.
+pub(super) fn exported_function_name(raw_name: &str) -> String {
+    if raw_name.starts_with("llvm_") {
+        decode_intrinsic_identifier(raw_name)
+    } else {
+        strip_device_prefix(raw_name)
+    }
 }
 
 impl<'a> ModuleExportState<'a> {
@@ -134,6 +147,36 @@ impl<'a> ModuleExportState<'a> {
                 8 // Default alignment
             }
         });
+        let debug_attachment = if !is_external
+            && matches!(
+                address_space,
+                crate::types::address_space::GLOBAL | crate::types::address_space::SHARED
+            ) {
+            match ops::debug_global_variable(self.ctx, global.get_operation()) {
+                Some(info) => {
+                    let owner = ops::debug_global_owner_function(self.ctx, global.get_operation())
+                        .and_then(|raw| {
+                            let exported = exported_function_name(&raw);
+                            self.function_source_names
+                                .get(&exported)
+                                .is_some_and(|indexed| indexed == &raw)
+                                .then_some(exported)
+                        });
+                    self.debug_global_variable(
+                        name.as_ref(),
+                        Some(alignment),
+                        address_space,
+                        owner.as_deref(),
+                        &info,
+                    )?
+                    .map(|id| format!(", !dbg !{id}"))
+                    .unwrap_or_default()
+                }
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
 
         if is_external {
             // External linkage: declaration with size determined elsewhere.
@@ -143,7 +186,7 @@ impl<'a> ModuleExportState<'a> {
             )
             .unwrap();
             self.export_type(ty, output)?;
-            writeln!(output, ", align {alignment}").unwrap();
+            writeln!(output, ", align {alignment}{debug_attachment}").unwrap();
         } else {
             self.public_globals.push(name.to_string());
             // Defined static storage in the global's address space. The LLVM
@@ -176,12 +219,12 @@ impl<'a> ModuleExportState<'a> {
                 let bytes = decode_hex_initializer(&hex)?;
                 write!(output, " ").unwrap();
                 self.export_relocated_initializer(ty, &bytes, &encoded, output)?;
-                writeln!(output, ", align {alignment}").unwrap();
+                writeln!(output, ", align {alignment}{debug_attachment}").unwrap();
             } else if let Some(hex) = global.initializer_hex(self.ctx) {
                 let bytes = decode_hex_initializer(&hex)?;
                 write!(output, " ").unwrap();
                 self.export_byte_initializer(ty, &bytes, output)?;
-                writeln!(output, ", align {alignment}").unwrap();
+                writeln!(output, ", align {alignment}{debug_attachment}").unwrap();
             } else {
                 // NVVM forbids initialized shared variables. `undef` denotes
                 // uninitialized shared storage and is required by both legacy and
@@ -192,7 +235,11 @@ impl<'a> ModuleExportState<'a> {
                 } else {
                     "zeroinitializer"
                 };
-                writeln!(output, " {initializer}, align {alignment}").unwrap();
+                writeln!(
+                    output,
+                    " {initializer}, align {alignment}{debug_attachment}"
+                )
+                .unwrap();
             }
         }
 
@@ -270,8 +317,12 @@ impl<'a> ModuleExportState<'a> {
         let mut field_index = 0usize;
         let mut cursor = 0u64;
         let mut first = true;
+        let (open, close) = match storage.layout() {
+            StructLayout::Packed => ("<{ ", " }>"),
+            StructLayout::Unpacked => ("{ ", " }"),
+        };
 
-        write!(output, "{{ ").unwrap();
+        write!(output, "{open}").unwrap();
         for (index, relocation) in relocations.iter().enumerate() {
             if relocation.width_bytes != 8 {
                 return Err(format!(
@@ -349,7 +400,7 @@ impl<'a> ModuleExportState<'a> {
                 fields.len()
             ));
         }
-        write!(output, " }}").unwrap();
+        write!(output, "{close}").unwrap();
         Ok(())
     }
 
@@ -520,16 +571,12 @@ impl<'a> ModuleExportState<'a> {
         output: &mut String,
     ) -> Result<(), String> {
         let func_name = func.get_symbol_name(self.ctx);
+        let func_name_str: &str = func_name.as_ref();
         // LLVM intrinsics (NVVM and standard, e.g. llvm.fptosi.sat) use dots in IR
         // but Pliron IR identifiers use underscores; convert for export.
-        let fixed_func_name = if func_name.starts_with("llvm_") {
-            decode_intrinsic_identifier(&func_name)
-        } else {
-            // Strip cuda_oxide_device_ prefix for clean export names.
-            // Internal MIR translation uses prefixed names; we strip at the final
-            // export layer so definitions and call targets are renamed consistently.
-            strip_device_prefix(&func_name)
-        };
+        // Strip cuda_oxide_device_ prefixes and restore LLVM intrinsic dots at
+        // the final export boundary. Calls and AS3 owner scopes share this map.
+        let fixed_func_name = exported_function_name(func_name_str);
 
         // Check for kernel attribute
         let kernel_key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
@@ -608,6 +655,68 @@ impl<'a> ModuleExportState<'a> {
 
         self.function_types.insert(fixed_func_name.clone(), ft);
 
+        // MIR lowering records source-language ABI alignments only when the
+        // direct LLVM aggregate type is naturally under-aligned. NVVM represents
+        // these contracts with the function-level `"align"` property rather than
+        // an ordinary LLVM parameter attribute. The low 16 bits are the byte
+        // alignment; the high 16 bits are the position (0 = return, arguments
+        // start at 1).
+        let read_abi_alignment = |key: &str| -> Result<Option<u16>, String> {
+            let key_id: pliron::identifier::Identifier = key
+                .try_into()
+                .map_err(|_| format!("invalid ABI alignment attribute name `{key}`"))?;
+            let Some(attribute) = attrs.get::<IntegerAttr>(&key_id) else {
+                return Ok(None);
+            };
+            let value = attribute.value();
+            if value.bw() > 64 {
+                return Err(format!(
+                    "ABI alignment attribute `{key}` is wider than 64 bits"
+                ));
+            }
+            let alignment = value.to_u64();
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(format!(
+                    "ABI alignment attribute `{key}` must be a non-zero power of two, found {alignment}"
+                ));
+            }
+            let alignment = u16::try_from(alignment).map_err(|_| {
+                format!(
+                    "ABI alignment attribute `{key}` exceeds NVVM's 16-bit alignment field: {alignment}"
+                )
+            })?;
+            Ok(Some(alignment))
+        };
+
+        let mut abi_alignments = Vec::new();
+        if let Some(alignment) = read_abi_alignment("cuda_oxide_return_abi_align")? {
+            abi_alignments.push(FunctionAbiAlignment {
+                name: fixed_func_name.clone(),
+                position: 0,
+                alignment,
+            });
+        }
+
+        if is_kernel {
+            for index in 0..func_ty.arg_types().len() {
+                let key = format!("cuda_oxide_param_abi_align_{index}");
+                let Some(alignment) = read_abi_alignment(&key)? else {
+                    continue;
+                };
+                let position = u16::try_from(index + 1).map_err(|_| {
+                    format!(
+                        "kernel `@{fixed_func_name}` parameter index {index} exceeds NVVM's 16-bit position field"
+                    )
+                })?;
+                abi_alignments.push(FunctionAbiAlignment {
+                    name: fixed_func_name.clone(),
+                    position,
+                    alignment,
+                });
+            }
+        }
+        self.function_abi_alignments.extend(abi_alignments);
+
         // Track every kernel as an external root. Backends independently decide
         // whether to emit annotations for all of them.
         if is_kernel {
@@ -618,7 +727,7 @@ impl<'a> ModuleExportState<'a> {
 
         // Track device function definitions (not declarations) for @llvm.used
         // preservation in standalone device-function compilation.
-        if !is_declaration && !is_kernel && has_device_prefix(&func_name) {
+        if !is_declaration && !is_kernel && has_device_prefix(func_name_str) {
             self.device_functions.push(fixed_func_name.clone());
         }
 
@@ -725,7 +834,10 @@ impl<'a> ModuleExportState<'a> {
 
         if let Some(entry_block) = entry_block_opt {
             let func_loc = func.get_operation().deref(self.ctx).loc();
-            let debug_scope = self.debug_subprogram_for_function(&fixed_func_name, &func_loc);
+            let debug_name = ops::debug_function_name(self.ctx, func.get_operation())
+                .unwrap_or_else(|| fixed_func_name.clone());
+            let debug_scope =
+                self.debug_subprogram_for_function(&debug_name, &fixed_func_name, &func_loc);
             if let Some(scope_id) = debug_scope {
                 self.register_debug_source_scopes_for_function(scope_id, func.get_operation());
             }
@@ -1148,7 +1260,7 @@ fn decode_hex_initializer(hex: &str) -> Result<Vec<u8>, String> {
         return Err("global initializer hex string has odd length".to_string());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks_exact(2) {
+    for chunk in hex.as_bytes().as_chunks::<2>().0 {
         let hi = hex_nibble(chunk[0])?;
         let lo = hex_nibble(chunk[1])?;
         bytes.push((hi << 4) | lo);

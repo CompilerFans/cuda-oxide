@@ -18,6 +18,7 @@
 //! cargo oxide sanitize vecadd         # run under NVIDIA Compute Sanitizer
 //! cargo oxide debug vecadd --tui      # build + cuda-gdb
 //! cargo oxide inspect vecadd          # build + print generated PTX
+//! cargo oxide fuzz-schedule barrier   # perturb generated PTX and watchdog it
 //! cargo oxide new my_kernel           # scaffold a standalone project
 //! cargo oxide new my_kernel --async   # scaffold with async template
 //! cargo oxide list                    # list bundled examples
@@ -81,8 +82,8 @@ impl TargetBackend {
 enum Commands {
     /// Internal helper: discover exact CUDA compiler provenance in the same
     /// startup environment that will be given to Cargo/rustc.
-    #[command(name = "__materializer-provenance", hide = true)]
-    MaterializerProvenance,
+    #[command(name = "__materializer-handshake", hide = true)]
+    MaterializerHandshake,
     /// Build and run an example or project
     Run {
         /// Example name (required in workspace, optional for standalone projects)
@@ -235,6 +236,45 @@ enum Commands {
         /// Cargo build arguments for passthrough mode. Use after `--`.
         #[arg(last = true, num_args = 0.., allow_hyphen_values = true)]
         cargo_args: Vec<String>,
+    },
+    /// Find schedule-sensitive failures by perturbing an example's generated PTX.
+    #[command(name = "fuzz-schedule")]
+    FuzzSchedule {
+        /// Example name under crates/rustc-codegen-cuda/examples
+        example: String,
+        /// Half-open seed interval, for example 0..100 runs 100 variants.
+        #[arg(long, default_value = "0..100")]
+        seeds: String,
+        /// Probability/intensity of site selection and delay magnitude.
+        #[arg(long, default_value_t = 1.0)]
+        intensity: f64,
+        /// Maximum nanosleep delay inserted at one site.
+        #[arg(long, default_value_t = ptx_schedule::DEFAULT_MAX_SLEEP_NS)]
+        max_sleep_ns: u32,
+        /// Per-variant watchdog timeout in seconds.
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
+        /// Total executions for each finding, including the initial run.
+        #[arg(long, default_value_t = 3)]
+        confirm_runs: u32,
+        /// Treat changed stdout as a finding when no explicit failure marker is present.
+        #[arg(long)]
+        compare_output: bool,
+        /// Target architecture used while building the example.
+        #[arg(long)]
+        arch: Option<String>,
+        /// Prefer sites whose opcode/text contains this substring.
+        #[arg(long)]
+        focus: Option<String>,
+        /// Artifact directory for mutated PTX, reports, and logs.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        /// Continue after a device-wedging timeout.
+        #[arg(long)]
+        keep_going: bool,
+        /// Exit with failure when any schedule-sensitive finding is observed.
+        #[arg(long)]
+        fail_on_finding: bool,
     },
     /// Run Cargo tests through the cuda-oxide backend
     Test {
@@ -547,6 +587,10 @@ fn validate_materialization_cli(cli: &Cli) -> Result<(), String> {
         | Commands::Test { .. }
         | Commands::Pipeline { .. }
         | Commands::Debug { .. } => Ok(()),
+        Commands::FuzzSchedule { .. } => Err(
+            "--materialize-cubin cannot be used with fuzz-schedule because the campaign patches the embedded PTX and cannot run on cubin-materialized bundles"
+                .to_string(),
+        ),
         Commands::Inspect { .. } => Err(
             "--materialize-cubin cannot be used with inspect because inspect displays PTX"
                 .to_string(),
@@ -583,10 +627,35 @@ fn validate_materialization_cli(cli: &Cli) -> Result<(), String> {
             "--materialize-cubin cannot be used with update because update only refreshes the codegen backend"
                 .to_string(),
         ),
-        Commands::MaterializerProvenance => Err(
+        Commands::MaterializerHandshake => Err(
             "--materialize-cubin cannot be passed to the internal materializer discovery helper"
                 .to_string(),
         ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuzzScheduleDisposition {
+    Success,
+    Declined,
+    BrokenBaseline,
+    Findings(usize),
+}
+
+fn fuzz_schedule_disposition(
+    baseline: ptx_schedule::campaign::BaselineVerdict,
+    finding_count: usize,
+    fail_on_finding: bool,
+) -> FuzzScheduleDisposition {
+    use ptx_schedule::campaign::BaselineVerdict;
+
+    match baseline {
+        BaselineVerdict::Declined => FuzzScheduleDisposition::Declined,
+        BaselineVerdict::Broken => FuzzScheduleDisposition::BrokenBaseline,
+        BaselineVerdict::Usable if fail_on_finding && finding_count > 0 => {
+            FuzzScheduleDisposition::Findings(finding_count)
+        }
+        BaselineVerdict::Usable => FuzzScheduleDisposition::Success,
     }
 }
 
@@ -613,8 +682,8 @@ fn main() {
     let materialize_cubin = cli.materialize_cubin;
 
     match cli.command {
-        Commands::MaterializerProvenance => {
-            commands::print_materializer_provenance();
+        Commands::MaterializerHandshake => {
+            commands::print_materializer_handshake();
         }
         Commands::Run {
             example,
@@ -632,6 +701,7 @@ fn main() {
             app_args,
         } => {
             let ctx = commands::resolve_context();
+            let ctx = commands::with_cli_target_backend(ctx, target.map(TargetBackend::as_str));
             let example = resolve_example_name(example, &ctx, "run");
             validate_output_arch(
                 &ctx,
@@ -640,7 +710,6 @@ fn main() {
                 materialize_cubin,
                 arch.as_deref(),
             );
-            let target_backend = target.map(TargetBackend::as_str);
             commands::codegen_run(
                 &ctx,
                 &example,
@@ -651,7 +720,6 @@ fn main() {
                 device_features.as_deref(),
                 bin.as_deref(),
                 no_fmad,
-                target_backend,
                 unchecked_indexing,
                 commands::DeviceDebug::from_flags(lineinfo, device_debug),
                 materialize_cubin,
@@ -717,6 +785,7 @@ fn main() {
                 !device_cfgs.is_empty(),
                 !cargo_args.is_empty(),
             );
+            let ctx = commands::with_cli_target_backend(ctx, target.map(TargetBackend::as_str));
             if !passthrough {
                 let example = resolve_example_name(example, &ctx, "build");
                 validate_output_arch(
@@ -726,7 +795,6 @@ fn main() {
                     materialize_cubin,
                     arch.as_deref(),
                 );
-                let target_backend = target.map(TargetBackend::as_str);
                 commands::codegen_build(
                     &ctx,
                     &example,
@@ -736,7 +804,6 @@ fn main() {
                     features.as_deref(),
                     device_features.as_deref(),
                     no_fmad,
-                    target_backend,
                     unchecked_indexing,
                     commands::DeviceDebug::from_flags(lineinfo, device_debug),
                     materialize_cubin,
@@ -775,13 +842,82 @@ fn main() {
                         device_codegen_crate: device_codegen_crate.as_deref(),
                         device_cfgs: &device_cfgs,
                         no_fmad,
-                        target_backend: target.map(TargetBackend::as_str),
                         unchecked_indexing,
                         materialize_cubin,
                         device_debug: commands::DeviceDebug::from_flags(lineinfo, device_debug),
                     },
                     &cargo_args,
                 );
+            }
+        }
+        Commands::FuzzSchedule {
+            example,
+            seeds,
+            intensity,
+            max_sleep_ns,
+            timeout_secs,
+            confirm_runs,
+            compare_output,
+            arch,
+            focus,
+            output_dir,
+            keep_going,
+            fail_on_finding,
+        } => {
+            let ctx = commands::resolve_context();
+            let (seed_start, seed_end) = ptx_schedule::campaign::parse_seed_range(&seeds)
+                .unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    std::process::exit(2);
+                });
+            let oxide_binary = std::env::current_exe().unwrap_or_else(|error| {
+                eprintln!("Error: could not locate cargo-oxide executable: {error}");
+                std::process::exit(1);
+            });
+            let options = ptx_schedule::campaign::CampaignOptions {
+                workspace_root: ctx.workspace_root,
+                oxide_binary,
+                example,
+                seed_start,
+                seed_end,
+                intensity,
+                max_sleep_ns,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+                arch,
+                focus,
+                output_dir,
+                keep_going,
+                confirm_runs,
+                compare_output,
+            };
+            match ptx_schedule::campaign::run_campaign(&options) {
+                Ok(summary) => match fuzz_schedule_disposition(
+                    summary.baseline.kind.baseline_verdict(),
+                    summary.finding_count(),
+                    fail_on_finding,
+                ) {
+                    // A decline is not a finding. It stays successful even
+                    // with --fail-on-finding and never runs schedule variants.
+                    FuzzScheduleDisposition::Declined => eprintln!(
+                        "Note: the example declined to run on this device; no schedule variants were run"
+                    ),
+                    FuzzScheduleDisposition::BrokenBaseline => {
+                        eprintln!(
+                            "Error: baseline example did not pass ({:?}); no schedule variants were run",
+                            summary.baseline.kind
+                        );
+                        std::process::exit(1);
+                    }
+                    FuzzScheduleDisposition::Findings(count) => {
+                        eprintln!("Error: {count} schedule-sensitive finding(s) detected");
+                        std::process::exit(1);
+                    }
+                    FuzzScheduleDisposition::Success => {}
+                },
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Test {
@@ -816,7 +952,6 @@ fn main() {
                     device_codegen_crate: device_codegen_crate.as_deref(),
                     device_cfgs: &device_cfgs,
                     no_fmad,
-                    target_backend: None,
                     unchecked_indexing,
                     materialize_cubin,
                     device_debug: commands::DeviceDebug::from_flags(lineinfo, device_debug),
@@ -928,7 +1063,12 @@ fn main() {
             commands::list_examples(&ctx, json);
         }
         Commands::Fmt { check } => {
-            let ctx = commands::resolve_context();
+            // Formatting compiles no device code. `format_all` reads only
+            // `workspace_root`, `codegen_crate` and `examples_dir`, which the
+            // passive resolver fills in identically, so eager resolution only
+            // added a backend build -- and a clone on a fresh checkout -- ahead
+            // of the first file being formatted.
+            let ctx = commands::resolve_passive_context();
             commands::format_all(&ctx, check);
         }
         Commands::New { name, async_mode } => {
@@ -1023,6 +1163,30 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn schedule_cli_exit_policy_keeps_declines_distinct_from_findings() {
+        use ptx_schedule::campaign::BaselineVerdict;
+
+        for fail_on_finding in [false, true] {
+            assert_eq!(
+                fuzz_schedule_disposition(BaselineVerdict::Declined, 0, fail_on_finding),
+                FuzzScheduleDisposition::Declined
+            );
+            assert_eq!(
+                fuzz_schedule_disposition(BaselineVerdict::Broken, 0, fail_on_finding),
+                FuzzScheduleDisposition::BrokenBaseline
+            );
+        }
+        assert_eq!(
+            fuzz_schedule_disposition(BaselineVerdict::Usable, 2, false),
+            FuzzScheduleDisposition::Success
+        );
+        assert_eq!(
+            fuzz_schedule_disposition(BaselineVerdict::Usable, 2, true),
+            FuzzScheduleDisposition::Findings(2)
+        );
     }
 
     #[test]

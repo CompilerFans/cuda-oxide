@@ -94,8 +94,8 @@ for name, body in lists:
         )
 
 # classify() returns `standard` for anything not claimed by a category array.
-# NVVM_VERIFY / NOINLINE_MIR / NO_LAUNCH / NO_OPT_SHAPE are modifiers, not
-# categories, so their members stay `standard` and still need a marker.
+# NVVM_VERIFY / NO_LAUNCH / NO_OPT_SHAPE are modifiers, not categories, so
+# their members stay `standard` and still need a marker.
 CATEGORY_LISTS = (
     "TCGEN05_EXAMPLES",
     "WGMMA_EXAMPLES",
@@ -105,6 +105,7 @@ CATEGORY_LISTS = (
     "AUTO_NVVM_EXAMPLES",
     "IKET_EXAMPLES",
     "BLACKWELL_COMPILE_EXAMPLES",
+    "SM100_COMPILE_EXAMPLES",
     "ERROR_EXAMPLES",
 )
 by_name = dict(lists)

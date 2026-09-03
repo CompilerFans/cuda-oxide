@@ -64,6 +64,8 @@ impl MirConvertibleType for MirSliceType {}
 #[type_interface_impl]
 impl MirTypeConversion for MirSliceType {
     fn converter(&self) -> ConvertMirTypeFn {
+        // `MirPointerKind` is semantic-only. `&[T]`, `&mut [T]`, and raw
+        // slice pointers all keep the same physical `{ptr, i64}` layout.
         |_ty, ctx| Ok(make_slice_struct(ctx))
     }
 }
@@ -75,6 +77,9 @@ impl MirConvertibleType for MirPtrType {}
 impl MirTypeConversion for MirPtrType {
     fn converter(&self) -> ConvertMirTypeFn {
         |ty, ctx| {
+            // Deliberately erase Rust pointer/reference kind here. It is not
+            // a physical LLVM pointer property and is not sufficient by
+            // itself to justify `noalias`, `readonly`, or related metadata.
             let address_space = ty
                 .deref(ctx)
                 .downcast_ref::<MirPtrType>()
@@ -274,18 +279,16 @@ impl MirConvertibleType for llvm_types::StructType {}
 impl MirTypeConversion for llvm_types::StructType {
     fn converter(&self) -> ConvertMirTypeFn {
         |ty, ctx| {
-            let fields: Vec<_> = {
+            let (fields, layout) = {
                 let r = ty.deref(ctx);
-                r.downcast_ref::<llvm_types::StructType>()
-                    .unwrap()
-                    .fields()
-                    .collect()
+                let struct_ty = r.downcast_ref::<llvm_types::StructType>().unwrap();
+                (struct_ty.fields().collect::<Vec<_>>(), struct_ty.layout())
             };
             let llvm_fields: Vec<_> = fields
                 .into_iter()
                 .map(|f| convert_type(ctx, f))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+            Ok(llvm_types::StructType::get_unnamed(ctx, (llvm_fields, layout)).into())
         }
     }
 }

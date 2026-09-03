@@ -17,7 +17,7 @@ safe = true
 must_use = false
 safe_allowlist_reason = "Packed conversion has no memory, pointer, synchronization, or participation preconditions."
 public_rust_path = "cuda_intrinsics::convert::cvt_f32x2_bf16x2"
-compatibility_rust_paths = ["cuda_device::tcgen05::cvt_f32x2_bf16x2"]
+compatibility_rust_paths = ["cuda_device::convert::cvt_bf16x2_f32"]
 dialect_op_type = "CvtF32x2Bf16x2Op"
 dialect_op_name = "nvvm.cvt_f32x2_bf16x2"
 dialect_operands = ["f32", "f32"]
@@ -38,7 +38,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "bf16x2", rounding = "nearest_even", saturation = "none", adapter = "reverse_high_low_operands" }
@@ -80,7 +80,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "f16x2", rounding = "nearest_even", saturation = "none", adapter = "reverse_high_low_operands" }
@@ -122,7 +122,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "f16x2", rounding = "toward_zero", saturation = "none", adapter = "reverse_high_low_operands" }
@@ -164,7 +164,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "f16x2", rounding = "nearest_even", saturation = "relu", adapter = "reverse_high_low_operands" }
@@ -206,7 +206,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "bf16x2", rounding = "nearest_even", saturation = "relu", adapter = "reverse_high_low_operands" }
@@ -248,7 +248,7 @@ ptx_isa_section = "9.7.9.22 Data Movement and Conversion Instructions: cvt"
 ptx_isa_url = "https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt"
 lowering = "generated_packed_conversion_inline_ptx"
 backend_lowerings = [
-    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-22.1.2-1cb4e383", minimum_ptx = "7.0", minimum_sm = "sm_80" },
+    { backend = "llvm_nvptx", mechanism = "inline_ptx", evidence_profile = "rust-llvm-23.1.0-16696adc", minimum_ptx = "7.0", minimum_sm = "sm_80" },
     { backend = "lib_nvvm", mechanism = "inline_ptx", evidence_profile = "cuda-13.3-libnvvm-13.3.33", minimum_ptx = "7.0", minimum_sm = "sm_80" },
 ]
 packed_conversion = { source_format = "f32x2", destination_format = "bf16x2", rounding = "toward_zero", saturation = "none", adapter = "reverse_high_low_operands" }

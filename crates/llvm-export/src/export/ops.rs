@@ -27,9 +27,9 @@ use pliron::{
 use crate::{
     attributes::{
         AtomicOrderingAttr, AtomicRmwKindAttr, FCmpPredicateAttr, FPHalfAttr, FastmathFlags,
-        FastmathFlagsAttr, GepIndexAttr, ICmpPredicateAttr,
+        FastmathFlagsAttr, GepIndexAttr, ICmpPredicateAttr, SyncScopeAttr,
     },
-    op_interfaces::{ATTR_KEY_FAST_MATH_FLAGS, PointerTypeResult},
+    op_interfaces::{ATTR_KEY_FAST_MATH_FLAGS, PointerTypeResult, SyncScopeInterface},
     ops,
     types::{ArrayType, FuncType, HalfType, PointerType, VoidType},
 };
@@ -52,7 +52,7 @@ use super::{
 /// textual export touches four places in this file:
 ///
 /// 1. Add a variant to `LlvmOp` below.
-/// 2. Add a matching entry in the [`classify_op!`] invocation.
+/// 2. Add a matching entry in the `classify_op!` invocation below.
 /// 3. Add an `emit_*` helper method on [`ModuleExportState`].
 /// 4. Add a `Some(LlvmOp::X(op)) => self.emit_x(...)` arm in `export_op`.
 ///
@@ -130,6 +130,7 @@ enum LlvmOp<'op> {
     Constant(&'op ops::ConstantOp),
     AddressOf(&'op ops::AddressOfOp),
     DebugValue(&'op ops::DebugValueOp),
+    DebugValueList(&'op ops::DebugValueListOp),
 }
 
 /// Try each `(Variant, OpType)` pair in order; return the first match.
@@ -218,6 +219,7 @@ impl<'op> TryFrom<&'op dyn Op> for LlvmOp<'op> {
             Constant     => ops::ConstantOp,
             AddressOf    => ops::AddressOfOp,
             DebugValue   => ops::DebugValueOp,
+            DebugValueList => ops::DebugValueListOp,
         })
     }
 }
@@ -226,7 +228,11 @@ impl LlvmOp<'_> {
     fn emits_real_instruction(&self) -> bool {
         !matches!(
             self,
-            Self::Undef(_) | Self::Constant(_) | Self::AddressOf(_) | Self::DebugValue(_)
+            Self::Undef(_)
+                | Self::Constant(_)
+                | Self::AddressOf(_)
+                | Self::DebugValue(_)
+                | Self::DebugValueList(_)
         )
     }
 
@@ -479,6 +485,9 @@ impl<'a> ModuleExportState<'a> {
             Some(LlvmOp::DebugValue(op)) => {
                 self.emit_debug_value(op, value_names, debug_scope, &op_loc, output)?
             }
+            Some(LlvmOp::DebugValueList(op)) => {
+                self.emit_debug_value_list(op, value_names, debug_scope, &op_loc, output)?
+            }
             // Unknown
             None if self.legacy_typed_pointers() => {
                 return Err(format!(
@@ -722,9 +731,13 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
             self.export_value(ptr, value_names, output)?;
         }
-        let align = crate::ops::op_alignment(self.ctx, op.get_operation())
-            .unwrap_or_else(|| self.natural_alignment(ty));
-        writeln!(output, ", align {align}").unwrap();
+        if let Some(align) = crate::ops::op_alignment(self.ctx, op.get_operation())
+            .or_else(|| self.natural_alignment(ty))
+        {
+            writeln!(output, ", align {align}").unwrap();
+        } else {
+            writeln!(output).unwrap();
+        }
         Ok(())
     }
 
@@ -761,9 +774,13 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
             self.export_value(ptr, value_names, output)?;
         }
-        let align = crate::ops::op_alignment(self.ctx, op.get_operation())
-            .unwrap_or_else(|| self.natural_alignment(val_ty));
-        writeln!(output, ", align {align}").unwrap();
+        if let Some(align) = crate::ops::op_alignment(self.ctx, op.get_operation())
+            .or_else(|| self.natural_alignment(val_ty))
+        {
+            writeln!(output, ", align {align}").unwrap();
+        } else {
+            writeln!(output).unwrap();
+        }
         Ok(())
     }
 
@@ -814,16 +831,18 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(array_size.get_type(self.ctx), output)?;
             write!(output, " {array_size_name}").unwrap();
         }
-        let align = crate::ops::op_alignment(self.ctx, op.get_operation())
-            .unwrap_or_else(|| self.natural_alignment(elem_llvm_ty));
-        write!(output, ", align {align}").unwrap();
         if alloca_as != 0 {
             // MXMACA-style targets: the frame lives in a private address
-            // space; the generic-pointer result is recovered with an
-            // addrspacecast (mirrors the target's own clang output).
+            // space; the alloca itself must carry the address-space suffix.
             write!(output, ", addrspace({alloca_as})").unwrap();
         }
-        writeln!(output).unwrap();
+        if let Some(align) = crate::ops::op_alignment(self.ctx, op.get_operation())
+            .or_else(|| self.natural_alignment(elem_llvm_ty))
+        {
+            writeln!(output, ", align {align}").unwrap();
+        } else {
+            writeln!(output).unwrap();
+        }
 
         if alloca_as != 0 {
             write!(output, "  {res_name} = addrspacecast ").unwrap();
@@ -845,6 +864,70 @@ impl<'a> ModuleExportState<'a> {
         Ok(())
     }
 
+    fn debug_expression_for_projection(dereference_base: bool, offset_bytes: u64) -> String {
+        match (dereference_base, offset_bytes) {
+            (false, 0) => "!DIExpression()".to_string(),
+            (false, offset) => format!("!DIExpression(DW_OP_plus_uconst, {offset})"),
+            (true, 0) => "!DIExpression(DW_OP_deref)".to_string(),
+            (true, offset) => {
+                format!("!DIExpression(DW_OP_deref, DW_OP_plus_uconst, {offset})")
+            }
+        }
+    }
+
+    fn debug_expression_for_fragment(offset_bits: u64, size_bits: u64) -> String {
+        format!("!DIExpression(DW_OP_LLVM_fragment, {offset_bits}, {size_bits})")
+    }
+
+    fn debug_expression_for_value_list(
+        expression: &ops::DebugValueExpression,
+        operand_count: usize,
+    ) -> Result<String, String> {
+        if expression.operations.is_empty() {
+            return Err("multi-value debug expression must not be empty".to_string());
+        }
+
+        let mut parts = Vec::with_capacity(expression.operations.len() * 2);
+        let mut saw_arg = false;
+        for operation in &expression.operations {
+            match operation {
+                ops::DebugValueExpressionOp::Arg(index) => {
+                    let index = *index as usize;
+                    if index >= operand_count {
+                        return Err(format!(
+                            "multi-value debug expression references argument {index}, but only {operand_count} operands exist"
+                        ));
+                    }
+                    saw_arg = true;
+                    parts.push("DW_OP_LLVM_arg".to_string());
+                    parts.push(index.to_string());
+                }
+                ops::DebugValueExpressionOp::ConstU(value) => {
+                    parts.push("DW_OP_constu".to_string());
+                    parts.push(value.to_string());
+                }
+                ops::DebugValueExpressionOp::Plus => parts.push("DW_OP_plus".to_string()),
+                ops::DebugValueExpressionOp::PlusUConst(value) => {
+                    parts.push("DW_OP_plus_uconst".to_string());
+                    parts.push(value.to_string());
+                }
+                ops::DebugValueExpressionOp::Mul => parts.push("DW_OP_mul".to_string()),
+                ops::DebugValueExpressionOp::Deref => parts.push("DW_OP_deref".to_string()),
+                ops::DebugValueExpressionOp::StackValue => {
+                    parts.push("DW_OP_stack_value".to_string())
+                }
+            }
+        }
+        if !saw_arg {
+            return Err(
+                "multi-value debug expression must reference at least one DIArgList operand"
+                    .to_string(),
+            );
+        }
+
+        Ok(format!("!DIExpression({})", parts.join(", ")))
+    }
+
     fn emit_debug_declare_for_alloca(
         &mut self,
         op: &ops::AllocaOp,
@@ -860,27 +943,70 @@ impl<'a> ModuleExportState<'a> {
         let Some(scope) = debug_scope else {
             return Ok(());
         };
-        let Some(info) = crate::ops::debug_local_variable(self.ctx, op.get_operation()) else {
-            return Ok(());
-        };
-        let Some((var_id, loc_id)) =
-            self.debug_local_variable_for_scope(scope, loc, op.get_operation(), &info)
-        else {
-            return Ok(());
-        };
-
         let alloca_result = op.get_operation().deref(self.ctx).get_result(0);
         let alloca_name = value_names
             .get(&alloca_result)
             .ok_or_else(|| "Missing alloca result name for debug declare".to_string())?;
 
-        writeln!(
-            output,
-            "  call void @llvm.dbg.declare(metadata ptr {alloca_name}, metadata !{var_id}, metadata !DIExpression()), !dbg !{loc_id}"
-        )
-        .unwrap();
-        self.debug_declare_used = true;
+        let mut emitted = false;
+        if let Some(info) = crate::ops::debug_local_variable(self.ctx, op.get_operation())
+            && let Some((var_id, loc_id)) =
+                self.debug_local_variable_for_scope(scope, loc, op.get_operation(), &info)
+        {
+            writeln!(
+                output,
+                "  call void @llvm.dbg.declare(metadata ptr {alloca_name}, metadata !{var_id}, metadata !DIExpression()), !dbg !{loc_id}"
+            )
+            .unwrap();
+            emitted = true;
+        }
 
+        for projected in crate::ops::debug_projected_variables(self.ctx, op.get_operation()) {
+            let Some((var_id, loc_id)) =
+                self.debug_projected_variable_for_scope(scope, loc, &projected)
+            else {
+                continue;
+            };
+            let expression = Self::debug_expression_for_projection(
+                projected.dereference_base,
+                projected.offset_bytes,
+            );
+            writeln!(
+                output,
+                "  call void @llvm.dbg.declare(metadata ptr {alloca_name}, metadata !{var_id}, metadata {expression}), !dbg !{loc_id}"
+            )
+            .unwrap();
+            emitted = true;
+        }
+
+        for fragment in crate::ops::debug_fragment_variables(self.ctx, op.get_operation()) {
+            let projected = crate::ops::DebugProjectedVariableInfo {
+                variable: fragment.variable,
+                dereference_base: false,
+                offset_bytes: 0,
+                source_scope: fragment.source_scope,
+                declaration: fragment.declaration,
+            };
+            let Some((var_id, loc_id)) =
+                self.debug_projected_variable_for_scope(scope, loc, &projected)
+            else {
+                continue;
+            };
+            let expression = Self::debug_expression_for_fragment(
+                fragment.fragment.offset_bits,
+                fragment.fragment.size_bits,
+            );
+            writeln!(
+                output,
+                "  call void @llvm.dbg.declare(metadata ptr {alloca_name}, metadata !{var_id}, metadata {expression}), !dbg !{loc_id}"
+            )
+            .unwrap();
+            emitted = true;
+        }
+
+        if emitted {
+            self.debug_declare_used = true;
+        }
         Ok(())
     }
 
@@ -899,6 +1025,75 @@ impl<'a> ModuleExportState<'a> {
         let Some(scope) = debug_scope else {
             return Ok(());
         };
+        let value = op.value(self.ctx);
+        let mut emitted = false;
+
+        if let Some(info) = crate::ops::debug_local_variable(self.ctx, op.get_operation())
+            && let Some((var_id, loc_id)) =
+                self.debug_local_variable_for_scope(scope, loc, op.get_operation(), &info)
+        {
+            write!(output, "  call void @llvm.dbg.value(metadata ").unwrap();
+            self.export_type(value.get_type(self.ctx), output)?;
+            write!(output, " ").unwrap();
+            self.export_value(value, value_names, output)?;
+            writeln!(
+                output,
+                ", metadata !{var_id}, metadata !DIExpression()), !dbg !{loc_id}"
+            )
+            .unwrap();
+            emitted = true;
+        }
+
+        for fragment in crate::ops::debug_fragment_variables(self.ctx, op.get_operation()) {
+            let projected = crate::ops::DebugProjectedVariableInfo {
+                variable: fragment.variable,
+                dereference_base: false,
+                offset_bytes: 0,
+                source_scope: fragment.source_scope,
+                declaration: fragment.declaration,
+            };
+            let Some((var_id, loc_id)) =
+                self.debug_projected_variable_for_scope(scope, loc, &projected)
+            else {
+                continue;
+            };
+            let expression = Self::debug_expression_for_fragment(
+                fragment.fragment.offset_bits,
+                fragment.fragment.size_bits,
+            );
+            write!(output, "  call void @llvm.dbg.value(metadata ").unwrap();
+            self.export_type(value.get_type(self.ctx), output)?;
+            write!(output, " ").unwrap();
+            self.export_value(value, value_names, output)?;
+            writeln!(
+                output,
+                ", metadata !{var_id}, metadata {expression}), !dbg !{loc_id}"
+            )
+            .unwrap();
+            emitted = true;
+        }
+
+        if emitted {
+            self.debug_value_used = true;
+        }
+        Ok(())
+    }
+
+    fn emit_debug_value_list(
+        &mut self,
+        op: &ops::DebugValueListOp,
+        value_names: &FxHashMap<Value, String>,
+        debug_scope: Option<usize>,
+        loc: &pliron::location::Location,
+        output: &mut String,
+    ) -> Result<(), String> {
+        if !self.debug_kind.variables_enabled() {
+            return Ok(());
+        }
+
+        let Some(scope) = debug_scope else {
+            return Ok(());
+        };
         let Some(info) = crate::ops::debug_local_variable(self.ctx, op.get_operation()) else {
             return Ok(());
         };
@@ -908,14 +1103,26 @@ impl<'a> ModuleExportState<'a> {
             return Ok(());
         };
 
-        let value = op.value(self.ctx);
-        write!(output, "  call void @llvm.dbg.value(metadata ").unwrap();
-        self.export_type(value.get_type(self.ctx), output)?;
-        write!(output, " ").unwrap();
-        self.export_value(value, value_names, output)?;
+        let values = op.values(self.ctx);
+        if values.len() < 2 {
+            return Err("llvm.dbg_value_list requires at least two operands".to_string());
+        }
+        let expression = crate::ops::debug_value_expression(self.ctx, op.get_operation())
+            .ok_or_else(|| "llvm.dbg_value_list is missing its debug expression".to_string())?;
+        let expression = Self::debug_expression_for_value_list(&expression, values.len())?;
+
+        write!(output, "  call void @llvm.dbg.value(metadata !DIArgList(").unwrap();
+        for (index, value) in values.into_iter().enumerate() {
+            if index != 0 {
+                write!(output, ", ").unwrap();
+            }
+            self.export_type(value.get_type(self.ctx), output)?;
+            write!(output, " ").unwrap();
+            self.export_value(value, value_names, output)?;
+        }
         writeln!(
             output,
-            ", metadata !{var_id}, metadata !DIExpression()), !dbg !{loc_id}"
+            "), metadata !{var_id}, metadata {expression}), !dbg !{loc_id}"
         )
         .unwrap();
         self.debug_value_used = true;
@@ -1022,7 +1229,7 @@ impl<'a> ModuleExportState<'a> {
         let ptr = op_ref.get_operand(0);
         let res_name = value_names.get(&res).unwrap();
         let ty = res.get_type(self.ctx);
-        let syncscope = fmt_syncscope(op.get_attr_llvm_ld_syncscope(self.ctx));
+        let syncscope = fmt_syncscope(op.syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_ld_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
         let pointer_name =
@@ -1038,7 +1245,15 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
             self.export_value(ptr, value_names, output)?;
         }
-        let align = self.natural_alignment(ty);
+        // Atomic loads must state an alignment; the operand types are
+        // power-of-two scalars, so this is always answerable. Error rather
+        // than fabricate if it ever is not.
+        let align = self.natural_alignment(ty).ok_or_else(|| {
+            format!(
+                "atomic load requires an explicit alignment, but `{}` has no known ABI alignment",
+                ty.deref(self.ctx).disp(self.ctx)
+            )
+        })?;
         writeln!(output, "{syncscope} {ordering}, align {align}").unwrap();
         Ok(())
     }
@@ -1053,7 +1268,7 @@ impl<'a> ModuleExportState<'a> {
         let op_ref = op.get_operation().deref(self.ctx);
         let val = op_ref.get_operand(0);
         let ptr = op_ref.get_operand(1);
-        let syncscope = fmt_syncscope(op.get_attr_llvm_st_syncscope(self.ctx));
+        let syncscope = fmt_syncscope(op.syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_st_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
         let val_ty = val.get_type(self.ctx);
@@ -1072,7 +1287,13 @@ impl<'a> ModuleExportState<'a> {
             write!(output, "{}", ptr_qualifier(addrspace)).unwrap();
             self.export_value(ptr, value_names, output)?;
         }
-        let align = self.natural_alignment(val_ty);
+        // Same contract as atomic load: exact alignment or a loud error.
+        let align = self.natural_alignment(val_ty).ok_or_else(|| {
+            format!(
+                "atomic store requires an explicit alignment, but `{}` has no known ABI alignment",
+                val_ty.deref(self.ctx).disp(self.ctx)
+            )
+        })?;
         writeln!(output, "{syncscope} {ordering}, align {align}").unwrap();
         Ok(())
     }
@@ -1090,7 +1311,7 @@ impl<'a> ModuleExportState<'a> {
         let val = op_ref.get_operand(1);
         let res_name = value_names.get(&res).unwrap();
         let rmw_kind = fmt_rmw_kind(op.get_attr_llvm_rmw_kind(self.ctx));
-        let syncscope = fmt_syncscope(op.get_attr_llvm_rmw_syncscope(self.ctx));
+        let syncscope = fmt_syncscope(op.syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_rmw_ordering(self.ctx));
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
         let val_ty = val.get_type(self.ctx);
@@ -1128,7 +1349,7 @@ impl<'a> ModuleExportState<'a> {
         let res_name = value_names.get(&res).unwrap();
         let success_ord = fmt_ordering(op.get_attr_llvm_cas_success_ordering(self.ctx));
         let failure_ord = fmt_ordering(op.get_attr_llvm_cas_failure_ordering(self.ctx));
-        let syncscope = fmt_syncscope(op.get_attr_llvm_cas_syncscope(self.ctx));
+        let syncscope = fmt_syncscope(op.syncscope(self.ctx));
         let val_ty = cmp.get_type(self.ctx);
         let addrspace = addrspace_of(ptr.get_type(self.ctx), self.ctx);
         let pointer_name =
@@ -1158,7 +1379,7 @@ impl<'a> ModuleExportState<'a> {
     }
 
     fn emit_fence(&self, op: &ops::FenceOp, output: &mut String) -> Result<(), String> {
-        let syncscope = fmt_syncscope(op.get_attr_llvm_fence_syncscope(self.ctx));
+        let syncscope = fmt_syncscope(op.syncscope(self.ctx));
         let ordering = fmt_ordering(op.get_attr_llvm_fence_ordering(self.ctx));
         writeln!(output, "  fence{syncscope} {ordering}").unwrap();
         Ok(())
@@ -2034,12 +2255,15 @@ fn fmt_rmw_kind(kind: Option<Ref<AtomicRmwKindAttr>>) -> &'static str {
     }
 }
 
-/// Format a syncscope suffix. pliron stores syncscope as a free-form string
-/// (absent = system scope); any value passes through verbatim.
-fn fmt_syncscope(scope: Option<Ref<StringAttr>>) -> String {
-    match scope.map(|s| String::from((*s).clone())) {
-        Some(s) if !s.is_empty() => format!(" syncscope(\"{s}\")"),
-        _ => String::new(),
+/// Format a syncscope suffix from pliron-llvm's dedicated [`SyncScopeAttr`].
+fn fmt_syncscope(scope: SyncScopeAttr) -> String {
+    // `SyncScopeAttr::to_name` returns the LLVM-IR scope name; the system
+    // scope is unnamed (empty string) and is omitted entirely in textual IR.
+    let name = scope.to_name();
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!(" syncscope(\"{name}\")")
     }
 }
 

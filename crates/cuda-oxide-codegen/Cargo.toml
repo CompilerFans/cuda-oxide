@@ -11,7 +11,9 @@ description = "Experimental rustc-independent cuda-oxide PTX backend"
 readme = "README.md"
 
 [dependencies]
+cuda-target-spec = { workspace = true }
 pliron = { workspace = true }
+ptx-parse = { workspace = true }
 thiserror = { workspace = true }
 dialect-mir = { workspace = true }
 dialect-iket = { workspace = true }
