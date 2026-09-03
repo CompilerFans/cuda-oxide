@@ -308,9 +308,44 @@ partial_warp_reduce 两示例的 block 几何改为 64 的倍数（96/93 线程�
 - trait 默认实现的静默回退是危险信号：`kernel_calling_convention` 没转发时编译照过、运行时符号找不到。
 - 生成文件（DO NOT EDIT 标记）与后端扩展的边界：maca_mma.rs 作为手写扩展模块注册进 generated/ 目录是可行模式。
 
+
+### 4.0.3 2026-09-03 第二次上游合并（171 提交，LLVM 23 / nightly-2026-08-28）
+
+**合并范围**：upstream/main 新增 171 提交——nightly 升至 2026-08-28（LLVM 23）、pliron 823d9d8
+（引入 `SyncScopeAttr`）、cargo-oxide commands 拆分为模块目录、generated_intrinsics 拆分为
+目录、debug 导出引入 `DebugExport`/`FunctionLocalStaticPlacement`、示例增至 226。
+
+**MACA 管线重接**：
+1. **cuda_oxide_target_maca cfg**：`--target` 改走 `Context.cli_target_backend`
+   （上游删除了命令签名中的 backend 参数）；cfg 注入收敛到
+   `target_backend_device_cfgs`（覆盖 run/build/passthrough/sanitize）。
+2. **指纹**：MACA_PATH 与 mxcc 二进制 digest 加入 codegen fingerprint（仅 maca 生效）。
+3. **generated_intrinsics 拆分**：46 处 maca 预分发移植到 sreg/warp_shuffle/vote/
+   warp_match/active_mask/redux/warp_barrier/elect/sync/debug_control 等拆分文件。
+4. **SyncScopeAttr 迁移**：fence/atomic scope 从 `Option<String>` 改为新枚举。
+5. **新 catalog 面的原生 lowering**：
+   - `trap` → `llvm.trap`（mxcc 原生支持）
+   - integer minmax：`min/max.relu.s32` → icmp+select；packed s16x2/u16x2 →
+     逐半段 widen+compare+select+merge（修复 half 符号扩展顺序）
+   - redux f32：新 `emit_maca_redux_f32` — 位模式 bpermute 循环 + fcmp/fadd，
+     abs 用符号位清零，NaN 语义由 ogt/olt 保证
+   - elect_sync/lanemask/redux 的 mask verify 加宽至 i32|i64
+6. **alloca 顺序**：mxcc 要求 `align N, addrspace(5)`（addrspace 在后会解析失败）。
+
+**验证**：MACA 全套件 **226/226 全部通过**（GPU2）；mir-lower 287 单测通过；
+touched crates clippy 干净。已推送 commit `b387df9a` 后续修复。
+
+**教训**：
+- 上游拆分单文件为目录时，先 grep 旧文件里的后端分发计数，再逐一确认新文件；
+  本次靠 `grep -c BackendTarget::Maca` 发现 46→0 的静默丢失。
+- mxcc 的 LLVM 解析器对 alloca 属性顺序有严格要求（align 先于 addrspace），
+  与 LLVM 参考手册的默认印象相反。
+- f32 redux 不能复用 i32 循环：最终 `trunc i32->i32` 会触发 verifier
+  "Result type must be smaller than operand type"。
+
 ### 4.1 当前状态（2026-08-15 合并后）✅
 
-**MACA 全套件：213/213 全部通过**（`scripts/smoketest.sh -t maca`）。
+**MACA 全套件：226/226 全部通过**（`scripts/smoketest.sh -t maca`；上游示例增长 213→226）。
 原 4.1/4.2/4.3 列出的任务均已达成，逐项对照：
 
 | 原任务 | 状态 | 说明 |
